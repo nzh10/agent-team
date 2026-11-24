@@ -579,7 +579,7 @@ const CONTINUES = /^(\s|[-*+](\s|$)|\d{1,9}[.)](\s|$))/;
 // any of these is parsed whole.
 const WHOLE_ONLY = new RegExp(
   [
-    /^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*\[[^\]]+\]:/.source,
+    /^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*\[(?:\\.|[^\]\\])+\]:/.source,
     /^ {0,3}(?:<(?:script|pre|style|textarea)(?:\s|>|$)|<!--|<\?|<![A-Za-z]|<!\[CDATA\[)/.source,
     /^ {0,3}(?:>[ \t]?)*<details[\s>]/.source,
   ].join("|"),

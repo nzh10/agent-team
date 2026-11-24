@@ -1189,7 +1189,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
           this.event({ kind: "text", content: block.content });
         } else {
           const durationMs = Date.now() - block.startedAt;
-          this.event({ kind: "thinking_delta", content: "", durationMs });
+          this.event({ kind: "thinking_delta", content: "", durationMs, thinkingFollows: true });
           this.event({ kind: "thinking", content: block.content, durationMs });
         }
         break;

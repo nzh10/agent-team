@@ -101,6 +101,13 @@ describe("streaming markdown blocks", () => {
     expect(markdownBlocks("a\n\n<pre>\nx\n\ny\n</pre>\n\nb")).toHaveLength(1);
   });
 
+  it("resolves references with escaped closing brackets in their label", () => {
+    const text = "See [docs][a\\]b].\n\n[a\\]b]: https://example.com";
+    const whole = renderToStaticMarkup(<MdBlock>{text}</MdBlock>);
+    expect(whole).toContain('href="https://example.com"');
+    expect(renderToStaticMarkup(<StreamingMdBlock>{text}</StreamingMdBlock>)).toBe(whole);
+  });
+
   it("matches one parse around HTML comments and inline triple backticks", () => {
     const same = (text: string) =>
       expect(renderToStaticMarkup(<StreamingMdBlock>{text}</StreamingMdBlock>)).toBe(

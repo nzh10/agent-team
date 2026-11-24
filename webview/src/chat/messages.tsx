@@ -12,7 +12,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import type { Message, MessageOrigin, AgentInfo, StreamEvent } from "../state/useServer";
-import { timelineBlocks } from "./events";
+import { timelineBlocks, type TimelineBlock } from "./events";
 import { toolNameOf, toolSummary } from "../state/stream";
 import { copySelectionAsMarkdown } from "./clipboard";
 import { CodeBlock, CopyButton, MdBlock, StreamingMdBlock } from "./markdown";
@@ -345,8 +345,10 @@ function formatSize(len: number): string {
 export const EventItem = memo(function EventItem({
   ev,
   onLoadDetails,
+  liveThinking = false,
 }: {
   ev: StreamEvent;
+  liveThinking?: boolean;
   // Set while the message is a summary: called on first expand so the
   // bodies get fetched.
   onLoadDetails?: () => void;
@@ -363,11 +365,12 @@ export const EventItem = memo(function EventItem({
 
   const isResult = ev.kind === "tool_result";
   const isToolUse = ev.kind === "tool_use";
+  const isThinking = ev.kind === "thinking";
   const toolName = isToolUse ? toolNameOf(ev) : null;
   const summary = isToolUse ? toolSummary(ev) : "";
   const label = toolName
     ? chipLabelFor(toolName)
-    : ev.kind === "thinking"
+    : isThinking
       ? thinkingLabel(ev)
       : (KIND_LABEL[ev.kind] ?? ev.kind);
   const chipClass = chipClassFor(toolName, ev.kind);
@@ -405,9 +408,9 @@ export const EventItem = memo(function EventItem({
   };
 
   return (
-    <div className={`event event-${ev.kind}`}>
-      <div className="event-row">
-        <span className={`event-chip ${chipClass}`}>{label}</span>
+    <div className={`event event-${ev.kind}${liveThinking ? " live-thinking" : ""}`}>
+      <div className="event-row" aria-hidden={liveThinking || undefined}>
+        {!liveThinking && <span className={`event-chip ${chipClass}`}>{label}</span>}
         {isToolUse && ev.durationMs != null && (
           <span className="event-time" title="From the call to its result">
             {formatRunTime(ev.durationMs)}
@@ -461,9 +464,14 @@ export const EventItem = memo(function EventItem({
           {!bodyMissing &&
             !toolBodyMissing &&
             (!isToolUse || showBodyByDefault || bodyOpen) &&
-            (!duplicateHeading || body) && (
+            (!duplicateHeading || body) &&
+            (!liveThinking || body) && (
               <div className="event-content">
-                <MdBlock>{body}</MdBlock>
+                {isThinking ? (
+                  <StreamingMdBlock>{body}</StreamingMdBlock>
+                ) : (
+                  <MdBlock>{body}</MdBlock>
+                )}
               </div>
             )}
           {hasResult && resultOpen && ev.toolResult != null && (
@@ -786,11 +794,13 @@ function StepTools({ tools }: { tools: string[] }) {
 function StepBox({
   events,
   live,
+  standaloneSince,
   onLoadDetails,
   defaultOpen = false,
 }: {
   events: StreamEvent[];
   live?: string;
+  standaloneSince?: number;
   onLoadDetails?: () => void;
   defaultOpen?: boolean;
 }) {
@@ -803,10 +813,15 @@ function StepBox({
     setToggled(!open);
   };
   const tools = stepTools(events);
-  // The block streaming in counts as the thinking it will be: the header
-  // reads the same before and after, and is never empty.
-  const counted: StreamEvent[] =
-    live != null ? [...events, { kind: "thinking", content: "" }] : events;
+  const items = open
+    ? events.map((ev, i) => <EventItem key={i} ev={ev} onLoadDetails={onLoadDetails} />)
+    : [];
+  // The persisted event takes the same slot, preserving state inside its Markdown body.
+  if (open && live != null) {
+    items.push(
+      <EventItem key={events.length} ev={{ kind: "thinking", content: live }} liveThinking />,
+    );
+  }
   return (
     <div className={`step-group${open ? " open" : ""}`}>
       <div className="step-header" ref={bottom.header} onClick={toggle}>
@@ -819,15 +834,13 @@ function StepBox({
         >
           {open ? "▾" : "▸"}
         </button>
-        {counted.length > 0 && <span className="step-summary">{stepSummary(counted)}</span>}
+        {events.length > 0 && <span className="step-summary">{stepSummary(events)}</span>}
+        {standaloneSince != null && <StepThinkingStatus since={standaloneSince} />}
         {!open && tools.length > 0 && <StepTools tools={tools} />}
       </div>
       {open && (
         <div className="events-list">
-          {events.map((ev, i) => (
-            <EventItem key={i} ev={ev} onLoadDetails={onLoadDetails} />
-          ))}
-          {live != null && <LiveThinking text={live} />}
+          {items}
           <BottomCollapse onClick={bottom.collapse} label="Collapse step trace" />
         </div>
       )}
@@ -837,28 +850,35 @@ function StepBox({
 
 // A segment's events in timeline order: each subagent card and banner is a
 // boundary, so the step boxes between them count only what happened there.
+type StepTimelineProps = {
+  blocks: TimelineBlock[];
+  onLoadEvents?: (taskId: string) => void;
+  onCancelSubagent?: (taskId: string) => void;
+  onLoadDetails?: () => void;
+  defaultOpen?: boolean;
+  // A thinking block streaming in or between its closing delta and final event.
+  live?: string;
+  standaloneSince?: number;
+};
+
 export function StepGroup({
   group,
+  ...props
+}: Omit<StepTimelineProps, "blocks"> & { group: { step: number; events: StreamEvent[] } }) {
+  return <StepTimeline blocks={timelineBlocks(group.events)} {...props} />;
+}
+
+function StepTimeline({
+  blocks,
   onLoadEvents,
   onCancelSubagent,
   onLoadDetails,
   defaultOpen = false,
   live,
-  keepTail = false,
-}: {
-  group: { step: number; events: StreamEvent[] };
-  onLoadEvents?: (taskId: string) => void;
-  onCancelSubagent?: (taskId: string) => void;
-  onLoadDetails?: () => void;
-  defaultOpen?: boolean;
-  // A thinking block streaming in after these events.
-  live?: string;
-  keepTail?: boolean;
-}) {
-  const blocks = timelineBlocks(group.events);
-  // Keep the reader's choice if a closing thinking delta flushes before its final event.
-  if ((keepTail || live != null) && blocks.at(-1)?.kind !== "steps") {
-    blocks.push({ kind: "steps", events: [] });
+  standaloneSince,
+}: StepTimelineProps) {
+  if (live != null && blocks.at(-1)?.kind !== "steps") {
+    blocks = [...blocks, { kind: "steps", events: [] }];
   }
   return (
     <>
@@ -869,6 +889,7 @@ export function StepGroup({
               key={`s${i}`}
               events={block.events}
               live={i === blocks.length - 1 ? live : undefined}
+              standaloneSince={i === blocks.length - 1 ? standaloneSince : undefined}
               onLoadDetails={onLoadDetails}
               defaultOpen={defaultOpen}
             />
@@ -909,16 +930,8 @@ function LiveChip({ secs }: { secs: number }) {
   );
 }
 
-function LiveThinking({ text }: { text: string }) {
-  return (
-    <div className="event event-thinking live-thinking">
-      {text && (
-        <div className="event-content">
-          <StreamingMdBlock>{text}</StreamingMdBlock>
-        </div>
-      )}
-    </div>
-  );
+function StepThinkingStatus({ since }: { since: number }) {
+  return <LiveChip secs={useElapsed(since)} />;
 }
 
 const CALL_SHOWN_AFTER_S = 3;
@@ -959,16 +972,18 @@ function TurnFooter({
   msg,
   activity,
   detailEvents,
+  thinkingInHeader,
 }: {
   msg: Message;
   activity?: string | null;
   detailEvents: StreamEvent[];
+  thinkingInHeader: boolean;
 }) {
   const now = Date.now();
   const thinkingSince = msg.liveThinkingSince;
   let call: StreamEvent | undefined;
   let tickAt = Infinity;
-  if (!activity) {
+  if (!thinkingInHeader && !activity) {
     for (let i = detailEvents.length - 1; i >= 0; i--) {
       const e = detailEvents[i];
       if (!isRunningTool(e) || e.startedAt == null) continue;
@@ -992,7 +1007,7 @@ function TurnFooter({
 
   return (
     <div className="turn-footer">
-      {label ? (
+      {thinkingInHeader ? null : label ? (
         <span className="turn-activity">{label}</span>
       ) : thinkingSince != null ? (
         <LiveChip secs={elapsedSeconds(now, thinkingSince)} />
@@ -1171,7 +1186,10 @@ export const MessageItem = memo(function MessageItem({
     if (segments.length === 0) segments.push({ text: "", events: [] });
     tailAt = joinsLastEvents ? segments.length - 2 : segments.length - 1;
   }
-  const liveBlock = msg.liveThinkingSince != null ? (msg.liveThinking ?? "") : undefined;
+  const liveSince = msg.liveThinkingSince;
+  const liveBlock = liveSince != null ? (msg.liveThinking ?? "") : msg.closingThinking;
+  const tailBlocks = tailAt >= 0 ? timelineBlocks(segments[tailAt].events) : [];
+  const standaloneSince = tailBlocks.at(-1)?.kind === "steps" ? undefined : liveSince;
 
   const time = new Date(msg.timestamp).toLocaleTimeString([], {
     hour: "2-digit",
@@ -1332,13 +1350,13 @@ export const MessageItem = memo(function MessageItem({
                             <MdBlock>{seg.text}</MdBlock>
                           ))}
                         {(seg.events.length > 0 || si === tailAt) && (
-                          <StepGroup
-                            group={{ step: si, events: seg.events }}
+                          <StepTimeline
+                            blocks={si === tailAt ? tailBlocks : timelineBlocks(seg.events)}
                             onLoadEvents={handleLoadEvents}
                             onCancelSubagent={handleCancelSubagent}
                             onLoadDetails={handleLoadDetails}
                             live={si === tailAt ? liveBlock : undefined}
-                            keepTail={si === tailAt}
+                            standaloneSince={si === tailAt ? standaloneSince : undefined}
                           />
                         )}
                       </div>
@@ -1346,7 +1364,12 @@ export const MessageItem = memo(function MessageItem({
                   </div>
                 )}
             {!isUser && streaming && (
-              <TurnFooter msg={msg} activity={agent?.activity} detailEvents={detailEvents} />
+              <TurnFooter
+                msg={msg}
+                activity={agent?.activity}
+                detailEvents={detailEvents}
+                thinkingInHeader={standaloneSince != null}
+              />
             )}
           </div>
         </div>

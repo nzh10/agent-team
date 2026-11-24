@@ -48,6 +48,7 @@ export interface ActiveTurnDiagnostics {
     open: boolean;
     rect: RectBox;
     header?: ElementGeometry;
+    liveChip?: ElementGeometry & { text: string };
     summary?: {
       text: string;
       rect: RectBox;
@@ -257,6 +258,7 @@ export function collectActiveTurn(root: ParentNode = document): ActiveTurnDiagno
     const open = trailingStep.classList.contains("open");
     const headerEl =
       directChild(trailingStep, "step-header") ?? trailingStep.querySelector(".step-header");
+    const liveChipEl = headerEl?.querySelector(".chip-live");
     const summaryEl = headerEl?.querySelector(".step-summary") ?? null;
     const stripEl = headerEl?.querySelector(".step-tools") ?? null;
     const moreEl = stripEl?.querySelector(".step-tools-more") ?? null;
@@ -276,6 +278,12 @@ export function collectActiveTurn(root: ParentNode = document): ActiveTurnDiagno
       open,
       rect: rectBox(trailingStep),
       ...(headerEl && { header: geometryOf(headerEl, ".step-header") }),
+      ...(liveChipEl && {
+        liveChip: {
+          ...geometryOf(liveChipEl, ".step-header .chip-live"),
+          text: boundedText(liveChipEl, MAX_STATUS_TEXT_CHARS),
+        },
+      }),
       ...(summaryEl && {
         summary: {
           text: boundedText(summaryEl, MAX_STATUS_TEXT_CHARS),

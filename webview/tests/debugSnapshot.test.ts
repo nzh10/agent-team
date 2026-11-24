@@ -241,6 +241,30 @@ describe("debug snapshot", () => {
     expect(document.querySelectorAll(".events-list .event-tool_use")).toHaveLength(16);
   });
 
+  it("captures the standalone thinking chip in the header, not as history or footer text", () => {
+    document.body.innerHTML = `
+      <div class="messages">
+        <div id="msg-live" class="message message-agent">
+          <div class="message-body">
+            <div class="step-group">
+              <div class="step-header">
+                <span class="event-chip chip-thinking chip-live">Thinking · 6s</span>
+              </div>
+            </div>
+            <div class="turn-footer"></div>
+          </div>
+        </div>
+      </div>`;
+    const turn = collectSnapshot().activeTurn!;
+    expect(turn.stepGroup?.liveChip).toMatchObject({
+      selector: ".step-header .chip-live",
+      text: "Thinking · 6s",
+    });
+    expect(turn.stepGroup?.summary).toBeUndefined();
+    expect(turn.turnFooter).toMatchObject({ state: "quiet", text: "" });
+    expect(turn.turnFooter?.liveChip).toBeUndefined();
+  });
+
   it("distinguishes activity and quiet states in turn-footer", () => {
     document.body.innerHTML = `
       <div class="messages">

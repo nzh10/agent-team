@@ -115,6 +115,8 @@ export interface StreamEvent {
   // A finished thinking block: how long it took and, once its API call
   // ends, how many tokens it spent. A tool call: from call to result.
   durationMs?: number;
+  // A closing thinking_delta immediately followed by a persisted thinking event.
+  thinkingFollows?: true;
   // Start of a tool call or a live thinking block.
   startedAt?: number;
   waitingSince?: number | null;
@@ -287,6 +289,8 @@ export interface Message {
   detail?: "summary";
   // Text is client-only; the timestamps also arrive in streaming snapshots.
   liveThinking?: string;
+  // Keep the body in place until the separately batched thinking event arrives.
+  closingThinking?: string;
   liveThinkingSince?: number;
   waitingSince?: number;
 }

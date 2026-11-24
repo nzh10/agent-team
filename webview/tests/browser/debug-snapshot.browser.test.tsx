@@ -149,7 +149,8 @@ it("captures real Chromium active-turn layout geometry in folded and live open s
   const foldedStep = folded.activeTurn!.stepGroup!;
   expect(foldedStep.open).toBe(false);
   expect(foldedStep.header!.rect.height).toBeGreaterThan(0);
-  expect(foldedStep.summary?.lineCount).toBe(1);
+  expect(foldedStep.summary).toMatchObject({ text: "4 tool calls", lineCount: 1 });
+  expect(foldedStep.liveChip).toBeUndefined();
   expect(foldedStep.toolsStrip?.scrollWidth).toBeGreaterThan(foldedStep.toolsStrip!.clientWidth);
   expect(foldedStep.toolChips).toHaveLength(4);
   expect(foldedStep.toolChipRowCount).toBe(1);
@@ -181,4 +182,27 @@ it("captures real Chromium active-turn layout geometry in folded and live open s
     expect(json).not.toContain("SECRET_PANEL_PAYLOAD");
     expect(json).not.toContain("SECRET_LONG_PAYLOAD");
   }
+});
+
+it("reports standalone thinking in the step header and a quiet footer of the same height", async () => {
+  await page.viewport(390, 800);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
+  const view = (msg: Message) => (
+    <div className="messages">
+      <MessageItem msg={msg} agents={[agent]} />
+    </div>
+  );
+  const { rerender } = render(view(activeTurn));
+  const initial = collectSnapshot().activeTurn!;
+  rerender(view({ ...activeTurn, content: "", events: [] }));
+  const standalone = collectSnapshot().activeTurn!;
+  expect(standalone.stepGroup?.summary).toBeUndefined();
+  expect(standalone.stepGroup?.liveChip).toMatchObject({
+    selector: ".step-header .chip-live",
+    text: "Thinking · 6s",
+  });
+  expect(standalone.stepGroup!.liveChip!.rect.height).toBeGreaterThan(0);
+  expect(standalone.turnFooter).toMatchObject({ state: "quiet", text: "" });
+  expect(standalone.turnFooter?.rect.height).toBe(initial.turnFooter?.rect.height);
 });
