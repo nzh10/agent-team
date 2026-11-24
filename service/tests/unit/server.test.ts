@@ -310,6 +310,27 @@ describe("server websocket", () => {
     expect(child.exitCode).toBeNull();
   });
 
+  it("returns no history rows for a zero limit, including timestamp ties", async () => {
+    const { ws, next } = await connect();
+    try {
+      for (const [before, limit, hasMore] of [
+        [undefined, 0, true],
+        [1002, 0, true],
+        [1002, -1, true],
+        [1, -1, false],
+      ]) {
+        ws.send(JSON.stringify({ type: "load_messages", workspaceId: "ws-h", before, limit }));
+        expect(await next("workspace_messages")).toMatchObject({ messages: [], hasMore });
+      }
+      ws.send(JSON.stringify({ type: "load_messages", workspaceId: "ws-h", limit: "bad" }));
+      const page = await next("workspace_messages");
+      expect(page.hasMore).toBe(false);
+      expect((page.messages as Message[]).map(({ id }) => id)).toContain("m0");
+    } finally {
+      ws.close();
+    }
+  });
+
   it("pages back through history without skipping same-millisecond messages", async () => {
     const { ws, next } = await connect();
     const seen: Message[] = [];

@@ -646,7 +646,7 @@ describe("per-message effort and context", () => {
     });
     const restored = Workspace.fromState(ws.getState(), registry);
     expect(restored.getInfo(false).agents[0].context).toEqual({ tokens: 42000, window: 200000 });
-    expect(patches.filter(Boolean)).toEqual([{ context: { tokens: 42000, window: 200000 } }]);
+    expect(patches).toContainEqual({ context: { tokens: 42000, window: 200000 } });
   });
 });
 

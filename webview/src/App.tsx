@@ -178,6 +178,7 @@ export function App() {
     cancelQueued,
     startReplayDemo,
     lastError,
+    showError,
     clearError,
     searchServer,
     searchResults,
@@ -1283,7 +1284,7 @@ export function App() {
     }
     sendingRef.current = true;
     setSending(true);
-    let sent = false;
+    let outcome: Awaited<ReturnType<typeof sendMessage>>;
     try {
       let images: Array<{ name: string; url: string }> | undefined;
       if (pendingImages.length > 0) {
@@ -1292,13 +1293,13 @@ export function App() {
           images = await Promise.all(pendingImages.map(({ file }) => uploadImage(file)));
         } catch (e) {
           console.error("Image upload failed:", e);
-          alert(`Image upload failed: ${e instanceof Error ? e.message : String(e)}`);
+          showError(`Image upload failed: ${e instanceof Error ? e.message : String(e)}`);
           return;
         } finally {
           setUploading(false);
         }
       }
-      sent = await sendMessage(
+      outcome = await sendMessage(
         ws.id,
         text,
         undefined,
@@ -1311,8 +1312,9 @@ export function App() {
       sendingRef.current = false;
       setSending(false);
     }
-    // Not sent: the draft, images and quote stay for another try.
-    if (!sent) return;
+    // Retain only a definitively unsent draft. An unknown delivery may
+    // already be in the conversation; don't leave it ready for a double-send.
+    if (outcome === "not_sent" || outcome === "rejected") return;
     if (pendingImages.length > 0) {
       pendingImages.forEach((img) => URL.revokeObjectURL(img.preview));
       setPendingImages([]);
@@ -1334,7 +1336,7 @@ export function App() {
       el.style.height = "36px";
     }
     setHasInput(false);
-  }, [sendMessage, pendingImages, quotedMsg]);
+  }, [sendMessage, showError, pendingImages, quotedMsg]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (isImeKeyEvent(e, composingRef.current, compositionEndTsRef.current)) return;

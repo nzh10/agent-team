@@ -603,14 +603,90 @@ describe("sending", () => {
   const sentMessages = () =>
     FakeSocket.instances.flatMap((s) => s.frames()).filter((f) => f.type === "send_message");
 
+  it.each(["accepted", "rejected", "disconnect", "timeout"])(
+    "distinguishes a sent frame's %s outcome",
+    async (event) => {
+      const { result, ws } = connected();
+      let sent!: ReturnType<typeof result.current.sendMessage>;
+      await act(async () => {
+        ws.receive({ ...init, sendReceipt: true });
+        sent = result.current.sendMessage("w", "send once");
+        const { requestId } = sentMessages()[0];
+        if (event === "accepted") ws.receive({ type: "send_receipt", requestId });
+        if (event === "rejected")
+          ws.receive({ type: "error", requestId, message: "Invalid input" });
+        if (event === "disconnect") ws.drop();
+        if (event === "timeout") {
+          for (let i = 0; i < Math.ceil(120_000 / HEARTBEAT_MS); i++) {
+            vi.advanceTimersByTime(HEARTBEAT_MS);
+            ws.receive({ type: "pong" });
+          }
+        }
+        await sent;
+      });
+      expect(await sent).toBe(event === "disconnect" || event === "timeout" ? "unknown" : event);
+      if (event === "disconnect" || event === "timeout") {
+        expect(result.current.lastError).toMatch(/unconfirmed.*check/i);
+        expect(result.current.lastError).not.toMatch(/failed|retry/i);
+      }
+      expect(sentMessages()).toHaveLength(1);
+    },
+  );
+
+  it("renders the same queue target, steering badge and actions live as in a fresh snapshot", () => {
+    const live = connected();
+    const fresh = connected();
+    const queued = {
+      id: "queued",
+      kind: "user",
+      agentId: null,
+      content: "Queued",
+      timestamp: 2,
+      status: "queued",
+    };
+    const page = (message: Record<string, unknown>) => ({
+      type: "workspace_messages",
+      workspaceId: "w",
+      messages: [message],
+    });
+    const update = (message: Record<string, unknown>) => ({
+      type: "message_done",
+      workspaceId: "w",
+      messageId: queued.id,
+      content: queued.content,
+      ...message,
+    });
+    const visible = (client: ReturnType<typeof connected>) => {
+      const message = client.result.current.workspaces[0].messages[0];
+      return {
+        queuedFor: message.queuedFor,
+        steering: Boolean(message.steering),
+        canCancel: message.status === "queued" && !message.steering,
+      };
+    };
+    act(() => live.ws.receive(page({ ...queued, queuedFor: "original", steering: true })));
+    act(() => {
+      live.ws.receive(update({ status: "queued", queuedFor: "successor", steering: false }));
+      fresh.ws.receive(page({ ...queued, queuedFor: "successor" }));
+    });
+    expect(visible(live)).toEqual(visible(fresh));
+    expect(visible(live)).toEqual({ queuedFor: "successor", steering: false, canCancel: true });
+    act(() => {
+      live.ws.receive(update({ status: "done", queuedFor: null, steering: false }));
+      fresh.ws.receive(page({ ...queued, status: "done" }));
+    });
+    expect(visible(live)).toEqual(visible(fresh));
+    expect(visible(live)).toEqual({ queuedFor: undefined, steering: false, canCancel: false });
+  });
+
   it("reports a message it could not send instead of dropping it silently", async () => {
     const { result, ws } = connected();
     act(() => ws.drop());
-    let sent: boolean | undefined;
+    let sent: string | undefined;
     await act(async () => {
       sent = await result.current.sendMessage("w", "a long prompt");
     });
-    expect(sent).toBe(false);
+    expect(sent).toBe("not_sent");
     expect(sentMessages()).toEqual([]);
     expect(result.current.lastError).toMatch(/not connected/i);
   });
@@ -619,7 +695,7 @@ describe("sending", () => {
     const { result, ws } = connected();
     act(() => setVisibility("visible"));
     expect(ws.frames().at(-1)).toEqual({ type: "ping" });
-    let sent: Promise<boolean> | undefined;
+    let sent: Promise<string> | undefined;
     act(() => {
       sent = result.current.sendMessage("w", "hi");
     });
@@ -628,14 +704,14 @@ describe("sending", () => {
       ws.receive({ type: "pong" });
       await sent;
     });
-    expect(await sent).toBe(true);
+    expect(await sent).toBe("unknown"); // This server does not advertise receipts.
     expect(sentMessages()).toMatchObject([{ content: "hi" }]);
   });
 
   it("does not write into a socket the probe finds dead (phone just woke up)", async () => {
     const { result, ws } = connected();
     act(() => setVisibility("visible"));
-    let sent: Promise<boolean> | undefined;
+    let sent: Promise<string> | undefined;
     act(() => {
       sent = result.current.sendMessage("w", "hi");
     });
@@ -643,7 +719,7 @@ describe("sending", () => {
       vi.advanceTimersByTime(PROBE_TIMEOUT_MS);
       await sent;
     });
-    expect(await sent).toBe(false);
+    expect(await sent).toBe("not_sent");
     expect(ws.readyState).toBe(FakeSocket.CLOSED);
     expect(sentMessages()).toEqual([]);
   });

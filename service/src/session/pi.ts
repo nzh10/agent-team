@@ -36,8 +36,10 @@ import { decodeExtensionUi } from "./pi-extension-ui";
 import { extractPiToolResultText, formatPiToolUse } from "./pi-tool-format";
 import { ACP } from "./quota-schema";
 import { retireOnEof } from "./retire";
+import { formatReportMarker } from "./types";
 import type {
   ActiveAsyncRunRecord,
+  DispatchAttempt,
   BackgroundTask,
   BoundedSessionProof,
   CommandInfo,
@@ -333,6 +335,27 @@ function sessionMessageText(entry: Json): string | undefined {
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text as string)
     .join("\n");
+}
+
+// A removed agent cannot be resumed to run the bridge's live probe. A
+// durable user entry proves receipt; absence never proves non-delivery
+// (Pi can buffer an initial user entry until the first assistant entry).
+export function hasPersistedPiReport(attempt: DispatchAttempt, cwd: string): boolean {
+  if (!attempt.piSession || !attempt.reportId) return false;
+  try {
+    const parsed = readSessionFile(attempt.piSession.file);
+    validateSessionHeader(parsed, attempt.piSession.id, cwd);
+    const marker = formatReportMarker(attempt.reportId);
+    return parsed.entries.some(
+      (entry, index) =>
+        index >= attempt.beforeEntryCount &&
+        entry.type === "message" &&
+        object(entry.message).role === "user" &&
+        sessionMessageText(entry)?.startsWith(marker),
+    );
+  } catch {
+    return false;
+  }
 }
 
 function validateSessionHeader(parsed: ParsedSessionFile, sessionId: string, cwd: string): void {
@@ -1101,6 +1124,11 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
             beforeLeafId: this.expectedLeafAnchorId,
             beforeEntryCount: this.minEntryCount,
             startedAt: Date.now(),
+            ...(envelope.reportId &&
+              this.sessionFile &&
+              this.sessionId && {
+                piSession: { file: this.sessionFile, id: this.sessionId },
+              }),
           });
         } catch (error) {
           // PiRpcClient has not invoked stdin.write yet: this was never a write claim.

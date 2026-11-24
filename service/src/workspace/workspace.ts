@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { applyExtensionUi } from "../../../shared/extension-ui";
-import { validatePiAttachments } from "../session/pi";
+import { hasPersistedPiReport, validatePiAttachments } from "../session/pi";
 import {
   SessionConfig,
   StreamEvent,
@@ -253,14 +253,17 @@ export interface WorkspaceCallbacks {
     status: MessageStatus,
     content: string,
     events?: StreamEvent[],
-    patch?: Partial<Pick<Message, "context" | "effort" | "thinking">>,
+    patch?: Partial<Pick<Message, "context" | "effort" | "thinking">> & {
+      queuedFor?: string | null;
+      steering?: boolean;
+    },
   ) => void;
   onAgentBusy?: (wsId: string, agentId: string) => void;
   onAgentIdle?: (wsId: string, agentId: string) => void;
   onSaveNow?: () => void;
   onReportDeliveryState?: (
     reportId: string,
-    state: "dispatching" | "sent_to_pi" | "outcome_unknown" | "error" | "settled",
+    state: "enqueued" | "dispatching" | "sent_to_pi" | "outcome_unknown" | "error" | "settled",
     meta?: { errorMessage?: string; acceptedByPiAt?: number; settledAt?: number },
   ) => void;
   onExtensionUi?: (event: ExtensionUiEvent) => void;
@@ -619,7 +622,12 @@ export class Workspace {
     patch?: Partial<Pick<Message, "context" | "effort" | "thinking">>,
   ): void {
     this.changed.add(id);
-    this.cb?.onMessageDone(this.id, id, status, content, events, patch);
+    const msg = this.findMessage(id);
+    const queue =
+      msg?.kind === "user"
+        ? { queuedFor: msg.queuedFor ?? null, steering: msg.steering ?? false }
+        : undefined;
+    this.cb?.onMessageDone(this.id, id, status, content, events, { ...patch, ...queue });
   }
 
   private pushMessage(msg: Message): void {
@@ -1194,14 +1202,29 @@ export class Workspace {
     return handler;
   }
 
-  // Returns the ids of the agent's queued messages, which are dropped with
-  // it; null if there is no such agent.
+  private readonly retiredReportAgents = new Map<string, Promise<void>>();
+
+  // Returns the ids of messages dropped with the agent; null if absent.
   removeAgent(agentId: string): string[] | null {
     const entry = this.agents.get(agentId);
     if (!entry) return null;
 
-    this.cancelOpeningPrompt(entry, "Agent removed");
-    void this.releaseSession(agentId, entry);
+    const opening = entry.openingPrompt;
+    if (opening?.envelope.reportId && opening.input) {
+      entry.openingPrompt = undefined;
+      if (!opening.writeClaimed) this.requeueReport(opening.input);
+    } else {
+      this.cancelOpeningPrompt(entry, "Agent removed");
+    }
+    const cleanup = this.releaseSession(agentId, entry);
+    if (
+      this.messages.some(
+        (m) => m.queuedFor === agentId && m.status === "dispatching" && m.dispatchAttempt?.reportId,
+      )
+    ) {
+      this.retiredReportAgents.set(agentId, cleanup);
+      void cleanup.finally(() => this.retiredReportAgents.delete(agentId)).catch(() => {});
+    }
     this.finalizeAbort(entry, false);
     this.agents.delete(agentId);
     this.cb?.onCommandsUpdate?.(agentId, []);
@@ -1215,10 +1238,11 @@ export class Workspace {
     const heir = this.resolveAgent();
     const queued = this.messages.filter((m) => m.status === "queued" && m.queuedFor === agentId);
     for (const m of queued) {
-      if (!heir || !m.from) continue;
-      m.queuedFor = heir.info.id;
+      if (heir && m.from) m.queuedFor = heir.info.id;
+      else if (m.queuedEnvelope?.reportId) delete m.queuedFor;
+      else continue;
       delete m.steering;
-      this.changed.add(m.id);
+      this.finished(m.id, m.status, m.content);
     }
     const dropped = queued.filter((m) => m.queuedFor === agentId).map((m) => m.id);
     this.messages = this.messages.filter((m) => !dropped.includes(m.id));
@@ -1554,6 +1578,8 @@ export class Workspace {
       clearLiveTiming(agentMsg);
       this.pushMessage(agentMsg);
       this.finished(agentMsg.id, "done", cmdResult);
+      const text = cleanContent.trim();
+      if (/^\/fast(?: |$)|^\/(?:model|effort) +\S/.test(text)) this.cb?.onSaveNow?.();
       onAccepted?.();
       return;
     }
@@ -1705,6 +1731,7 @@ export class Workspace {
     // Given back meanwhile (unread) when the turn ended under the request.
     if (taken || !msg.steering) return;
     delete msg.steering;
+    this.finished(msg.id, msg.status, msg.content);
     this.dequeueNext(agent.info.id);
   }
 
@@ -1748,6 +1775,8 @@ export class Workspace {
       if (this.projectLink?.unreported && (m.from?.role === "lead" || m.from?.role === "panel")) {
         this.messages.splice(this.messages.indexOf(m), 1);
         this.cb?.onMessageRemoved?.(this.id, m.id);
+      } else {
+        this.finished(m.id, m.status, m.content);
       }
     }
   }
@@ -1848,15 +1877,24 @@ export class Workspace {
           },
         },
       );
-      if (agent.openingPrompt !== opening) return;
+      if (agent.openingPrompt !== opening) {
+        if (
+          envelope.reportId &&
+          input?.status === "dispatching" &&
+          !this.agents.has(agent.info.id) &&
+          receipt?.disposition === "rejected"
+        ) {
+          const heir = this.resolveAgent();
+          input.queuedFor = heir?.info.id;
+          this.requeueReport(input);
+          if (heir) this.dequeueNext(heir.info.id);
+        }
+        return;
+      }
       if (receipt?.disposition === "rejected") {
         if (receipt.retryable && input) {
-          this.touch([input.id]);
-          input.status = "queued";
-          delete input.dispatchAttempt;
-          this.cb?.onSaveNow?.();
+          this.requeueReport(input);
           agent.openingPrompt = undefined;
-          this.finished(input.id, "queued", input.content);
           this.settleIdleReply(agent);
           setTimeout(() => this.dequeueNext(agent.info.id), 100);
         } else {
@@ -1877,6 +1915,17 @@ export class Workspace {
         err instanceof Error ? err.message : String(err),
       );
     }
+  }
+
+  // Flush the proof of an unsent attempt before mirroring the journal.
+  private requeueReport(msg: Message): void {
+    this.touch([msg.id]);
+    msg.status = "queued";
+    delete msg.dispatchAttempt;
+    this.cb?.onSaveNow?.();
+    if (msg.queuedEnvelope?.reportId)
+      this.cb?.onReportDeliveryState?.(msg.queuedEnvelope.reportId, "enqueued");
+    this.finished(msg.id, msg.status, msg.content);
   }
 
   private enqueue(msg: Message, envelope: PromptEnvelope): void {
@@ -1907,6 +1956,7 @@ export class Workspace {
     msg.status = status;
     delete msg.queuedEnvelope;
     delete msg.queuedFor;
+    delete msg.steering;
     this.cb?.onSaveNow?.();
     if (reportId)
       this.cb?.onReportDeliveryState?.(
@@ -1983,7 +2033,14 @@ export class Workspace {
     content: string,
   ): Message {
     const existing = this.findMessage(id);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.status === "queued" && !existing.queuedFor) {
+        existing.queuedFor = agentId;
+        this.finished(existing.id, existing.status, existing.content);
+        this.cb?.onSaveNow?.();
+      }
+      return existing;
+    }
     const msg: Message = {
       id,
       agentId: null,
@@ -2007,10 +2064,7 @@ export class Workspace {
 
   settlePlainDispatchingOnRestore(): void {
     for (const msg of this.messages) {
-      if (
-        msg.status === "dispatching" &&
-        (!msg.dispatchAttempt?.reportId || !msg.queuedFor || !this.agents.has(msg.queuedFor))
-      ) {
+      if (msg.status === "dispatching" && !msg.dispatchAttempt?.reportId) {
         this.completeDispatch(msg, "outcome_unknown");
       }
     }
@@ -2021,7 +2075,24 @@ export class Workspace {
     commit: (settle: () => void) => Promise<void>,
     probe = true,
   ): Promise<void> {
-    const entry = this.agents.get(msg.queuedFor ?? "");
+    const agentId = msg.queuedFor;
+    const entry = this.agents.get(agentId ?? "");
+    if (!entry && msg.status === "dispatching") {
+      const attempt = msg.dispatchAttempt;
+      await this.retiredReportAgents.get(agentId ?? "")?.catch(() => {});
+      await commit(() => {
+        if (
+          msg.status !== "dispatching" ||
+          msg.queuedFor !== agentId ||
+          msg.dispatchAttempt !== attempt ||
+          !attempt?.reportId
+        )
+          return;
+        const found = hasPersistedPiReport(attempt, this.normalizedCwd);
+        this.completeDispatch(msg, found ? "done" : "outcome_unknown");
+      });
+      return;
+    }
     if (
       !entry ||
       entry.recoveringDispatching ||
@@ -2046,10 +2117,14 @@ export class Workspace {
           /* No positive proof: never resend. */
         }
       }
-      await commit(() => {
-        if (msg.status === "dispatching")
-          this.completeDispatch(msg, found && this.isWritable() ? "done" : "outcome_unknown");
-      });
+      if (!this.agents.has(entry.info.id)) {
+        await this.recoverDispatchingReport(msg, commit, probe);
+      } else {
+        await commit(() => {
+          if (msg.status === "dispatching")
+            this.completeDispatch(msg, found && this.isWritable() ? "done" : "outcome_unknown");
+        });
+      }
     } finally {
       entry.recoveringDispatching = false;
     }
@@ -2536,11 +2611,15 @@ export class Workspace {
       if (restoreMessage(msg)) ws.touch([msg.id]);
       return msg;
     });
-    // Queued for an agent that no longer exists: nothing will ever run it.
+    // An orphaned queued report is still owned by the Lead workspace.
     const agentIds = new Set(state.agents.map((a) => a.id));
-    ws.messages = ws.messages.filter(
-      (m) => m.status !== "queued" || !m.queuedFor || agentIds.has(m.queuedFor),
-    );
+    ws.messages = ws.messages.filter((m) => {
+      if (m.status !== "queued" || !m.queuedFor || agentIds.has(m.queuedFor)) return true;
+      if (!m.queuedEnvelope?.reportId) return false;
+      delete m.queuedFor;
+      ws.touch([m.id]);
+      return true;
+    });
     const lastMsg = ws.messages[ws.messages.length - 1];
     ws.lastActivityAt = Math.max(
       state.lastActivityAt ?? 0,

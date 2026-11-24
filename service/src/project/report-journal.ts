@@ -12,6 +12,7 @@ export interface FrozenContextWrite {
   objectiveId: string;
   expectedPrevUpdatedAt: number | null;
   context: string;
+  stamp?: { at: number; commit?: string };
 }
 
 export interface FrozenTaskTransition {

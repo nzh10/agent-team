@@ -177,6 +177,7 @@ export interface DispatchAttempt {
   beforeLeafId: string | null;
   beforeEntryCount: number;
   startedAt: number;
+  piSession?: { file: string; id: string };
 }
 
 export type SendDisposition = "started" | "handled" | "rejected";

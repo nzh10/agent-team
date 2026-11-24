@@ -1,6 +1,6 @@
 import type { Message } from "./workspace";
 import type { StreamEvent } from "../session/types";
-import { PANEL_ACTIONS } from "../project/tools";
+import { panelActionOf } from "../../../shared/panel-actions";
 
 // History pages carry only what the collapsed view needs: kinds, chips,
 // counts, banners. Bodies (thinking text, tool output, subagent transcripts)
@@ -39,7 +39,7 @@ export function summarizeEvent(e: StreamEvent): StreamEvent {
     case "tool_use":
       // The panel's calls show as lines of their own (a session started, a
       // message sent): what was sent and answered, like a banner's text.
-      if (PANEL_ACTIONS.has(e.toolName?.replace(/^mcp__panel__/, "") ?? "")) {
+      if (panelActionOf(e)) {
         base.content = capped(e.content ?? "");
         base.bodyLength = (e.content ?? "").length;
         if (e.toolResult != null) {

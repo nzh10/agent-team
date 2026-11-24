@@ -476,6 +476,8 @@ function resolveWsUrl(): string {
   return `${proto}//${loc.host}${loc.pathname}`;
 }
 
+export type SendOutcome = "not_sent" | "rejected" | "accepted" | "unknown";
+
 export function useServer() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -530,9 +532,9 @@ export function useServer() {
   const buildIdRef = useRef<string | null>(null);
   const sendReceiptRef = useRef(false);
   const nextSendRef = useRef(0);
-  const sendWaitersRef = useRef(new Map<string, (accepted: boolean) => void>());
+  const sendWaitersRef = useRef(new Map<string, (outcome: SendOutcome) => void>());
   const failPendingSends = useCallback(() => {
-    for (const finish of sendWaitersRef.current.values()) finish(false);
+    for (const finish of sendWaitersRef.current.values()) finish("unknown");
   }, []);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   // Pending liveness probe; cleared by any frame from the server.
@@ -957,6 +959,10 @@ export function useServer() {
                     ...withoutLiveTiming(m),
                     status,
                     content,
+                    ...("queuedFor" in msg
+                      ? { queuedFor: (msg.queuedFor as string | null) ?? undefined }
+                      : {}),
+                    ...("steering" in msg ? { steering: msg.steering === true || undefined } : {}),
                     ...(merged ? { events: merged } : {}),
                     ...(context ? { context } : {}),
                     ...(effort ? { effort } : {}),
@@ -1157,11 +1163,12 @@ export function useServer() {
           break;
 
         case "send_receipt":
-          sendWaitersRef.current.get(String(msg.requestId))?.(true);
+          sendWaitersRef.current.get(String(msg.requestId))?.("accepted");
           break;
 
         case "error":
-          if (typeof msg.requestId === "string") sendWaitersRef.current.get(msg.requestId)?.(false);
+          if (typeof msg.requestId === "string")
+            sendWaitersRef.current.get(msg.requestId)?.("rejected");
           console.error("[server]", msg.message);
           setLastError(String(msg.message));
           break;
@@ -1356,6 +1363,7 @@ export function useServer() {
     refreshQuota,
     archiveAfterDays,
     lastError,
+    showError: setLastError,
     clearError: useCallback(() => setLastError(null), []),
     loadMessages: useCallback(
       (wsId: string, before?: number, pageSize?: number) => {
@@ -1466,31 +1474,29 @@ export function useServer() {
         target?: string,
         images?: Array<{ name: string; url: string }>,
         quote?: { messageId: string; agentId: string | null; content: string },
-      ): Promise<boolean> => {
+      ): Promise<SendOutcome> => {
         if (probeRef.current) await new Promise<void>((r) => probeWaitersRef.current.push(r));
         const data = { type: "send_message", workspaceId: wsId, content, target, images, quote };
-        if (!sendReceiptRef.current) {
-          const sent = send(data);
-          if (!sent) setLastError("Not connected: the message was not sent");
-          return sent;
-        }
-        const requestId = String(++nextSendRef.current);
-        return new Promise<boolean>((resolve) => {
-          const timer = setTimeout(() => {
-            setLastError("No send confirmation. Check the conversation before retrying.");
-            finish(false);
-          }, 120_000);
-          const finish = (accepted: boolean) => {
-            clearTimeout(timer);
-            sendWaitersRef.current.delete(requestId);
-            resolve(accepted);
-          };
-          sendWaitersRef.current.set(requestId, finish);
-          if (!send({ ...data, requestId })) {
-            setLastError("Not connected: the message was not sent");
-            finish(false);
-          }
-        });
+        const outcome = !sendReceiptRef.current
+          ? send(data)
+            ? "unknown"
+            : "not_sent"
+          : await new Promise<SendOutcome>((resolve) => {
+              const requestId = String(++nextSendRef.current);
+              const timer = setTimeout(() => finish("unknown"), 120_000);
+              const finish = (result: SendOutcome) => {
+                clearTimeout(timer);
+                sendWaitersRef.current.delete(requestId);
+                resolve(result);
+              };
+              sendWaitersRef.current.set(requestId, finish);
+              if (!send({ ...data, requestId })) finish("not_sent");
+            });
+        if (outcome === "unknown")
+          setLastError("Delivery is unconfirmed. Check the conversation before sending again.");
+        else if (outcome === "not_sent")
+          setLastError("Not connected: the message was not sent. You can retry.");
+        return outcome;
       },
       [send],
     ),

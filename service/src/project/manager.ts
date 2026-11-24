@@ -970,7 +970,8 @@ export class ProjectManager {
     const current = journal.getByReportId(reportId)?.leadDelivery.state;
     if (
       !current ||
-      deliveryStateRank(state) <= deliveryStateRank(current) ||
+      (deliveryStateRank(state) <= deliveryStateRank(current) &&
+        !(current === "dispatching" && state === "enqueued")) ||
       (state === "settled" && current !== "sent_to_pi")
     )
       return;
@@ -1934,14 +1935,28 @@ export class ProjectManager {
     const w = this.host.workspace(workspaceId);
     const id = w?.projectLink?.role === "worker" ? w.projectLink.projectId : undefined;
     if (!w || !id) throw new Error("This session has no project lead");
+    const receivedAt = Date.now();
+    const stamp = final && finish.context ? await this.stamp(id, w.id) : undefined;
     const { ack, online } = await this.commitLock.run(id, () => {
       const project = this.requireActive(id);
       this.checkReporting(w);
       const journal = this.journal(id);
       const online = this.leadOnline(project);
-      if (journal.findByCallId(callId))
-        return { ack: final ? "Reported to the lead." : "Sent to the lead.", online };
-      if (online && !this.leadOf(id)?.resolveAgent()) throw new Error("Project lead has no agent");
+      const waiting = online && !this.leadOf(id)?.resolveAgent();
+      const saved = waiting
+        ? "Report saved and awaiting a Lead agent."
+        : "Report saved for the offline lead.";
+      const duplicate = journal.findByCallId(callId);
+      if (duplicate)
+        return {
+          ack:
+            duplicate.leadDelivery.state === "pending" && (!online || waiting)
+              ? saved
+              : final
+                ? "Reported to the lead."
+                : "Sent to the lead.",
+          online,
+        };
       let frozenPlan: FrozenReportPlan | null = null;
       let unwritten = "";
       if (final) {
@@ -1960,6 +1975,7 @@ export class ProjectManager {
                 objectiveId: target.id,
                 expectedPrevUpdatedAt: target.updatedAt,
                 context: finish.context,
+                stamp: { at: receivedAt, commit: stamp?.commit },
               };
           }
         }
@@ -1988,14 +2004,15 @@ export class ProjectManager {
         frozenPlan,
         boardState: final ? "pending" : "not_applicable",
         leadDelivery: { state: "pending" },
-        createdAt: Date.now(),
+        createdAt: receivedAt,
       });
       return {
-        ack: online
-          ? final
-            ? `Reported to the lead.${unwritten}`
-            : "Sent to the lead."
-          : `Report saved for the offline lead.${unwritten}`,
+        ack:
+          online && !waiting
+            ? final
+              ? `Reported to the lead.${unwritten}`
+              : "Sent to the lead."
+            : `${saved}${unwritten}`,
         online,
       };
     });
@@ -2006,7 +2023,12 @@ export class ProjectManager {
     return ack;
   }
 
-  private applyFrozenReport(id: string, workerId: string, plan: FrozenReportPlan): void {
+  private applyFrozenReport(
+    id: string,
+    workerId: string,
+    plan: FrozenReportPlan,
+    receivedAt: number,
+  ): void {
     const worker = this.host.workspace(workerId);
     if (worker) {
       for (const inputId of plan.answeredInputIds) worker.markAnswered(inputId);
@@ -2027,8 +2049,8 @@ export class ProjectManager {
         next = {
           ...next,
           context: context.context,
-          contextWritten: Date.now(),
-          contextCommit: undefined,
+          contextWritten: context.stamp?.at ?? receivedAt,
+          contextCommit: context.stamp?.commit,
         };
       }
       const tasks = current.tasks.map((task) =>
@@ -2045,6 +2067,14 @@ export class ProjectManager {
       if (tasks.some((task, i) => task !== current.tasks[i])) next = { ...next, tasks };
       if (next !== current) this.saveObjective(id, next);
     }
+  }
+
+  leadAgentsChanged(workspace: Workspace): void {
+    const link = workspace.projectLink;
+    if (link?.role !== "lead" || !this.store.get(link.projectId)) return;
+    void this.drainInbox(link.projectId).catch((error) =>
+      console.error(`[projects] ${link.projectId}: report drain failed`, error),
+    );
   }
 
   async drainInbox(id: string, dispatch = true): Promise<void> {
@@ -2076,7 +2106,7 @@ export class ProjectManager {
         for (const report of entries) {
           if (report.kind !== "final" || report.boardState !== "pending" || !report.frozenPlan)
             continue;
-          this.applyFrozenReport(id, report.workerWsId, report.frozenPlan);
+          this.applyFrozenReport(id, report.workerWsId, report.frozenPlan, report.createdAt);
           journal.updateBoardState(report.reportId, "applied");
         }
       }
@@ -2086,8 +2116,14 @@ export class ProjectManager {
       this.host.saveWorkspaceNow(target);
       const outcomes = entries.map((report) => {
         const msg = target.findMessage(report.leadMessageId);
+        // The row is flushed first on explicit rejection, so this also
+        // covers a crash before the journal has recorded that rollback.
+        const unsent = msg?.status === "queued" && !msg.dispatchAttempt;
+        const state = report.leadDelivery.state;
+        if (unsent && state === "dispatching")
+          journal.updateLeadDelivery(report.reportId, { state: "enqueued" });
         const reconciliation = reconcileReportDeliveryState(
-          report.leadDelivery.state,
+          unsent && state === "dispatching" ? "enqueued" : state,
           msg?.status ?? null,
         );
         if (reconciliation.journalNeedsUpdate)
@@ -2104,7 +2140,12 @@ export class ProjectManager {
               active && online,
             ),
           );
-        } else if (active && online && reconciliation.shouldEnqueue) {
+        } else if (
+          active &&
+          online &&
+          (reconciliation.shouldEnqueue ||
+            (!reconciliation.isTerminal && msg?.status === "queued" && !msg.queuedFor))
+        ) {
           const agent = target.resolveAgent();
           if (!agent || (target.isArchived && !this.host.restoreWorkspace(target))) continue;
           const body = `${report.kind === "final" ? "Finished" : "Progress"}:

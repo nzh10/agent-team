@@ -370,14 +370,10 @@ describe("Pi workspace lifecycle regressions", () => {
     session.emit("event", { kind: "result", content: "" });
     ws.dequeueNext(agent.id);
     expect(next.status).toBe("starting");
-    expect(onMessageDone).toHaveBeenCalledWith(
-      ws.id,
-      next.id,
-      "starting",
-      "next",
-      undefined,
-      undefined,
-    );
+    expect(onMessageDone).toHaveBeenCalledWith(ws.id, next.id, "starting", "next", undefined, {
+      queuedFor: agent.id,
+      steering: false,
+    });
     expect(ws.cancelQueued(next.id)).toBe(false);
     expect(agentMsgs()).toHaveLength(1);
     second.write();

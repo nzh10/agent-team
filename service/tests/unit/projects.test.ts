@@ -1291,7 +1291,7 @@ describe("ProjectManager", () => {
 });
 
 describe("project messages that must not be lost or looped", () => {
-  it("fail the tool when the target has no agent, before touching the board", async () => {
+  it("saves a report awaiting a Lead agent but rejects direct sends to an empty worker", async () => {
     const { create, call, workers, manager, objectives } = setup();
     const { lead } = create("clice");
     await withTask(call, lead);
@@ -1305,8 +1305,10 @@ describe("project messages that must not be lost or looped", () => {
     const [worker] = workers();
     lead.removeAgent([...lead.agents.keys()][0]);
 
-    await expect(call(worker, "finish_task", { summary: "done" })).rejects.toThrow("has no agent");
-    expect(objectives()[0].tasks[0].state).toBe("doing");
+    await expect(call(worker, "finish_task", { summary: "done" })).resolves.toMatch(
+      /saved.*awaiting a Lead/,
+    );
+    expect(objectives()[0].tasks[0].state).toBe("review");
     worker.removeAgent([...worker.agents.keys()][0]);
     const tools = manager.toolsFor(lead)!.tools;
     await expect(

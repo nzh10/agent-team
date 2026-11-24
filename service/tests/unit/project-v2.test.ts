@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,6 +13,7 @@ import type {
   DispatchAttempt,
   PromptEnvelope,
   SendHooks,
+  SendReceipt,
   UiDialogRequest,
 } from "../../src/session/types";
 import {
@@ -71,7 +73,14 @@ async function fixture() {
     }
     const leadAfter = f.workspaces.get(lead.id)!;
     const workerAfter = f.workspaces.get(worker.id)!;
-    return { manager, lead: leadAfter, worker: workerAfter, session: f.session(leadAfter) };
+    return {
+      manager,
+      lead: leadAfter,
+      worker: workerAfter,
+      get session() {
+        return f.session(leadAfter);
+      },
+    };
   };
   const call = (w: Workspace, name: string, args: Record<string, unknown> = {}, id?: string) =>
     f
@@ -316,6 +325,202 @@ describe("Report outbox crash boundaries", () => {
       }
     },
   );
+
+  it("keeps a queued report through removal of the last Lead and delivers it to the successor", async () => {
+    const f = await fixture();
+    try {
+      f.setOnline(false);
+      await f.finish();
+      const before = f.restart();
+      f.setOnline(true);
+      await before.manager.drainInbox(f.project.id, false);
+      const [report] = f.journal();
+      expect(before.lead.findMessage(report.leadMessageId)?.status).toBe("queued");
+      before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
+      f.save(before.lead);
+      const after = f.restart();
+      expect(after.lead.agents.size).toBe(0);
+      after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+      after.manager.leadAgentsChanged(after.lead);
+      await vi.waitFor(() => expect(after.session.sent).toHaveLength(1));
+      expect(after.lead.findMessage(report.leadMessageId)?.status).toBe("done");
+    } finally {
+      f.close();
+    }
+  });
+
+  it.each(["rejected", "received", "unknown"])(
+    "recovers a removed Lead's dispatching report: %s",
+    async (evidence) => {
+      const f = await fixture();
+      try {
+        f.setOnline(false);
+        await f.finish();
+        const before = f.restart();
+        f.setOnline(true);
+        await before.manager.drainInbox(f.project.id, false);
+        const [report] = f.journal();
+        const file = path.join(f.base, "removed-pi.jsonl");
+        const id = "removed-session";
+        let respond!: (receipt: SendReceipt) => void;
+        Object.assign(before.session, {
+          send: (envelope: PromptEnvelope, hooks: SendHooks) => {
+            hooks.onBeforeWrite?.({ ...attempt(envelope), piSession: { file, id } });
+            return new Promise<SendReceipt>((resolve) => {
+              respond = resolve;
+            });
+          },
+        });
+        const oldAgent = before.lead.resolveAgent()!.info.id;
+        before.lead.dequeueNext(oldAgent);
+        expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
+        before.lead.removeAgent(oldAgent);
+        f.save(before.lead);
+        if (evidence === "received") {
+          const timestamp = new Date().toISOString();
+          fs.writeFileSync(
+            file,
+            [
+              { type: "session", id, cwd: before.lead.cwd },
+              {
+                type: "message",
+                id: "entry",
+                parentId: null,
+                message: {
+                  role: "user",
+                  content: formatReportMarker(report.reportId),
+                  timestamp: Date.now(),
+                },
+                timestamp,
+              },
+            ]
+              .map((row) => JSON.stringify(row))
+              .join("\n") + "\n",
+          );
+        } else if (evidence === "rejected") {
+          respond({ disposition: "rejected", retryable: true });
+          await vi.waitFor(() => expect(f.journal()[0].leadDelivery.state).toBe("enqueued"));
+        }
+        const after = f.restart();
+        after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+        after.manager.leadAgentsChanged(after.lead);
+        await vi.waitFor(() =>
+          expect(after.lead.findMessage(report.leadMessageId)?.status).toBe(
+            evidence === "unknown" ? "outcome_unknown" : "done",
+          ),
+        );
+        expect(after.session.sent).toHaveLength(evidence === "rejected" ? 1 : 0);
+        if (evidence === "received") expect(f.journal()[0].leadDelivery.state).toBe("sent_to_pi");
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  it("does not let recovery of a removed Lead settle the successor's in-flight dispatch", async () => {
+    const f = await fixture();
+    try {
+      f.setOnline(false);
+      await f.finish();
+      const { lead, manager, session } = f.restart();
+      f.setOnline(true);
+      await manager.drainInbox(f.project.id, false);
+      const [report] = f.journal();
+      const original = lead.resolveAgent()!.info.id;
+      let respond!: (receipt: SendReceipt) => void;
+      let stopOld!: () => void;
+      vi.spyOn(f.registry.get("local")!, "destroySession").mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            stopOld = resolve;
+          }),
+      );
+      Object.assign(session, {
+        send(envelope: PromptEnvelope, hooks: SendHooks) {
+          hooks.onBeforeWrite?.(attempt(envelope));
+          return new Promise<SendReceipt>((resolve) => {
+            respond = resolve;
+          });
+        },
+      });
+      const successor = lead.addAgent("successor", "test", "", "", { backend: "codex" });
+      let newWrite!: () => void;
+      const started = new Promise<void>((resolve) => {
+        newWrite = resolve;
+      });
+      Object.assign(lead.agents.get(successor.id)!.session, {
+        send(envelope: PromptEnvelope, hooks: SendHooks) {
+          hooks.onBeforeWrite?.(attempt(envelope));
+          newWrite();
+          return new Promise<SendReceipt>(() => {});
+        },
+      });
+      lead.dequeueNext(original);
+      lead.removeAgent(original);
+      f.save(lead);
+      const recovering = manager.drainInbox(f.project.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      respond({ disposition: "rejected" });
+      await started;
+      stopOld();
+      await recovering;
+      expect(lead.findMessage(report.leadMessageId)).toMatchObject({
+        status: "dispatching",
+        queuedFor: successor.id,
+      });
+      expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
+    } finally {
+      f.close();
+    }
+  });
+
+  it("journals a report with no Lead agent and retains the worker's report-time commit", async () => {
+    const f = await fixture();
+    try {
+      const git = (...args: string[]) =>
+        execFileSync("git", args, { cwd: f.worker.cwd, encoding: "utf8" }).trim();
+      git("init", "-q");
+      const commit = (message: string) => {
+        git(
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.com",
+          "commit",
+          "--allow-empty",
+          "-qm",
+          message,
+        );
+        return git("rev-parse", "--short=9", "HEAD");
+      };
+      const original = commit("before report");
+      const before = f.restart();
+      before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
+      f.save(before.lead);
+      // Dispatch admission can independently defer the drain during deploy.
+      let allowed = false;
+      f.host.dispatchAllowed = () => allowed;
+      expect(await f.finish(before.worker)).toMatch(/saved.*awaiting a Lead/);
+      expect(f.journal()[0]).toMatchObject({
+        boardState: "pending",
+        leadDelivery: { state: "pending" },
+      });
+      expect(commit("after report")).not.toBe(original);
+      allowed = true;
+      before.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+      before.manager.leadAgentsChanged(before.lead);
+      await vi.waitFor(() => expect(before.session.sent).toHaveLength(1));
+      expect(f.frames.filter((frame) => frame.type === "project_updated").at(-1)).toMatchObject({
+        project: {
+          objectives: [
+            { id: objective, contextCommit: original, contextWritten: f.journal()[0].createdAt },
+          ],
+        },
+      });
+    } finally {
+      f.close();
+    }
+  });
 
   it.each(["5a", "5b", "5c"])("%s: dispatching recovery never resends a report", async (window) => {
     const f = await fixture();

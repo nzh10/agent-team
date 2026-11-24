@@ -359,6 +359,40 @@ const readState = (base: string, id: string): WorkspaceState => {
 };
 
 describe("server restart with projects", () => {
+  it("persists a local model change before sending its receipt and correlates malformed-image errors", async () => {
+    const { base, web } = seed();
+    const { server, frames, send, stop } = await start(base, web);
+    try {
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "/model gpt-5.6-sol",
+        requestId: "model",
+      });
+      await until(
+        () => frames.some((f) => f.type === "send_receipt" && f.requestId === "model"),
+        "model receipt",
+      );
+      expect(readState(base, "ws-lead").agents[0].model).toBe("gpt-5.6-sol");
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "look",
+        images: [{ url: null }],
+        requestId: "bad-image",
+      });
+      await until(
+        () => frames.some((f) => f.type === "error" && f.requestId === "bad-image"),
+        "correlated image error",
+      );
+      expect(frames.some((f) => f.type === "send_receipt" && f.requestId === "bad-image")).toBe(
+        false,
+      );
+    } finally {
+      stop();
+      await server.close();
+    }
+  });
   it("treats the lead's own turn as busy, then gates sends and resumes after unseal", async () => {
     const { base, web } = seed();
     const { server, frames, send, stop } = await start(base, web, true);

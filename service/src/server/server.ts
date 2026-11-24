@@ -563,7 +563,10 @@ export class Server {
         const workspace = this.workspaces.get(msg.workspaceId as string);
         if (workspace && this.ensureLoaded(workspace)) {
           const before = (msg.before as number) ?? Infinity;
-          const limit = Math.min((msg.limit as number) ?? 50, 200);
+          const limit =
+            typeof msg.limit === "number" && Number.isFinite(msg.limit)
+              ? Math.min(200, Math.max(0, Math.trunc(msg.limit)))
+              : 50;
           const all = workspace.getMessages();
           const older = before === Infinity ? all : all.filter((m) => m.timestamp < before);
           // A prompt and its reply often share a millisecond, and the client
@@ -571,7 +574,7 @@ export class Server {
           // neighbours it has: send all of them on top of the page (the client
           // drops duplicates by id).
           const tied = before === Infinity ? [] : all.filter((m) => m.timestamp === before);
-          const page = [...older.slice(-limit), ...tied];
+          const page = limit === 0 ? [] : [...older.slice(-limit), ...tied];
           this.sendJson(ws, {
             type: "workspace_messages",
             workspaceId: workspace.id,
@@ -715,14 +718,6 @@ export class Server {
         return;
 
       case "send_message": {
-        const rawImages = msg.images as Array<{ name: string; url: string }> | undefined;
-        const images = rawImages?.length
-          ? rawImages.map((img) => ({
-              name: img.name,
-              url: img.url,
-              path: path.join(this.uploadsDir, path.basename(img.url)),
-            }))
-          : undefined;
         const quote = msg.quote as
           { messageId: string; agentId: string | null; content: string } | undefined;
         // send_receipt marks admission (persisted and broadcast into the transcript);
@@ -739,6 +734,20 @@ export class Server {
           if (typeof msg.requestId === "string")
             this.sendJson(ws, { type: "send_receipt", requestId: msg.requestId });
         };
+        let images: Array<{ name: string; url: string; path: string }> | undefined;
+        try {
+          const rawImages = msg.images as Array<{ name: string; url: string }> | undefined;
+          if (rawImages !== undefined && !Array.isArray(rawImages))
+            throw new Error("Invalid images");
+          images = rawImages?.map((img) => ({
+            name: img.name,
+            url: img.url,
+            path: path.join(this.uploadsDir, path.basename(img.url)),
+          }));
+        } catch (error) {
+          reject(error instanceof Error ? error.message : String(error));
+          return;
+        }
         const send = async () => {
           try {
             await this.sendMessage(
@@ -1117,6 +1126,7 @@ export class Server {
       workspaceId: workspace.id,
       agent: entry ? workspace.agentInfo(entry) : agent,
     });
+    this.projects.leadAgentsChanged(workspace);
   }
 
   private reapplyProviderEnv(): void {
@@ -1194,6 +1204,7 @@ export class Server {
       this.broadcastUI({ type: "message_removed", workspaceId, messageId });
     }
     this.broadcastUI({ type: "agent_removed", workspaceId, agentId });
+    this.projects.leadAgentsChanged(workspace);
   }
 
   private async fetchRemoteImages(
