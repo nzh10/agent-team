@@ -17,8 +17,8 @@ import {
 } from "../src/state/useServer";
 import { CreateProjectDialog } from "../src/workspace/dialogs";
 import { UiDialogModal } from "../src/workspace/UiDialogModal";
-import { QuotaPanel } from "../src/sidebar/Sidebar";
-import { QUOTA_STALE_AFTER } from "../../service/src/session/quota-schema";
+import { QuotaPanel } from "../src/sidebar/QuotaPanel";
+import { QUOTA_STALE_AFTER } from "../../shared/quota";
 import { FakeSocket } from "./fakeSocket";
 
 const NOW = 1_800_000_000_000;

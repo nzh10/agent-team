@@ -2,8 +2,9 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { QUOTA_STALE_AFTER, type QuotaState } from "../../../service/src/session/quota-schema";
-import { QuotaPanel, Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
+import { QUOTA_STALE_AFTER, type QuotaState } from "../../../shared/quota";
+import { Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
+import { QuotaPanel } from "../../src/sidebar/QuotaPanel";
 import type { Workspace } from "../../src/state/useServer";
 import "../../src/styles.css";
 

@@ -2524,6 +2524,16 @@ button.action-target:hover {
   white-space: nowrap;
   margin-left: auto;
 }
+.command-source {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 9px;
+  line-height: 14px;
+  text-transform: uppercase;
+}
 .mention-name {
   font-size: 13px;
   font-weight: 600;
@@ -3101,24 +3111,6 @@ button.quote-bar-content:focus-visible {
   font-size: var(--fs-tag);
   color: var(--text-muted);
   white-space: nowrap;
-}
-.default-account-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 0 6px;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-.default-account-row select {
-  flex: 1;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text-primary);
-  font-size: 11px;
-  padding: 2px 4px;
-  font-family: inherit;
 }
 
 /* ---- Scrollbar ---------------------------------------------------------- */
@@ -5579,8 +5571,7 @@ button.quote-bar-content:focus-visible {
   border-color: var(--border);
 }
 .ap-meta,
-.ap-agent-state,
-.ap-goal {
+.ap-agent-state {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5923,16 +5914,6 @@ button.quote-bar-content:focus-visible {
 }
 
 /* Delivery state, sealed projects and blocking Pi dialogs. */
-.command-source {
-  flex-shrink: 0;
-  padding: 1px 5px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-muted);
-  font-size: 9px;
-  line-height: 14px;
-  text-transform: uppercase;
-}
 .delivery-status {
   display: flex;
   align-items: center;

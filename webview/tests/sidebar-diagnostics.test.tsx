@@ -4,6 +4,7 @@ import { Sidebar } from "../src/sidebar/Sidebar";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   history.replaceState(null, "", location.pathname);
 });
 
@@ -67,4 +68,21 @@ it("hides diagnostics and debug controls when healthy", async () => {
   expect(screen.queryByRole("link", { name: "Service diagnostics" })).toBeNull();
   expect(screen.queryByTitle(/Replay rendering demo/)).toBeNull();
   expect(screen.queryByTitle(/Save a layout debug snapshot/)).toBeNull();
+});
+
+it("surfaces diagnostics when a connected service later becomes degraded", async () => {
+  vi.useFakeTimers();
+  let issues: object[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ issues }) })),
+  );
+  await act(() => {
+    sidebar();
+    return Promise.resolve();
+  });
+  expect(screen.queryByRole("link", { name: "Service diagnostics" })).toBeNull();
+  issues = [{}];
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(screen.getByRole("link", { name: "Service diagnostics" })).toBeTruthy();
 });

@@ -271,13 +271,13 @@ it("gives model and effort their own unclipped row in a narrow panel, independen
     onCancelWake: no,
     onStopAll: no,
   };
-  const view = (width: number, current = agent) => (
+  const view = (width: number, current = agent, connected = true) => (
     <div style={{ width }}>
       <AgentsPanel
         sessions={[workspace("s", { agents: [current], lastMessageAt: 1 })]}
         project={undefined}
         activeWsId="s"
-        connected
+        connected={connected}
         models={[
           { id: agent.model, label: "Opus", backend: "pi" },
           { id: "github-copilot/claude-opus-5-5", label: "Opus", backend: "pi" },
@@ -323,6 +323,14 @@ it("gives model and effort their own unclipped row in a narrow panel, independen
     rect(get(container, ".ap-agent svg, .ap-agent .agent-avatar")).left,
     0,
   );
+
+  rerender(view(336, agent, false));
+  for (const field of [get(container, ".ap-agent-state"), get(container, ".ap-meta")]) {
+    expect(style(field).whiteSpace).toBe("nowrap");
+    expect(style(field).overflow).toBe("hidden");
+    expect(style(field).textOverflow).toBe("ellipsis");
+    expect(style(field).display).not.toBe("flex");
+  }
 });
 
 it("aligns status bars across rows even with differently sized values", async () => {
