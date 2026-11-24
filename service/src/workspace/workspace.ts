@@ -294,8 +294,6 @@ export interface WorkspaceCallbacks {
   // missing rendering is diagnosable instead of silent.
   onUnhandled?: (wsId: string, agentId: string, msg: unknown) => void;
   modelOptions?(): ModelOption[];
-  // Provider settings a model runs with.
-  sessionEnv?: (model: string, account?: string) => Record<string, string> | undefined;
   piConfig?: () => Partial<SessionConfig>;
   onSessionReplaced?: (workspace: Workspace, session: HostSessionHandle) => void;
 }
@@ -1444,7 +1442,6 @@ export class Workspace {
           ? fallback
           : undefined;
     const fast = Boolean(state.config.fast) && supportsFastMode(next);
-    const providerEnv = this.cb?.sessionEnv?.(next, agent.info.account);
     if (crossesBackend) {
       const host = this.hostRegistry.get(this.hostId);
       if (!host?.connected || !host.replaceSession) return `Host not connected: ${this.hostId}`;
@@ -1455,7 +1452,6 @@ export class Workspace {
         model: next,
         effort: keep,
         fast,
-        providerEnv,
         ...this.sessionStorage(),
       });
       agent.session = session;
@@ -1466,7 +1462,6 @@ export class Workspace {
       this.cb?.onCommandsUpdate?.(agent.info.id, session.getCommands?.() ?? []);
     } else {
       agent.session.setModel!(next, keep, fast);
-      agent.session.setProviderEnv?.(providerEnv);
     }
     agent.info.model = next;
     this.cb?.onAgentUpdated?.(this.id, this.agentInfo(agent));
@@ -2547,12 +2542,9 @@ export class Workspace {
       cwd: this.cwd,
       normalizedCwd: this.normalizedCwd,
       agents: [...this.agents.values()].map((a) => {
-        const session = a.session.getState();
-        // Account tokens and provider keys: recomputed from config.toml on
-        // restore, never written to the state files.
         return {
           ...a.info,
-          session: { ...session, config: { ...session.config, providerEnv: undefined } },
+          session: a.session.getState(),
           ...(a.delivered && {
             delivered: { ...a.delivered, ...(a.input !== a.delivered && { since: true }) },
           }),

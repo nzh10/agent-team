@@ -213,8 +213,13 @@ const ISSUES =
   "Known defects are the project's issues; write_issues says how they are kept and fixed.";
 
 // How the panel's agents talk to the user.
-const LANGUAGE =
-  "Write to the user in 简体中文: replies, questions, summaries. Code, identifiers, commit messages and the files you write stay in English.";
+function languageInstructions(language?: string): string[] {
+  return language
+    ? [
+        `Write user-facing replies, questions and summaries in ${language}. Keep code, identifiers, commit messages and repository files in English.`,
+      ]
+    : [];
+}
 
 export function selectablePresetNames(names: string[]): string {
   const counts = new Map<string, number>();
@@ -231,6 +236,7 @@ export function leadToolset(
   notesDir: string,
   models: string[],
   agentPresets: Array<Pick<AgentPreset, "name" | "when_to_use">> = [],
+  language?: string,
 ): PanelToolset {
   const id = project.id;
   const presets = selectablePresetNames(agentPresets.map((preset) => preset.name));
@@ -249,7 +255,7 @@ export function leadToolset(
   return {
     instructions: [
       `You are the lead agent of the project "${project.name}" (${project.root ? `repository ${project.root}` : "no Git repository"}).`,
-      LANGUAGE,
+      ...languageInstructions(language),
       "You keep the whole project in view: from the board and the sessions you discuss with the user what to do. Start worker sessions (start_session) only when the user asks for it: for a piece of work the user decided on, with its objective and task, or for a topic the user wants to go into in depth (then its task says what to discuss, and that it starts no work on its own). A worker is a separate session the user opens and talks to directly. Give it a complete, self-contained task.",
       [
         "Once a worker is started, step back: tell the user which session to talk to, and leave that conversation to them. A worker decides what it can itself and asks the user, in its own session, what is theirs to decide; do not answer for the user, relay, chase or poll. Message a worker (message_session) only when the user asks you to, to pass on what reached you from outside its session (another project's request, say), or to retry a failed turn as below.",
@@ -779,12 +785,13 @@ export function workerToolset(
   notesDir: string,
   isolated = false,
   unreported = false,
+  language?: string,
 ): PanelToolset {
-  if (unreported) return ownSessionToolset(api, project, notesDir, !isolated);
+  if (unreported) return ownSessionToolset(api, project, notesDir, !isolated, language);
   return {
     instructions: [
       `You are a session of the project "${project.name}" (${project.root ? `repository ${project.root}` : "no Git repository"}). Its lead agent coordinates the work there and may have started you with a task; the user may also talk to you directly.`,
-      LANGUAGE,
+      ...languageInstructions(language),
       "The task is yours: decide what you can yourself. What is the user's to decide, ask the user, not the lead, here in your reply, and stop: they come to this session to talk it over with you. A task to discuss something with the user is that discussion: start work only when they ask for it.",
       "When the task is done, or the user calls it off, call finish_task once with a concise summary for the lead: what changed, where (branch, commits, PR), what is left, and what your work replaced and where its traces were removed. Use report_progress only for what changes the lead's plans before you finish (the scope changed, the plan proved wrong, a finding that affects other work), not for milestones.",
       "The lead's messages reach you prefixed [From the project lead], the panel's [From the panel]; the rest is the user's. When the lead asks you something after the task, just answer: your reply reaches it once you stop, or at once with report_progress while background work or a scheduled wake-up keeps you going. When the user changes the lead's task, say so in your finish_task summary. Work the lead sends after you finished ends with finish_task too; what the user asks after that needs one only if what you reported no longer holds.",
@@ -884,11 +891,12 @@ function ownSessionToolset(
   project: Project,
   notesDir: string,
   showNotes: boolean,
+  language?: string,
 ): PanelToolset {
   return {
     instructions: [
       `You are a session of the project "${project.name}" (${project.root ? `repository ${project.root}` : "no Git repository"}). The user works with you here directly: you do not report to the project's lead and take no work from it.`,
-      LANGUAGE,
+      ...languageInstructions(language),
       `You may read the project: its board (list_objectives, read_objective), its issues (list_issues, read_issue), its sessions (project_status) and their history; you do not write to the board or the issues. ${showNotes ? `Use list_notes and read_note for markdown notes under ${notesDir}. ` : ""}Contexts and issues say when and at which commit they were written: check them against the code before acting on them.`,
       HISTORY,
     ].join("\n\n"),

@@ -181,40 +181,18 @@ export class CodexSession extends EventEmitter {
     this.config.goal = goal ?? undefined;
   }
 
-  setProviderEnv(env: Record<string, string> | undefined): void {
-    this.config.providerEnv = env;
-  }
-
-  // Runtime only: the server sets them again on restore. A thread's tools
-  // and instructions are fixed when it starts: codex keeps both in the
-  // thread (its rollout) and resumes with them.
+  // Codex retains tool declarations in the thread. Refresh project
+  // instructions on start/resume, without mutating an active turn.
   setPanelTools(tools: PanelToolset | null): void {
     this.panelTools = tools;
   }
 
-  // What of the provider env is codex's: the server's carries other
-  // backends' credentials too (a Claude login token), which neither belong
-  // in codex's commands nor restart it when they change. Also allow the
-  // shared session Git prompt override.
-  private codexEnv(): Record<string, string> {
-    return Object.fromEntries(
-      Object.entries(this.config.providerEnv ?? {}).filter(
-        ([k]) => k === "GIT_TERMINAL_PROMPT" || /^(OPENAI|CODEX)_/.test(k),
-      ),
-    );
-  }
-
-  // The process's environment and the thread's resume parameters that only
-  // a restart changes.
   private launchKey(): string {
-    return JSON.stringify([
-      this.codexEnv(),
-      this.config.model ? codexContextWindow(this.config.model) : null,
-    ]);
+    return JSON.stringify(this.config.model ? codexContextWindow(this.config.model) : null);
   }
 
   private env(): NodeJS.ProcessEnv {
-    return applyNonInteractiveGitEnv(codexProcessEnv(this.codexEnv()));
+    return applyNonInteractiveGitEnv(codexProcessEnv());
   }
 
   private connect(): Promise<AppServerClient> {
@@ -283,6 +261,7 @@ export class CodexSession extends EventEmitter {
         await client.request("thread/resume", {
           threadId: this.sessionId,
           ...this.threadParams(),
+          ...(this.panelTools && { developerInstructions: this.panelTools.instructions }),
           excludeTurns: true,
         });
         return this.sessionId;

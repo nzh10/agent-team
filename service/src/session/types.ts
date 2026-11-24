@@ -278,7 +278,6 @@ export interface SessionConfig {
   permissionMode?: string;
   systemPrompt?: string;
   panelInstructions?: string;
-  providerEnv?: Record<string, string>;
   // Pi host runtime wiring (populated by LocalHost / tests, omitted from user presets).
   dataDir?: string;
   uploadsDir?: string;

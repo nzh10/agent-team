@@ -38,11 +38,6 @@ export interface HostConfig {
   type: "local";
 }
 
-export interface ProviderConfig {
-  api_key: string;
-  base_url: string;
-}
-
 export interface PiConfig {
   acp?: AcpConfig;
   packages?: string[];
@@ -63,13 +58,12 @@ export interface ProjectsConfig {
 }
 
 export interface AppConfig {
-  user: { name: string; avatar: string };
+  user: { name: string; avatar: string; language?: string };
   presets: AgentPreset[];
   server: ServerConfig;
   workspace: WorkspaceConfig;
   auth: AuthConfig | null;
   hosts: Record<string, HostConfig>;
-  providers: Record<string, ProviderConfig>;
   projects: ProjectsConfig;
   pi?: PiConfig;
 }
@@ -158,18 +152,10 @@ export function loadConfig(baseDir: string): AppConfig {
     hosts["local"] = { label: "Local", type: "local" };
   }
 
-  const providers: Record<string, ProviderConfig> = {};
-  const rawProviders = parsed.providers;
-  if (rawProviders && typeof rawProviders === "object") {
-    for (const [name, cfg] of Object.entries(rawProviders as Record<string, unknown>)) {
-      if (cfg && typeof cfg === "object") {
-        const c = cfg as Record<string, string>;
-        if (c.api_key && c.base_url) {
-          providers[name] = { api_key: c.api_key, base_url: c.base_url };
-        }
-      }
-    }
-  }
+  if (parsed.providers !== undefined)
+    throw new RuntimeConfigError(
+      "[providers.*] is no longer supported. Migrate custom Pi providers to ~/.pi/agent/models.json and remove the [providers.*] tables from config.toml.",
+    );
 
   let auth: AuthConfig | null = null;
   const rawAuth = parsed.auth as Record<string, unknown> | undefined;
@@ -210,16 +196,17 @@ export function loadConfig(baseDir: string): AppConfig {
     : undefined;
 
   const rawUser = parsed.user as Record<string, unknown> | undefined;
+  const language = optionalString(rawUser?.language)?.trim();
   const user = {
     name: optionalString(rawUser?.name) ?? "You",
     avatar: optionalString(rawUser?.avatar) ?? "avatars/header.jpg",
+    ...(language && { language }),
   };
   return {
     server,
     workspace,
     auth,
     hosts,
-    providers,
     projects,
     pi,
     user,

@@ -68,7 +68,7 @@ import {
 } from "../session/quota-schema";
 import { SystemMonitor } from "./system";
 import { serviceReport } from "../config/diagnostics";
-import { applyRuntimeEnvironment } from "../config/runtime";
+import { applyRuntimeEnvironment, RuntimeConfigError } from "../config/runtime";
 
 function stripEventsInnerEvents(events: StreamEvent[]): StreamEvent[] {
   return events.map((e) => {
@@ -1112,7 +1112,6 @@ export class Server {
       backend,
       effort: effort ?? preset?.effort,
       permissionMode,
-      providerEnv: this.resolveProviderEnv(model),
       ...(backend === "pi" && this.piConfig()),
     });
     const tools = this.projects.toolsFor(workspace);
@@ -1129,31 +1128,26 @@ export class Server {
     this.projects.leadAgentsChanged(workspace);
   }
 
-  private reapplyProviderEnv(): void {
-    for (const ws of this.workspaces.values()) {
-      for (const entry of ws.agents.values()) {
-        entry.session.setProviderEnv?.(this.resolveProviderEnv(entry.info.model));
-      }
-    }
-  }
-
-  // Hot-reload provider settings (the port and auth cookie secret need a
+  // Hot-reload user settings (the port and auth cookie secret need a
   // restart). watchFile (polling) survives atomic rename-writes editors do.
   private watchConfig(): void {
     const configPath = path.join(this.baseDir, "config.toml");
     fs.watchFile(configPath, { interval: 2000 }, () => {
       const previousPresets = this.config.presets;
+      const previousLanguage = this.config.user.language;
       try {
         const next = loadConfig(this.baseDir);
         // Service-level environment is fixed for the lifetime of this process.
         next.server.proxy = this.config.server.proxy;
         if (next.pi) next.pi.acp = this.config.pi?.acp;
         this.config = next;
-      } catch {
+      } catch (error) {
         this.broadcastUI({
           type: "error",
           message:
-            "config.toml reload failed; previous settings are still in use. Run --doctor to inspect the file.",
+            error instanceof RuntimeConfigError
+              ? `config.toml reload failed; previous settings are still in use. ${error.message}`
+              : "config.toml reload failed; previous settings are still in use. Run --doctor to inspect the file.",
         });
         return;
       }
@@ -1170,27 +1164,19 @@ export class Server {
           if (workspace.projectLink?.role === "lead") this.refreshLeadTools(workspace);
         }
       }
+      if (this.config.user.language !== previousLanguage) {
+        for (const workspace of this.workspaces.values()) {
+          if (workspace.projectLink?.role === "lead") this.refreshLeadTools(workspace);
+          else if (workspace.projectLink) {
+            const tools = this.projects.toolsFor(workspace);
+            for (const agent of workspace.agents.values()) agent.session.setPanelTools?.(tools);
+          }
+        }
+      }
       this.broadcastUI({ type: "identities_update", user: this.config.user, presets });
-      this.reapplyProviderEnv();
       if (this.dispatchAllowed) void this.track(this.refreshPiCatalog());
       console.log("[config] reloaded config.toml");
     });
-  }
-
-  private resolveProviderEnv(model: string): Record<string, string> | undefined {
-    for (const [name, cfg] of Object.entries(this.config.providers)) {
-      if (model.startsWith(name)) {
-        return {
-          ANTHROPIC_BASE_URL: cfg.base_url,
-          ANTHROPIC_AUTH_TOKEN: cfg.api_key,
-          ANTHROPIC_MODEL: model,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: model,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: model,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
-        };
-      }
-    }
-    return undefined;
   }
 
   private removeAgent(workspaceId: string, agentId: string): void {
@@ -1369,7 +1355,6 @@ export class Server {
 
     for (const wsState of states) {
       for (const agent of wsState.agents) {
-        agent.session.config.providerEnv = this.resolveProviderEnv(agent.model);
         if (agent.session.config.backend === "pi") agent.session.config.piAcp = this.config.pi?.acp;
       }
       const workspace = Workspace.fromState(
@@ -1496,6 +1481,7 @@ export class Server {
       addAgent: (w, name, model, avatar, color, effort) =>
         this.addAgentTo(w, name, model, avatar, color, undefined, effort),
       agentPresets: () => this.config.presets,
+      userLanguage: () => this.config.user.language,
       projectDefaults: () => ({
         ...this.config.projects,
         ...(!this.config.projects.model && {
@@ -1952,7 +1938,6 @@ export class Server {
         appendLog(this.baseDir, wsId, { timestamp: Date.now(), agentId, unhandled: msg });
       },
       modelOptions: () => this.models,
-      sessionEnv: (model) => this.resolveProviderEnv(model),
       piConfig: () => this.piConfig(),
       onSessionReplaced: (workspace, session) => {
         session.setPanelTools?.(this.projects.toolsFor(workspace));

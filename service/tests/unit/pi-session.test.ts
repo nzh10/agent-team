@@ -530,10 +530,8 @@ describe("PiSession ACP readiness", () => {
     async (model) => {
       const home = temp();
       const h = harness({
-        config: {
-          model,
-          providerEnv: { HOME: home, USERPROFILE: home, PATH: "", AGY_ACP_BIN: "" },
-        },
+        config: { model },
+        options: { env: { HOME: home, USERPROFILE: home, PATH: "", AGY_ACP_BIN: "" } },
         startupModel: model ? undefined : acp,
         models: [acp],
       });
@@ -565,8 +563,8 @@ describe("PiSession ACP readiness", () => {
       config: {
         piAntigravityEntryPath: "/stub/acp-extension",
         piOffline: false,
-        providerEnv: { HOME: home, AGY_ACP_BIN: path.join(home, "bad-binary") },
       },
+      options: { env: { HOME: home, AGY_ACP_BIN: path.join(home, "bad-binary") } },
       disposition: "handled",
     });
     await h.session.ensureStarted();
@@ -586,7 +584,8 @@ describe("PiSession ACP readiness", () => {
     const home = temp();
     const runtime = path.join(home, "agy");
     const withoutAcp = harness({
-      config: { piOffline: false, providerEnv: { AGY_ACP_BIN: runtime } },
+      config: { piOffline: false },
+      options: { env: { AGY_ACP_BIN: runtime } },
     });
     await withoutAcp.session.ensureStarted();
     expect(withoutAcp.factory.mock.calls[0][0].env?.PI_OFFLINE).toBeUndefined();
@@ -594,17 +593,17 @@ describe("PiSession ACP readiness", () => {
     const withAcp = {
       piOffline: false,
       piAntigravityEntryPath: "/stub/acp-extension",
-      providerEnv: { AGY_ACP_BIN: runtime },
     };
-    const missing = harness({ config: withAcp });
+    const options = { env: { AGY_ACP_BIN: runtime } };
+    const missing = harness({ config: withAcp, options });
     await missing.session.ensureStarted();
     expect(missing.factory.mock.calls[0][0].env?.PI_OFFLINE).toBe("1");
 
     fs.writeFileSync(runtime, "not run", { mode: 0o700 });
-    const ready = harness({ config: withAcp });
+    const ready = harness({ config: withAcp, options });
     await ready.session.ensureStarted();
     expect(ready.factory.mock.calls[0][0].env?.PI_OFFLINE).toBeUndefined();
-    const catalog = harness({ config: withAcp, options: { catalogOnly: true } });
+    const catalog = harness({ config: withAcp, options: { ...options, catalogOnly: true } });
     await catalog.session.ensureStarted();
     expect(catalog.factory.mock.calls[0][0].env?.PI_OFFLINE).toBe("1");
   });
@@ -631,8 +630,8 @@ describe("PiSession ACP readiness", () => {
         piAgentDir,
         piAcp: { permissions: "yolo" },
         piOffline: false,
-        providerEnv: { AGY_ACP_BIN: path.join(dir, "missing") },
       },
+      options: { env: { AGY_ACP_BIN: path.join(dir, "missing") } },
     });
     await h.session.ensureStarted();
     expect(h.factory.mock.calls[0][0].env?.PI_OFFLINE).toBe("1");
@@ -667,7 +666,7 @@ describe("PiSession ACP readiness", () => {
     const runtime = path.join(temp(), "agy");
     fs.writeFileSync(runtime, "not run", { mode: 0o700 });
     const h = harness({
-      config: { providerEnv: { AGY_ACP_BIN: runtime } },
+      options: { env: { AGY_ACP_BIN: runtime } },
       disposition: "handled",
     });
     const onBeforeWrite = vi.fn();
@@ -699,7 +698,7 @@ describe("PiSession ACP readiness", () => {
   it("still runs the all-provider quota command with an unavailable ACP default", async () => {
     const home = temp();
     const h = harness({
-      config: { providerEnv: { AGY_ACP_BIN: path.join(home, "missing") } },
+      options: { env: { AGY_ACP_BIN: path.join(home, "missing") } },
       startupModel: acp,
       models: [acp],
       disposition: "handled",
@@ -743,11 +742,10 @@ describe("PiSession Git environment", () => {
   ])("passes the Git prompt setting to the RPC child: %j", async (test) => {
     vi.stubEnv("GIT_TERMINAL_PROMPT", test.inherited);
     const h = harness({
-      config: {
-        providerEnv:
-          test.provider === undefined ? undefined : { GIT_TERMINAL_PROMPT: test.provider },
+      options: {
+        catalogOnly: test.catalogOnly,
+        env: test.provider === undefined ? undefined : { GIT_TERMINAL_PROMPT: test.provider },
       },
-      options: { catalogOnly: test.catalogOnly },
     });
     await h.session.ensureStarted();
     expect(h.factory.mock.calls[0][0].env?.GIT_TERMINAL_PROMPT).toBe(test.expected);

@@ -98,7 +98,6 @@ function makeWorkspace(cb: Partial<WorkspaceCallbacks> = {}) {
   });
   const agent = ws.addAgent("A", "gpt-5.6-terra", "a", "#888", {
     backend: "codex",
-    providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: "sk-secret" },
   });
   const session = host.sessions.get(agent.id)!;
   return { ws, host, agent, session };

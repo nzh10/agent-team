@@ -44,7 +44,8 @@ label = "Local"
 type = "local"
 
 # Pi (optional — keeping [pi] present populates the Pi model picker at startup)
-# Omit `packages` (or leave it empty) to auto-discover packages from ~/.pi/agent.
+# Omit `packages` (or leave it empty) to use locally installed packages listed
+# in ~/.pi/agent/settings.json. Configure custom providers in ~/.pi/agent/models.json.
 # Use `exclude_packages` to block specific packages. `offline` defaults to true.
 [pi]
 # exclude_packages = []
@@ -77,6 +78,7 @@ type = "local"
 # [user]
 # name = "You"
 # avatar = "avatars/header.jpg"
+# language = "Simplified Chinese"  # project replies, questions and summaries only
 
 # Repeat to replace the built-in agent presets; omitted or empty uses built-ins.
 # A project worker can use a preset by exact name, with model and effort overrides.
@@ -92,9 +94,3 @@ type = "local"
 # model = "provider/model"
 # effort = "medium"
 # when_to_use = "Broad codebase exploration and fact-finding"
-
-# External LLM providers (optional)
-# The provider name must be a prefix of the model ID you want to route.
-# [providers.deepseek]
-# api_key = "your-api-key"
-# base_url = "https://api.deepseek.com/anthropic"

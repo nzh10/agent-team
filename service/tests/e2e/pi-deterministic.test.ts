@@ -269,7 +269,19 @@ async function runDeterministicPiScenario() {
     vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
     const spawn = PiRpcClient.spawn.bind(PiRpcClient);
     vi.spyOn(PiRpcClient, "spawn").mockImplementation((options) => {
-      const rpc = spawn(options);
+      const rpc = spawn({
+        ...options,
+        env: {
+          ...options?.env,
+          ...home.env,
+          HOME: root,
+          XDG_CONFIG_HOME: path.join(root, "config"),
+          XDG_CACHE_HOME: path.join(root, "cache"),
+          XDG_DATA_HOME: path.join(root, "share"),
+          XDG_STATE_HOME: path.join(root, "state"),
+          TMPDIR: root,
+        },
+      });
       rpc.on("stderr", (text: string) => {
         if (!text.startsWith("Warning: No project session found with id")) console.error(text);
       });
@@ -282,17 +294,6 @@ async function runDeterministicPiScenario() {
       piBinary: localPiBinary,
       piArgs: ["-e", extension],
       piAgentDir: home.piAgentDir,
-      providerEnv: {
-        ...home.env,
-        HOME: root,
-        XDG_CONFIG_HOME: path.join(root, "config"),
-        XDG_CACHE_HOME: path.join(root, "cache"),
-        XDG_DATA_HOME: path.join(root, "share"),
-        XDG_STATE_HOME: path.join(root, "state"),
-        TMPDIR: root,
-        GIT_CONFIG_GLOBAL: "/dev/null",
-        GIT_CONFIG_NOSYSTEM: "1",
-      },
     };
     // The production LocalHost constructs every PiSession; inject only the test home.
     // Preserve the actual receiver when calling the original methods below.

@@ -200,7 +200,7 @@ describe("panel tool arguments", () => {
       ["workerReport", "ws-w", "done", true, {}, undefined],
       ["currentTask", "ws-w", undefined],
     ]);
-    expect(set.instructions).toContain("Write to the user in 简体中文");
+    expect(set.instructions).not.toContain("Write user-facing");
     expect(set.instructions).toContain("not yours to look at");
     for (const word of [
       "/notes",
@@ -275,14 +275,25 @@ describe("panel tool arguments", () => {
     );
   });
 
-  it("tell the lead and its workers to write to the user in Chinese, and the lead to reuse worktrees", () => {
-    const set = leadToolset(api, project, "/notes", ["gpt-6-astra"]);
-    const worker = workerToolset(api, "ws-w", project, "/notes").instructions;
-    for (const text of [set.instructions, worker]) {
-      expect(text).toContain("Write to the user in 简体中文");
-    }
-    expect(byName(set).start_session.description).toContain("a worktree, reused");
-  });
+  it.each([undefined, "Icelandic"])(
+    "scopes the optional user-facing language (%s) to project replies",
+    (language) => {
+      const set = leadToolset(api, project, "/notes", ["gpt-6-astra"], [], language);
+      for (const text of [
+        set.instructions,
+        workerToolset(api, "ws-w", project, "/notes", false, false, language).instructions,
+        workerToolset(api, "ws-w", project, "/notes", true, false, language).instructions,
+        workerToolset(api, "ws-w", project, "/notes", false, true, language).instructions,
+      ]) {
+        if (language)
+          expect(text).toContain(
+            `Write user-facing replies, questions and summaries in ${language}. Keep code, identifiers, commit messages and repository files in English.`,
+          );
+        else expect(text).not.toContain("Write user-facing");
+      }
+      expect(byName(set).start_session.description).toContain("a worktree, reused");
+    },
+  );
 
   it("shows preset dispatch hints only in the lead's start_session description", () => {
     const scoutHint = "Map unfamiliar repositories before implementation";

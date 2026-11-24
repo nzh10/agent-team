@@ -65,6 +65,7 @@ import type {
 export interface PiSessionOptions {
   panelHttp?: PanelHttpServer;
   rpcFactory?: (options: PiRpcSpawnOptions) => PiRpcClient;
+  env?: NodeJS.ProcessEnv;
   piBinary?: string;
   piArgs?: string[];
   interruptTimeoutMs?: number;
@@ -843,7 +844,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     try {
       const env = applyNonInteractiveGitEnv({
         ...process.env,
-        ...this.config.providerEnv,
+        ...this.options.env,
         ...this.home?.env,
       });
       // A Hub session is a top-level Pi, even when Hub itself was started from a child shell.

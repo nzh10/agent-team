@@ -59,7 +59,6 @@ export interface HostSessionHandle extends EventEmitter {
   setPanelTools?(tools: PanelToolset | null): void;
   stopTask?(taskId: string): Promise<void>;
   simulateRateLimit?(info: { rateLimitType?: string; resetsAt?: number }): void;
-  setProviderEnv?(env: Record<string, string> | undefined): void;
   getState(): SessionState;
   getContextUsage?(): Promise<Record<string, unknown> | null>;
   getUsageInfo?(): Promise<Record<string, unknown> | null>;

@@ -41,6 +41,22 @@ describe("loadConfig", () => {
     expect(loadConfig(dir)).not.toHaveProperty("cursor");
   });
 
+  it("reads an optional user-facing language", () => {
+    expect(loadConfig(dir).user).not.toHaveProperty("language");
+    expect(loadConfig(writeConfig('[user]\nlanguage = " Icelandic "\n')).user.language).toBe(
+      "Icelandic",
+    );
+  });
+
+  it("reports the provider migration without exposing the section name or credentials", () => {
+    const d = writeConfig(
+      '[providers.sensitive-name]\napi_key = "private-test-token"\nbase_url = "https://secret.example"\n',
+    );
+    expect(() => loadConfig(d)).toThrow(
+      /^\[providers\.\*\] is no longer supported\. Migrate custom Pi providers to ~\/\.pi\/agent\/models\.json and remove the \[providers\.\*\] tables from config\.toml\.$/,
+    );
+  });
+
   it("reads the lead's default model and effort", () => {
     const d = writeConfig(`[projects]\nmodel = "provider/model"\neffort = "high"\n`);
     expect(loadConfig(d).projects).toEqual({ model: "provider/model", effort: "high" });

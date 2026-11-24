@@ -122,6 +122,7 @@ export interface ProjectHost {
   modelDiscoveryIssue?(): ModelDiscoveryIssue | undefined;
   projectDefaults?(): ProjectsConfig;
   agentPresets?(): AgentPreset[];
+  userLanguage?(): string | undefined;
   // Deletes a workspace without the project bookkeeping of a user delete.
   removeWorkspace(id: string): void;
   // False when the workspace is still busy.
@@ -620,6 +621,7 @@ export class ProjectManager {
           this.store.notesDir(project.id),
           this.workerModels(),
           this.agentPresets(),
+          this.host.userLanguage?.(),
         )
       : workerToolset(
           this.api,
@@ -628,6 +630,7 @@ export class ProjectManager {
           this.store.notesDir(project.id),
           link.isolated === true,
           link.unreported === true,
+          this.host.userLanguage?.(),
         );
   }
 

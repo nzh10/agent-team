@@ -163,25 +163,20 @@ const echoTools = (handler: (args: Record<string, unknown>) => Promise<string>):
 });
 
 describe("codex app-server session", () => {
-  it.each([
-    { expected: "0" },
-    { inherited: "1", expected: "1" },
-    { inherited: "", expected: "" },
-    { inherited: "0", provider: "1", expected: "1" },
-    { inherited: "1", provider: "", expected: "" },
-  ])("passes the Git prompt setting to the app-server: %j", async (test) => {
-    vi.stubEnv("GIT_TERMINAL_PROMPT", test.inherited);
-    const transport = vi.fn((_session: CodexSession, _env: NodeJS.ProcessEnv) =>
-      server.transport(),
-    );
-    CodexSession.hooks = { transport };
-    const { session } = makeSession({
-      providerEnv: test.provider === undefined ? undefined : { GIT_TERMINAL_PROMPT: test.provider },
-    });
-    await session.send("first");
-    expect(transport.mock.calls[0][1].GIT_TERMINAL_PROMPT).toBe(test.expected);
-    expect(process.env.GIT_TERMINAL_PROMPT).toBe(test.inherited);
-  });
+  it.each([{ expected: "0" }, { inherited: "1", expected: "1" }, { inherited: "", expected: "" }])(
+    "passes the Git prompt setting to the app-server: %j",
+    async (test) => {
+      vi.stubEnv("GIT_TERMINAL_PROMPT", test.inherited);
+      const transport = vi.fn((_session: CodexSession, _env: NodeJS.ProcessEnv) =>
+        server.transport(),
+      );
+      CodexSession.hooks = { transport };
+      const { session } = makeSession();
+      await session.send("first");
+      expect(transport.mock.calls[0][1].GIT_TERMINAL_PROMPT).toBe(test.expected);
+      expect(process.env.GIT_TERMINAL_PROMPT).toBe(test.inherited);
+    },
+  );
 
   it.each([false, true])(
     "distinguishes RPC rejection from a lost turn/start response (lost=%s)",
@@ -311,17 +306,19 @@ describe("codex app-server session", () => {
     expect(server.connections).toBe(1);
   });
 
-  it("restarts the process for a new provider env and resumes the thread in it", async () => {
+  it("refreshes project instructions on a resumed thread without re-registering its tools", async () => {
     const { session } = makeSession();
-    await session.send("one");
-    server.startTurn();
-    server.completeTurn();
-    session.setProviderEnv({ OPENAI_BASE_URL: "http://proxy" });
-    await session.send("two");
-    expect(server.connections).toBe(2);
-    expect(server.sent("thread/resume")).toEqual([
-      expect.objectContaining({ threadId: "thr_1", excludeTurns: true }),
-    ]);
+    session.sessionId = "thr_1";
+    const tools = {
+      ...echoTools(() => Promise.resolve("ok")),
+      instructions: "Write user-facing replies, questions and summaries in Icelandic.",
+    };
+    session.setPanelTools(tools);
+    await session.send("hi");
+    const [resume] = server.sent("thread/resume");
+    expect(resume).toMatchObject({ threadId: "thr_1", developerInstructions: tools.instructions });
+    expect(resume).not.toHaveProperty("dynamicTools");
+    expect(server.sent("thread/start")).toEqual([]);
   });
 
   it("starts a fresh thread, saying so, when the stored one is gone", async () => {
@@ -622,19 +619,6 @@ describe("codex app-server session", () => {
     session.abort();
   });
 
-  it("restarts the process before a capacity retry when its env changed during the wait", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [0] };
-    const { session } = makeSession();
-    await session.send("hi");
-    server.startTurn();
-    server.completeTurn("failed", overloaded);
-    session.setProviderEnv({ OPENAI_BASE_URL: "http://proxy" });
-    await flush();
-    expect(server.connections).toBe(2);
-    expect(server.sent("thread/resume")).toHaveLength(1);
-    expect(server.sent("turn/start")).toHaveLength(2);
-  });
-
   it("goes idle without a terminal event when the process is killed mid-turn", async () => {
     const { session, events, states } = makeSession();
     await session.send("hi");
@@ -839,20 +823,6 @@ describe("codex session races", () => {
     expect(await session.steer("more", "m1")).toBe(true);
     server.completeTurn("interrupted");
     expect(unread).toEqual([["m1"]]);
-  });
-
-  it("keeps other backends' credentials out of codex and does not restart for them", async () => {
-    const { session } = makeSession();
-    await session.send("one");
-    server.startTurn();
-    server.completeTurn();
-    session.setProviderEnv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-claude", OPENAI_API_KEY: "sk-openai" });
-    const env = (session as unknown as { env(): NodeJS.ProcessEnv }).env();
-    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(process.env.CLAUDE_CODE_OAUTH_TOKEN);
-    expect([env.OPENAI_API_KEY, env.CODEX_API_KEY]).toEqual(["sk-openai", "sk-openai"]);
-    session.setProviderEnv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-claude" });
-    await session.send("two");
-    expect(server.connections).toBe(1);
   });
 
   it("answers no tool call from a process it is replacing, and stops its subagents' cards", async () => {

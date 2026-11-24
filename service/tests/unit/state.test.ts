@@ -233,7 +233,7 @@ describe("unloaded workspaces", () => {
         isDefault: true,
         session: {
           sessionId: null,
-          config: { cwd: "/tmp", providerEnv: { ANTHROPIC_AUTH_TOKEN: "sk-old" } },
+          config: { cwd: "/tmp" },
           usage: {
             input_tokens: 0,
             output_tokens: 0,
@@ -246,6 +246,7 @@ describe("unloaded workspaces", () => {
       },
     ];
     delete ws.messages;
+    Object.assign(ws.agents[0].session.config, { providerEnv: { ANTHROPIC_AUTH_TOKEN: "sk-old" } });
     fs.writeFileSync(file, JSON.stringify(ws), { mode: 0o664 });
     fs.chmodSync(file, 0o664);
     saveIndex(base, ["ws-1"]);

@@ -181,9 +181,8 @@ changes shape, re-record rather than guess.
 
 ## Configuration
 
-Everything lives in `config.toml` (gitignored — `config.example.toml` is the
-template). Providers reload live on change; the port and the auth cookie
-secret need a restart.
+Use `config.toml` for YAAT settings (`config.example.toml` is the template).
+The port and auth cookie secret need a restart. Pi owns provider configuration.
 
 ```toml
 [auth]                       # omit the section to disable auth entirely
@@ -199,16 +198,15 @@ archive_after_days = 14      # 0 disables archiving
 label = "Local"
 type = "local"
 
-[providers.deepseek]         # any Anthropic-compatible endpoint
-api_key = "..."
-base_url = "https://api.deepseek.com/anthropic"
+[user]
+# language = "Simplified Chinese"  # user-facing project replies, questions and summaries only
 
 [projects]                   # what new leads (and workers started without a model) run on
 model = "gpt-6-astra"         # any model in the picker
 effort = "high"
 
 [pi]                         # keeping [pi] present populates the Pi model picker at startup
-exclude_packages = []        # omit `packages` to auto-discover ~/.pi/agent
+exclude_packages = []        # omit `packages` to use locally installed packages in ~/.pi/agent/settings.json
 default_model = "provider/model"
 default_effort = "medium"
 offline = true               # set false to allow Pi npm access on startup
@@ -218,8 +216,16 @@ offline = true               # set false to allow Pi npm access on startup
 # restart_command = ["launchctl", "kickstart", "-k", "gui/501/com.yaat.server"]
 ```
 
-A provider name must be a prefix of the model ids routed to it, so
-`[providers.deepseek]` serves `deepseek-v4-pro`.
+Omitting `[user].language` adds no language instruction. A language change
+is reflected in Pi's project instructions on the next turn and in Codex on
+thread start or resume in a new app-server process.
+
+If upgrading from a config with `[providers.*]`, migrate custom Pi providers to
+`~/.pi/agent/models.json` and remove those tables from `config.toml`. The managed
+Pi home links `models.json`; start a new Pi process to pick up changes. Its
+`models-store.json` cache is separate and seeded from the user cache only once.
+If a package is unsuitable for headless Pi on your machine, list it in
+`[pi].exclude_packages`.
 
 ### Environment
 

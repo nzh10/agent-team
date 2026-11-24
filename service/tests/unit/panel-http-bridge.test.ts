@@ -325,7 +325,7 @@ async function startRealPi(options: {
   });
   const home = prepareControlledPiAgentHome({
     mode: "test-synthetic",
-    ...(options.onQuota && { excludePackages: ["pi-antigravity-acp-provider"] }),
+    packages: subagents ? [subagents] : [],
   });
   temporaryDirectories.push(home.piAgentDir, home.geminiHome!, home.env.PI_SUBAGENTS_TEMP_ROOT);
   const cwd = options.sessionFile

@@ -188,16 +188,9 @@ describe("Workspace event aggregation", () => {
       onStreamEvent: () => {},
       onMessageDone: () => {},
     });
-    const info = ws.addAgent(
-      "B",
-      "gpt-5.6-terra",
-      "🤖",
-      "#888",
-      { providerEnv: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-x" } },
-      "work",
-    );
+    const info = ws.addAgent("B", "gpt-5.6-terra", "🤖", "#888", {}, "work");
     expect(info.account).toBe("work");
-    // Persisted state keeps the account so restore can re-resolve the token.
+    // Persisted state keeps the account label.
     expect(ws.getState().agents[0].account).toBe("work");
   });
 
@@ -1057,12 +1050,7 @@ describe("/model", () => {
   });
 
   it("moves the conversation to another model, with effort and fast mode it takes", async () => {
-    const envs: Array<[string, string | undefined]> = [];
     const { ws, session, agentInfo, emit } = makeWorkspace("gpt-6-astra");
-    (ws as unknown as { cb: WorkspaceCallbacks }).cb.sessionEnv = (model, account) => {
-      envs.push([model, account]);
-      return { PROVIDER: model };
-    };
     session.getState().config.effort = "xhigh";
     session.getState().config.fast = true;
     await ws.sendMessage("/model gpt-5.6-terra");
@@ -1073,8 +1061,6 @@ describe("/model", () => {
       effort: "xhigh",
       fast: true,
     });
-    expect(envs).toEqual([["gpt-5.6-terra", undefined]]);
-    expect(session.providerEnv).toEqual({ PROVIDER: "gpt-5.6-terra" });
 
     // Replies from here on say which model they ran on.
     await ws.sendMessage("go on");

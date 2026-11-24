@@ -46,14 +46,6 @@ type SourceSettings = {
   subagents?: unknown;
 };
 
-const INCLUDED_PACKAGES = [
-  "nzh10-skills",
-  "pi-skillful",
-  "pi-subagents",
-  "pi-antigravity-acp-provider",
-] as const;
-const EXCLUDED_PACKAGES = new Set(["pi-btw", "pi-intercom", "pi-autoresearch"]);
-
 function readSettings(sourceAgentDir: string): SourceSettings {
   try {
     return JSON.parse(
@@ -114,17 +106,8 @@ function isPackageEntry(entry: unknown): entry is PiPackageEntry {
   );
 }
 
-function packageEntries(settings: SourceSettings, sourceAgentDir: string): PiPackageEntry[] {
-  if (Array.isArray(settings.packages)) {
-    const configured = settings.packages.filter(isPackageEntry);
-    if (configured.length > 0) return configured;
-  }
-  return [
-    path.join(sourceAgentDir, "nzh10-skills"),
-    path.join(sourceAgentDir, "packages", "pi-skillful"),
-    "npm:pi-subagents",
-    "npm:pi-antigravity-acp-provider",
-  ];
+function packageEntries(settings: SourceSettings): PiPackageEntry[] {
+  return Array.isArray(settings.packages) ? settings.packages.filter(isPackageEntry) : [];
 }
 
 function orderPackages(packages: PiPackageEntry[]): PiPackageEntry[] {
@@ -578,7 +561,7 @@ function resolveLocalPiPackages(
   sourceAgentDir: string,
   excludePackages: readonly string[] = [],
 ): LocalPiPackages {
-  const excluded = new Set([...EXCLUDED_PACKAGES, ...excludePackages.map(packageName)]);
+  const excluded = new Set(excludePackages.map(packageName));
   const isIncluded = (entry: PiPackageEntry) => !excluded.has(packageName(entry));
   const packages = orderPackages(
     entries
@@ -609,14 +592,8 @@ export function discoverLocalPiPackages(
   sourceAgentDir: string = path.join(os.homedir(), ".pi", "agent"),
   excludePackages?: readonly string[],
 ): LocalPiPackages {
-  const entries = packageEntries(readSettings(sourceAgentDir), sourceAgentDir).filter(
-    (entry) =>
-      fs.existsSync(candidatePath(packageSource(entry), sourceAgentDir)) &&
-      INCLUDED_PACKAGES.includes(
-        packageName(
-          candidatePath(packageSource(entry), sourceAgentDir),
-        ) as (typeof INCLUDED_PACKAGES)[number],
-      ),
+  const entries = packageEntries(readSettings(sourceAgentDir)).filter((entry) =>
+    fs.existsSync(candidatePath(packageSource(entry), sourceAgentDir)),
   );
   return resolveLocalPiPackages(entries, sourceAgentDir, excludePackages);
 }
@@ -762,7 +739,8 @@ export function prepareControlledPiAgentHome(
   if (options.mode === "runtime" && !options.dataDir) {
     throw new Error("dataDir is required for a runtime PI_CODING_AGENT_DIR");
   }
-  const sourceAgentDir = options.sourceAgentDir ?? path.join(os.homedir(), ".pi", "agent");
+  const defaultSource =
+    options.mode === "test-synthetic" ? undefined : path.join(os.homedir(), ".pi", "agent");
   const piAgentDir =
     options.mode === "runtime"
       ? path.join(options.dataDir!, "pi-agent-home")
@@ -771,9 +749,12 @@ export function prepareControlledPiAgentHome(
   if (!fs.lstatSync(piAgentDir).isDirectory())
     throw new Error("Managed Pi agent home must be a directory, not a symlink");
 
-  const discovered = options.packages?.length
-    ? resolveLocalPiPackages(options.packages, sourceAgentDir, options.excludePackages)
-    : discoverLocalPiPackages(sourceAgentDir, options.excludePackages);
+  const sourceAgentDir = options.sourceAgentDir ?? defaultSource ?? piAgentDir;
+  const synthetic = options.mode === "test-synthetic";
+  const discovered =
+    options.packages?.length || synthetic
+      ? resolveLocalPiPackages(options.packages ?? [], sourceAgentDir, options.excludePackages)
+      : discoverLocalPiPackages(sourceAgentDir, options.excludePackages);
   let piAcpProfileError: string | undefined;
   if (discovered.piAntigravityEntryPath) {
     try {
@@ -818,12 +799,22 @@ export function prepareControlledPiAgentHome(
       // Runtime homes persist: do not retain a link from a previous preparation.
       fs.unlinkSync(agentsDestination);
     }
+    const catalog = path.join(piAgentDir, "models.json");
+    const catalogSource = path.resolve(sourceAgentDir, "models.json");
+    const linked = fs.lstatSync(catalog, { throwIfNoEntry: false })?.isSymbolicLink();
+    if (fs.existsSync(catalogSource)) {
+      if (!linked || fs.readlinkSync(catalog) !== catalogSource)
+        linkIfPresent(catalogSource, catalog);
+    } else if (linked) fs.unlinkSync(catalog);
     const modelsSource = path.join(sourceAgentDir, "models-store.json");
-    if (fs.existsSync(modelsSource))
-      copyCredential(modelsSource, path.join(piAgentDir, "models-store.json"));
+    const modelsStore = path.join(piAgentDir, "models-store.json");
+    const existingStore = fs.lstatSync(modelsStore, { throwIfNoEntry: false });
+    if (existingStore && !existingStore.isFile())
+      throw new Error("Managed Pi models-store.json must be a regular file");
+    if (!existingStore && fs.existsSync(modelsSource)) copyCredential(modelsSource, modelsStore);
   }
 
-  const sourceSettings = readSettings(sourceAgentDir);
+  const sourceSettings = synthetic ? {} : readSettings(sourceAgentDir);
   const settings: Record<string, unknown> = {
     defaultProjectTrust: "always",
     packages: discovered.packages,

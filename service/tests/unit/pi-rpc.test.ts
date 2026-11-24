@@ -393,6 +393,9 @@ describe("prepareControlledPiAgentHome", () => {
     expect(settings.packages.some((entry) => entry.startsWith("npm:"))).toBe(false);
     expect(settings.packages.map((entry) => path.basename(entry))).toEqual([
       "nzh10-skills",
+      "pi-intercom",
+      "pi-btw",
+      "pi-autoresearch",
       "pi-skillful",
       "pi-subagents",
       "pi-antigravity-acp-provider",
@@ -429,6 +432,30 @@ describe("prepareControlledPiAgentHome", () => {
     expectIsolatedRouting(prepareControlledPiAgentHome(options));
   });
 
+  it("links the user model catalog but only seeds the managed model cache once", () => {
+    const { sourceAgentDir, dataDir } = makeSource();
+    const catalog = path.join(sourceAgentDir, "models.json");
+    const hostCache = path.join(sourceAgentDir, "models-store.json");
+    fs.writeFileSync(catalog, "{}\n");
+    fs.writeFileSync(hostCache, '{"source":true}');
+    const options = { mode: "runtime" as const, sourceAgentDir, dataDir };
+    const { piAgentDir } = prepareControlledPiAgentHome(options);
+    const managed = path.join(piAgentDir, "models-store.json");
+    const link = path.join(piAgentDir, "models.json");
+    expect(fs.readlinkSync(link)).toBe(catalog);
+    const inode = fs.lstatSync(link).ino;
+    expect(fs.lstatSync(managed).isFile()).toBe(true);
+    expect(fs.readFileSync(managed, "utf8")).toBe('{"source":true}');
+    fs.writeFileSync(managed, '{"managed":true}');
+    prepareControlledPiAgentHome(options);
+    expect(fs.readFileSync(managed, "utf8")).toBe('{"managed":true}');
+    expect(fs.readFileSync(hostCache, "utf8")).toBe('{"source":true}');
+    expect(fs.lstatSync(link).ino).toBe(inode);
+    fs.unlinkSync(catalog);
+    prepareControlledPiAgentHome(options);
+    expect(fs.lstatSync(link, { throwIfNoEntry: false })).toBeUndefined();
+  });
+
   it("preserves existing runtime agent definitions when switching to host agents", () => {
     const { sourceAgentDir, dataDir } = makeSource();
     const piAgentDir = path.join(dataDir, "pi-agent-home");
@@ -446,8 +473,10 @@ describe("prepareControlledPiAgentHome", () => {
     );
   });
 
-  it("builds a synthetic home without host credential symlinks", () => {
+  it("builds a synthetic home without host credentials, settings or models", () => {
     const { sourceAgentDir } = makeSource();
+    for (const file of ["models.json", "models-store.json", "settings.json"])
+      fs.writeFileSync(path.join(sourceAgentDir, file), "not JSON; must not be read");
     const home = prepareControlledPiAgentHome({ mode: "test-synthetic", sourceAgentDir });
     temporaryDirectories.push(home.piAgentDir, home.geminiHome!, home.env.PI_SUBAGENTS_TEMP_ROOT);
     expect(JSON.parse(fs.readFileSync(path.join(home.piAgentDir, "auth.json"), "utf8"))).toEqual(
@@ -459,16 +488,13 @@ describe("prepareControlledPiAgentHome", () => {
     expectIsolatedRouting(home);
     expectNoSymlinks(home.piAgentDir);
     expectNoSymlinks(home.geminiHome!);
-    expectControlledSettings(home.settingsPath);
+    expect(JSON.parse(fs.readFileSync(home.settingsPath, "utf8"))).toEqual({
+      defaultProjectTrust: "always",
+      packages: [],
+    });
+    expect(fs.existsSync(path.join(home.piAgentDir, "models.json"))).toBe(false);
+    expect(fs.existsSync(path.join(home.piAgentDir, "models-store.json"))).toBe(false);
     expect(fs.existsSync(path.join(home.geminiHome!, "antigravity-acp-provider"))).toBe(false);
-    expect(
-      JSON.parse(
-        fs.readFileSync(
-          path.join(home.piAgentDir, "antigravity-acp-provider", "config.json"),
-          "utf8",
-        ),
-      ),
-    ).toEqual({ permissions: "yolo", runtimeUpdates: "manual" });
   });
 
   it("atomically applies the managed ACP profile without changing unrelated or standalone settings", () => {
@@ -671,7 +697,13 @@ describe("prepareControlledPiAgentHome", () => {
             : packageSources.map((source) =>
                 selection === "explicit object-form" ? { source, skills: ["foo"] } : source,
               ),
-        excludePackages: ["pi-subagents", "npm:pi-antigravity-acp-provider"],
+        excludePackages: [
+          "pi-subagents",
+          "npm:pi-antigravity-acp-provider",
+          "pi-btw",
+          "pi-intercom",
+          "pi-autoresearch",
+        ],
       });
       const settings = JSON.parse(fs.readFileSync(home.settingsPath, "utf8")) as {
         packages: unknown;
@@ -706,7 +738,7 @@ describe("prepareControlledPiAgentHome", () => {
     const subagentsDir = path.join(sourceAgentDir, "npm", "node_modules", "pi-subagents");
     fs.mkdirSync(subagentsDir, { recursive: true });
 
-    // No settings.json yet: skips missing optional packages (nzh10-skills, pi-skillful) without ENOENT.
+    // A package not listed in settings.json isn't enabled just because it is installed.
     const noSettingsHome = prepareControlledPiAgentHome({
       mode: "runtime",
       sourceAgentDir,

@@ -33,7 +33,6 @@ interface Launch {
   model?: string;
   effort?: string;
   panel?: { instructions: string; tools: FakeTool[] };
-  env?: Record<string, string | undefined>;
   prompts: string[];
   emit: (frame: unknown) => void;
 }
@@ -61,7 +60,6 @@ class TestSession extends FakeSession {
         cwd: this.sessionConfig.cwd,
         model: this.sessionConfig.model,
         effort: this.sessionConfig.effort,
-        env: this.providerEnv,
         prompts: [],
         emit: (frame) => this.emitFrame(frame),
       };

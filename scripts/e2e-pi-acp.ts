@@ -263,9 +263,9 @@ export default function (pi) {
         dataDir: root,
         piAgentDir: home.piAgentDir,
         piArgs: ["-e", observer],
-        providerEnv: env,
       },
       {
+        env,
         reconcileIntervalMs: 500,
         readyTimeoutMs: 20_000,
         rpcFactory: (options) => {

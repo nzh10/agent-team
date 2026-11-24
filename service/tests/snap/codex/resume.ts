@@ -34,14 +34,17 @@ export default fixture({
     expect(first.content).toBe("ok");
     expect(compacted.events!.filter((e) => e.kind === "compact")).toHaveLength(1);
     expect(last.content).toBe("kiwi 4051");
-    // A new process resumes the thread, whose tools and instructions codex
-    // kept: neither goes in again.
+    // Codex retains tool declarations in the thread. The server supplies
+    // current project instructions again on resume.
     expect(r.sessions).toHaveLength(2);
     expect(r.sessions[1].sessionId).toBe(r.sessions[0].sessionId);
     const resume = r.sent.find((s) => s.method === "thread/resume");
     expect(resume?.params).toMatchObject({ threadId: r.sessions[0].sessionId });
     expect(resume?.params).not.toHaveProperty("dynamicTools");
-    expect(resume?.params).not.toHaveProperty("developerInstructions");
+    expect(resume?.params).toHaveProperty(
+      "developerInstructions",
+      "Panel tools of a recorded fixture.",
+    );
     expect(r.sent.filter((s) => s.method === "thread/compact/start")).toHaveLength(1);
     const call = last.events!.find((e) => e.kind === "tool_use");
     expect([call?.toolName, call?.toolResult]).toEqual([
