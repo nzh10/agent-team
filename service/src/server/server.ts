@@ -725,6 +725,20 @@ export class Server {
           : undefined;
         const quote = msg.quote as
           { messageId: string; agentId: string | null; content: string } | undefined;
+        // send_receipt marks admission (persisted and broadcast into the transcript);
+        // any later failure during dispatchPrompt is a delivery error, not a draft rejection.
+        let receiptSent = false;
+        let settleAdmission!: () => void;
+        const admitted = new Promise<void>((resolve) => {
+          settleAdmission = resolve;
+        });
+        const sendReceipt = () => {
+          if (receiptSent) return;
+          receiptSent = true;
+          settleAdmission();
+          if (typeof msg.requestId === "string")
+            this.sendJson(ws, { type: "send_receipt", requestId: msg.requestId });
+        };
         const send = async () => {
           try {
             await this.sendMessage(
@@ -733,11 +747,21 @@ export class Server {
               msg.target as string | undefined,
               images,
               quote,
+              sendReceipt,
             );
-            if (typeof msg.requestId === "string")
-              this.sendJson(ws, { type: "send_receipt", requestId: msg.requestId });
+            sendReceipt();
           } catch (error) {
-            reject(error instanceof Error ? error.message : String(error));
+            settleAdmission();
+            if (receiptSent) {
+              this.sendJson(ws, {
+                type: "error",
+                message: error instanceof Error ? error.message : String(error),
+              });
+            } else {
+              reject(error instanceof Error ? error.message : String(error));
+            }
+          } finally {
+            settleAdmission();
           }
         };
         // Sends keep their order even when one waits on an image download.
@@ -750,8 +774,14 @@ export class Server {
         }
         const next = (prev ?? Promise.resolve())
           .then(() => (missing.length ? this.fetchRemoteImages(missing) : undefined))
-          .then(send)
-          .catch((error: unknown) => reject(String(error)));
+          .then(() => {
+            void this.track(send());
+            return admitted;
+          })
+          .catch((error: unknown) => {
+            settleAdmission();
+            reject(String(error));
+          });
         this.sendOrder.set(wsId, next);
         void next.finally(() => {
           if (this.sendOrder.get(wsId) === next) this.sendOrder.delete(wsId);
@@ -1196,11 +1226,12 @@ export class Server {
     target?: string,
     images?: Array<{ name: string; url: string; path: string }>,
     quote?: { messageId: string; agentId: string | null; content: string },
+    onAccepted?: () => void,
   ): Promise<void> {
     const workspace = this.workspaces.get(workspaceId);
     if (!workspace) throw new Error("Workspace not found");
     if (!this.unarchiveWorkspace(workspace)) throw new Error("Workspace could not be loaded");
-    await workspace.sendMessage(content, target, images, quote);
+    await workspace.sendMessage(content, target, images, quote, onAccepted);
     this.persistWorkspace(workspaceId);
   }
 

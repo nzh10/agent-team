@@ -405,6 +405,192 @@ describe("server restart with projects", () => {
       await server.close();
     }
   });
+
+  it("sends send_receipt on acceptance without waiting for cold-start session.send()", async () => {
+    const { base, web } = seed();
+    const { server, frames, send, stop } = await start(base, web, true);
+    const rpc = (message: Record<string, unknown>) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const socket = createConnection(path.join(base, "deploy-control/control.sock"), () =>
+          socket.write(JSON.stringify(message) + "\n"),
+        );
+        let reply = "";
+        socket.on("data", (chunk: Buffer) => (reply += chunk.toString()));
+        socket.on("error", reject);
+        socket.on("end", () => resolve(JSON.parse(reply) as Record<string, unknown>));
+      });
+    const leadSession = sessionsByAgent.get("a-lead")!;
+    const origSend = leadSession.send.bind(leadSession);
+    let releaseColdStart!: () => void;
+    let firstSend = true;
+    vi.spyOn(leadSession, "send").mockImplementation((input) => {
+      if (!firstSend) return origSend(input);
+      firstSend = false;
+      return new Promise<void>((resolve) => {
+        releaseColdStart = () => {
+          void origSend(input).then(resolve);
+        };
+      });
+    });
+
+    try {
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "cold start msg",
+        requestId: "cold-1",
+      });
+      await until(
+        () =>
+          frames.some((f) => f.type === "send_receipt" && f.requestId === "cold-1") &&
+          frames.some(
+            (f) =>
+              f.type === "new_message" &&
+              (f.message as Message | undefined)?.content === "cold start msg",
+          ),
+        "immediate receipt and user message during cold start",
+      );
+      expect(launches).toHaveLength(0);
+      const status = await rpc({ cmd: "status" });
+      expect(status.blockers).toMatchObject({ workspaces: 1 });
+      expect((status.blockers as { requests: number }).requests).toBeGreaterThanOrEqual(1);
+
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "queued while cold",
+        requestId: "cold-2",
+      });
+      await until(
+        () =>
+          frames.some((f) => f.type === "send_receipt" && f.requestId === "cold-2") &&
+          frames.some(
+            (f) =>
+              f.type === "new_message" &&
+              (f.message as Message | undefined)?.content === "queued while cold" &&
+              (f.message as Message | undefined)?.status === "queued",
+          ),
+        "immediate receipt for follow-up queued during cold start",
+      );
+
+      releaseColdStart();
+      await until(() => launches.length === 1, "cold start completed");
+      expect(launches[0].prompts).toEqual(["cold start msg"]);
+      launches[0].emit({ kind: "result", content: "" });
+      await until(
+        () => launches[0].prompts.includes("queued while cold"),
+        "queued follow-up dispatched after cold start turn",
+      );
+      launches[0].emit({ kind: "result", content: "" });
+    } finally {
+      stop();
+      await server.close();
+    }
+  });
+
+  it("preserves sendOrder admission receipts across a slow image download while dispatch stays pending", async () => {
+    const { base, web } = seed();
+    const { server, frames, send, stop } = await start(base, web, true);
+    const rpc = (message: Record<string, unknown>) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const socket = createConnection(path.join(base, "deploy-control/control.sock"), () =>
+          socket.write(JSON.stringify(message) + "\n"),
+        );
+        let reply = "";
+        socket.on("data", (chunk: Buffer) => (reply += chunk.toString()));
+        socket.on("error", reject);
+        socket.on("end", () => resolve(JSON.parse(reply) as Record<string, unknown>));
+      });
+    let releaseDownload!: () => void;
+    let downloadStarted = false;
+    vi.spyOn(
+      server as unknown as {
+        fetchRemoteImages: (
+          images: Array<{ name: string; url: string; path: string }>,
+        ) => Promise<void>;
+      },
+      "fetchRemoteImages",
+    ).mockImplementation((images) => {
+      downloadStarted = true;
+      return new Promise<void>((resolve) => {
+        releaseDownload = () => {
+          for (const img of images) fs.writeFileSync(img.path, "img");
+          resolve();
+        };
+      });
+    });
+
+    const leadSession = sessionsByAgent.get("a-lead")!;
+    const origSend = leadSession.send.bind(leadSession);
+    let releaseColdStart!: () => void;
+    let firstSend = true;
+    vi.spyOn(leadSession, "send").mockImplementation((input) => {
+      if (!firstSend) return origSend(input);
+      firstSend = false;
+      return new Promise<void>((resolve) => {
+        releaseColdStart = () => {
+          void origSend(input).then(resolve);
+        };
+      });
+    });
+
+    try {
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "with slow image",
+        images: [{ name: "delayed.png", url: "/uploads/delayed.png" }],
+        requestId: "img-1",
+      });
+      send({
+        type: "send_message",
+        workspaceId: "ws-lead",
+        content: "after slow image",
+        requestId: "img-2",
+      });
+      await until(() => downloadStarted, "slow image download started");
+      expect(frames.filter((f) => f.type === "send_receipt")).toEqual([]);
+
+      releaseDownload();
+      await until(
+        () => frames.filter((f) => f.type === "send_receipt").length === 2,
+        "both receipts emitted in order before cold-start send resolves",
+      );
+      expect(frames.filter((f) => f.type === "send_receipt").map((f) => f.requestId)).toEqual([
+        "img-1",
+        "img-2",
+      ]);
+      expect(launches).toHaveLength(0);
+
+      const busyStatus = await rpc({ cmd: "status" });
+      expect(busyStatus.blockers).toMatchObject({ workspaces: 1 });
+      expect((busyStatus.blockers as { requests: number }).requests).toBeGreaterThanOrEqual(1);
+
+      releaseColdStart();
+      await until(() => launches.length === 1, "first image send dispatched");
+      launches[0].emit({ kind: "result", content: "" });
+      await until(
+        () => launches[0].prompts.includes("after slow image"),
+        "second send dispatched after first completes",
+      );
+      launches[0].emit({ kind: "result", content: "" });
+      let idleStatus = await rpc({ cmd: "status" });
+      for (
+        let i = 0;
+        i < 50 &&
+        ((idleStatus.blockers as { workspaces: number; requests: number }).workspaces !== 0 ||
+          (idleStatus.blockers as { workspaces: number; requests: number }).requests !== 0);
+        i++
+      ) {
+        await new Promise((r) => setTimeout(r, 10));
+        idleStatus = await rpc({ cmd: "status" });
+      }
+      expect(idleStatus.blockers).toMatchObject({ workspaces: 0, requests: 0 });
+    } finally {
+      stop();
+      await server.close();
+    }
+  });
   it("keeps the candidate fenced, journals a worker report, and dispatches only after verification", async () => {
     const { base, web } = seed();
     const transaction = path.join(base, "transaction.json");

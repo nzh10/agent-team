@@ -1268,6 +1268,7 @@ export function App() {
 
   // Set while a send is in flight (uploading, or waiting on a liveness probe)
   // so a second tap cannot send the same draft twice.
+  const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const handleSend = useCallback(async () => {
     const text = (textareaRef.current?.value ?? "").trim();
@@ -1281,6 +1282,7 @@ export function App() {
       return;
     }
     sendingRef.current = true;
+    setSending(true);
     let sent = false;
     try {
       let images: Array<{ name: string; url: string }> | undefined;
@@ -1307,6 +1309,7 @@ export function App() {
       );
     } finally {
       sendingRef.current = false;
+      setSending(false);
     }
     // Not sent: the draft, images and quote stay for another try.
     if (!sent) return;
@@ -1846,9 +1849,11 @@ export function App() {
                     disabled={
                       (!hasInput && pendingImages.length === 0) ||
                       !hasAgents ||
+                      sending ||
                       uploading ||
                       projectSealed
                     }
+                    aria-busy={sending || uploading || undefined}
                     title={
                       targetBusy
                         ? `${targetAgent.name} is busy — message will run next`

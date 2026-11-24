@@ -196,7 +196,9 @@ describe("composer", () => {
 
   it("keeps a draft on a retryable seal response and clears it only after a receipt", async () => {
     const sock = boot([], { sendReceipt: true });
+    const sendBtn = () => document.querySelector<HTMLButtonElement>(".btn-primary-slot")!;
     fireEvent.change(composer(), { target: { value: "preserve me" } });
+    expect(sendBtn().disabled).toBe(false);
     fireEvent.keyDown(composer(), { key: "Enter" });
     const lastSend = () =>
       sock
@@ -204,6 +206,8 @@ describe("composer", () => {
         .filter((frame) => frame.type === "send_message")
         .at(-1)!;
     expect(composer().value).toBe("preserve me");
+    expect(sendBtn().disabled).toBe(true);
+    expect(sendBtn().getAttribute("aria-busy")).toBe("true");
     sock.receive({
       type: "error",
       message: "Retry shortly",
@@ -212,10 +216,15 @@ describe("composer", () => {
     });
     await act(async () => {});
     expect(composer().value).toBe("preserve me");
+    expect(sendBtn().disabled).toBe(false);
+    expect(sendBtn().getAttribute("aria-busy")).toBeNull();
     fireEvent.keyDown(composer(), { key: "Enter" });
+    expect(sendBtn().disabled).toBe(true);
+    expect(sendBtn().getAttribute("aria-busy")).toBe("true");
     sock.receive({ type: "send_receipt", requestId: lastSend().requestId });
     await act(async () => {});
     expect(composer().value).toBe("");
+    expect(sendBtn().getAttribute("aria-busy")).toBeNull();
   });
 
   it("leaves another workspace's draft alone when a held send completes", async () => {

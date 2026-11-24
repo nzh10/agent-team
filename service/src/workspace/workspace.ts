@@ -1514,6 +1514,7 @@ export class Workspace {
     target?: string,
     images?: Array<{ name: string; url: string; path: string }>,
     quote?: { messageId: string; agentId: string | null; content: string },
+    onAccepted?: () => void,
   ): Promise<void> {
     this.assertWritable();
     let resolvedTarget = target;
@@ -1553,6 +1554,7 @@ export class Workspace {
       clearLiveTiming(agentMsg);
       this.pushMessage(agentMsg);
       this.finished(agentMsg.id, "done", cmdResult);
+      onAccepted?.();
       return;
     }
 
@@ -1610,10 +1612,20 @@ export class Workspace {
       ...(steering && { steering: true }),
     };
     this.enqueue(userMsg, { inputId: userMsg.id, text: prompt, attachmentIds });
-    if (steering) await this.steer(agent, userMsg);
-    if (busy) return;
+    if (steering) {
+      const steeringPrompt = this.steer(agent, userMsg);
+      onAccepted?.();
+      await steeringPrompt;
+      return;
+    }
+    if (busy) {
+      onAccepted?.();
+      return;
+    }
 
-    await this.dispatchPrompt(agent, userMsg.queuedEnvelope!, userMsg);
+    const dispatching = this.dispatchPrompt(agent, userMsg.queuedEnvelope!, userMsg);
+    onAccepted?.();
+    await dispatching;
   }
 
   // Whether a message for the agent now goes into its running turn: the
