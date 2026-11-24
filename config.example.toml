@@ -75,10 +75,10 @@ type = "local"
 # Your name and avatar in chat. Use an emoji, a text label without a slash,
 # or an image path such as avatars/me.png.
 # Files in avatars/ beside config.toml take precedence over bundled avatars.
-# [user]
+[user]
 # name = "You"
 # avatar = "avatars/header.jpg"
-# language = "Simplified Chinese"  # project replies, questions and summaries only
+language = "简体中文"  # user-facing project replies, questions and summaries only
 
 # Repeat to replace the built-in agent presets; omitted or empty uses built-ins.
 # A project worker can use a preset by exact name, with model and effort overrides.

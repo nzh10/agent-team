@@ -199,7 +199,7 @@ label = "Local"
 type = "local"
 
 [user]
-# language = "Simplified Chinese"  # user-facing project replies, questions and summaries only
+language = "简体中文"          # user-facing project replies, questions and summaries only
 
 [projects]                   # what new leads (and workers started without a model) run on
 model = "gpt-6-astra"         # any model in the picker

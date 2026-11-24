@@ -329,6 +329,7 @@ describe("yaat-service.sh and start-server.sh", () => {
     const config = readFileSync(join(base, "config.toml"), "utf8");
     expect(config).toMatch(/password = "[a-f0-9]{24}"/);
     expect(config).toMatch(/session_secret = "[a-f0-9]{64}"/);
+    expect(config).toContain('[user]\nlanguage = "简体中文"\n');
   });
 
   it("forwards --doctor --json even if config and Pi are missing and does not write", () => {

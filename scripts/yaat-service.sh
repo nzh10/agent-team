@@ -469,6 +469,11 @@ type = \"local\"
 "
   fi
 
+  content="${content}
+[user]
+language = \"简体中文\"
+"
+
   if [ -n "$MODEL" ] || [ -n "$EFFORT" ]; then
     content="${content}
 [projects]
