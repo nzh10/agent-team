@@ -5,6 +5,7 @@
 // to the server, which stores it as a JSON file.
 
 import { readViewportFacts, ViewportFacts } from "../viewport/facts";
+import { markToolSummaryDuplicates } from "./auditChatRedundancy";
 
 export interface RectBox {
   top: number;
@@ -386,6 +387,7 @@ export function trimmedHtml(maxMessages = 3): string {
       }
     }
   }
+  markToolSummaryDuplicates(clone);
   for (const payload of clone.querySelectorAll(TOOL_PAYLOAD_SELECTOR)) {
     payload.replaceChildren();
     payload.setAttribute("data-trimmed", "payload");

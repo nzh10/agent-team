@@ -449,10 +449,10 @@ describe("Copy buttons", () => {
   it("copies a result that came on its own", async () => {
     const writeText = vi.fn(() => Promise.resolve());
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    const { container, getByText } = render(
+    const { container, getByRole } = render(
       <EventItem ev={{ kind: "tool_result", content: "a_b.ts\r\n" }} />,
     );
-    fireEvent.click(getByText(/^Result ·/));
+    fireEvent.click(getByRole("button", { name: "Show · 8 chars" }));
     await click(container.querySelector(".event-result .copy-btn")!);
     expect(writeText).toHaveBeenCalledWith("a_b.ts");
   });

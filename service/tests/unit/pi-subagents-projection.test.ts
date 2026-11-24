@@ -191,7 +191,7 @@ describe("Pi subagent projection", () => {
       ).toEqual([
         expect.objectContaining({
           taskId: childA,
-          eventCount: 2,
+          eventCount: 1,
           model: "test/native-a",
           effort: "high",
         }),
@@ -211,7 +211,8 @@ describe("Pi subagent projection", () => {
       expect(startA.subagent?.events?.[0].toolInput).not.toHaveProperty("filter");
       expect(startA.subagent).toMatchObject({
         status: "completed",
-        eventCount: 2,
+        eventCount: 1,
+        events: [expect.objectContaining({ kind: "tool_use", toolResult: outputMarker })],
         model: "test/native-a",
         effort: "high",
       });

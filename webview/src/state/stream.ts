@@ -266,6 +266,7 @@ function applyInnerEvent(sa: SubAgentInfo, innerEv: StreamEvent): void {
       sa.events[i] = {
         ...sa.events[i],
         toolResult: innerEv.content,
+        ...(innerEv.isMarkdown && { toolResultIsMarkdown: true }),
         ...(innerEv.isError && { toolResultIsError: true }),
         ...(innerEv.durationMs != null && { durationMs: innerEv.durationMs }),
       };

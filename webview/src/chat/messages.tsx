@@ -427,8 +427,9 @@ export const EventItem = memo(function EventItem({
           </button>
         )}
         {(isResult || hasResult) && (
-          <button className="btn-inline btn-diff" onClick={toggleResult}>
-            {resultOpen ? "Hide result" : "Result"} · {resultLabel(resultLen)}
+          <button className="btn-inline btn-diff" aria-expanded={resultOpen} onClick={toggleResult}>
+            {isResult ? (resultOpen ? "Hide" : "Show") : resultOpen ? "Hide result" : "Result"} ·{" "}
+            {resultLabel(resultLen)}
           </button>
         )}
       </div>
