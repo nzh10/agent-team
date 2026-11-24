@@ -1276,7 +1276,10 @@ export class ProjectManager {
       const canonical = canonicalPath(cwd);
       return roots.some((r) => {
         const root = canonicalPath(r);
-        return canonical === root || canonical.startsWith(`${root}/`);
+        return (
+          canonical === root ||
+          canonical.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)
+        );
       });
     };
     return [...this.host.workspaces()].filter(
@@ -1318,7 +1321,10 @@ export class ProjectManager {
     const folder =
       a.folder && path.resolve(base.root ?? this.leadOf(base.id)?.cwd ?? this.baseDir, a.folder);
     const sessions = (await this.scope(projectId, a.project, a.session)).filter(
-      (w) => !folder || w.cwd === folder || w.cwd.startsWith(`${folder}/`),
+      (w) =>
+        !folder ||
+        w.cwd === folder ||
+        w.cwd.startsWith(folder.endsWith(path.sep) ? folder : `${folder}${path.sep}`),
     );
     const names = new Map(sessions.map((w) => [w.id, w.name]));
     const kinds: EntryKind[] =

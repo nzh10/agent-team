@@ -524,7 +524,7 @@ async function replayPi(
 ): Promise<Replay> {
   const base = Date.parse(rec.header.recordedAt) - (rec.entries.at(-1)?.t ?? 0);
   if (vi.isFakeTimers()) vi.setSystemTime(base);
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "yaat-pi-snap-")));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "yaat-pi-snap-")));
   const panel = new PanelHttpServer();
   const stats = rec.entries
     .flatMap((entry) =>
@@ -560,7 +560,13 @@ async function replayPi(
       override createSession(agentId: string, config: SessionConfig) {
         const session = new PiSession(
           { ...config, agentId, piAgentDir: dir, uploadsDir },
-          { panelHttp: panel, rpcFactory: player.connect, readyTimeoutMs: 1500 },
+          {
+            panelHttp: panel,
+            rpcFactory: player.connect,
+            readyTimeoutMs: 1500,
+            // RPC is replayed; readiness needs an executable but never launches it.
+            env: { AGY_ACP_BIN: process.execPath },
+          },
         );
         sessions.push(session);
         session.on("event", (event: StreamEvent) => events.push(structuredClone(event)));

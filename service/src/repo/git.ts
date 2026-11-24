@@ -83,7 +83,7 @@ export function repositoryRoot(cwd: string): string {
       ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
       { encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
-    return path.basename(common) === ".git" ? path.dirname(common) : cwd;
+    return path.basename(common) === ".git" ? path.normalize(path.dirname(common)) : cwd;
   } catch {
     return cwd;
   }
@@ -92,7 +92,7 @@ export function repositoryRoot(cwd: string): string {
 export async function gitWorktrees(root: string): Promise<string[]> {
   const out = await run("git", ["worktree", "list", "--porcelain"], root, 5000);
   const paths = out === null ? [] : parseWorktrees(out);
-  return paths.length ? paths : [root];
+  return paths.length ? paths.map((p) => path.normalize(p)) : [root];
 }
 
 // The commit a folder is at, abbreviated; undefined outside git.

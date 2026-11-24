@@ -70,7 +70,7 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-describe("release garbage collection", () => {
+describe.skipIf(process.platform === "win32")("release garbage collection", () => {
   it("keeps current, rollback, live processes and unfinished jobs", async () => {
     const root = path.join(dir, "releases");
     const jobs = path.join(root, "jobs");
@@ -383,7 +383,7 @@ describe("deferred cutover", () => {
     expect(f.manager.restart).not.toHaveBeenCalled();
   });
 
-  it.each(["succeeded", "rolled_back"])(
+  it.skipIf(process.platform === "win32").each(["succeeded", "rolled_back"])(
     "checks the boot and release and leaves a %s job",
     async (outcome) => {
       const f = fixture();

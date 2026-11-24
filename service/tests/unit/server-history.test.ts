@@ -36,7 +36,7 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
-  for (const b of bases.splice(0)) fs.rmSync(b, { recursive: true, force: true });
+  for (const b of bases.splice(0)) fs.rmSync(b, { recursive: true, force: true, maxRetries: 5 });
 });
 
 const until = async (cond: () => boolean, what: string) => {
@@ -157,7 +157,7 @@ async function start(base: string, web: string) {
     if (stopped) return;
     stopped = true;
     ws.close();
-    void server.close();
+    return server.close();
   };
   return { server, frames, send, search, live, stop };
 }
@@ -197,7 +197,7 @@ describe("a real server saving histories", () => {
         "the late change saved",
       );
     } finally {
-      stop();
+      await stop();
     }
   });
 
@@ -212,7 +212,7 @@ describe("a real server saving histories", () => {
       expect(await search("NARWHAL")).toEqual(["ws-b/b1"]);
       expect(await search("zeppelin")).toEqual(["ws-a/u1"]);
     } finally {
-      stop();
+      await stop();
     }
   });
 
@@ -243,7 +243,7 @@ describe("a real server saving histories", () => {
       ws("ws-a", [msg("u1", "hello", 1000, { kind: "user", agentId: null })]),
     ]);
     vi.spyOn(console, "log").mockImplementation(() => {});
-    (await start(base, web)).stop();
+    await (await start(base, web)).stop();
     crashMidTurn(
       base,
       "ws-a",
@@ -268,7 +268,7 @@ describe("a real server saving histories", () => {
       expect([...(calls[0][2] as Set<string>)]).toEqual(["a1"]);
       expect(await search("quokkas")).toEqual(["ws-a/a1"]);
     } finally {
-      stop();
+      await stop();
     }
   });
 
@@ -304,7 +304,7 @@ describe("a real server saving histories", () => {
       expect(rows(base, "ws-a")[0].content).toBe("first, edited");
       expect(rows(base, "ws-c")[0].content).toBe("other");
     } finally {
-      stop();
+      await stop();
     }
     expect(rows(base, "ws-c")[0].content).toBe("other, edited");
   });
@@ -326,7 +326,7 @@ describe("a real server saving histories", () => {
         "the turn started",
       );
     } finally {
-      stop();
+      await stop();
     }
     const saved = rows(base, "ws-a").filter((m) => m.content !== "tell me about axolotls");
     expect(saved.map((m) => m.status)).toEqual(["done"]);
@@ -350,11 +350,14 @@ describe("a real server saving histories", () => {
     );
     db.close();
     const { stop } = await start(base, web);
-    stop();
-    expect(
-      new DatabaseSync(historyFile(base), { readOnly: true })
-        .prepare("select id from messages where session = 'ws-a' order by seq")
-        .all(),
-    ).toEqual([{ id: "a1" }, { id: "a2" }]);
+    await stop();
+    const saved = new DatabaseSync(historyFile(base), { readOnly: true });
+    try {
+      expect(
+        saved.prepare("select id from messages where session = 'ws-a' order by seq").all(),
+      ).toEqual([{ id: "a1" }, { id: "a2" }]);
+    } finally {
+      saved.close();
+    }
   });
 });

@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
-import { createConnection } from "node:net";
+import { DeployControl } from "../../src/server/deploy-control";
 import * as path from "path";
 import WebSocket from "ws";
 import type { Message, WorkspaceState, AgentState } from "../../src/workspace/workspace";
@@ -320,6 +320,8 @@ function seed(
 }
 
 async function start(base: string, web: string, deploy = false, bootFence?: string) {
+  // Socket ownership is covered by deploy-control.test on POSIX. Here exercise the real seal state machine.
+  if (deploy) vi.spyOn(DeployControl.prototype, "listen").mockResolvedValue();
   const server = new Server(
     0,
     base,
@@ -342,7 +344,7 @@ async function start(base: string, web: string, deploy = false, bootFence?: stri
   const send = (msg: Record<string, unknown>) => ws.send(JSON.stringify(msg));
   const stop = () => {
     ws.close();
-    void server.close();
+    return server.close();
   };
   return { server, port, frames, send, stop };
 }
@@ -359,7 +361,7 @@ const readState = (base: string, id: string): WorkspaceState => {
 describe("server restart with projects", () => {
   it("persists a local model change before sending its receipt and correlates malformed-image errors", async () => {
     const { base, web } = seed();
-    const { server, frames, send, stop } = await start(base, web);
+    const { frames, send, stop } = await start(base, web);
     try {
       send({
         type: "send_message",
@@ -387,23 +389,14 @@ describe("server restart with projects", () => {
         false,
       );
     } finally {
-      stop();
-      await server.close();
+      await stop();
     }
   });
   it("treats the lead's own turn as busy, then gates sends and resumes after unseal", async () => {
     const { base, web } = seed();
     const { server, frames, send, stop } = await start(base, web, true);
-    const rpc = (message: Record<string, unknown>) =>
-      new Promise<Record<string, unknown>>((resolve, reject) => {
-        const socket = createConnection(path.join(base, "deploy-control/control.sock"), () =>
-          socket.write(JSON.stringify(message) + "\n"),
-        );
-        let reply = "";
-        socket.on("data", (chunk: Buffer) => (reply += chunk.toString()));
-        socket.on("error", reject);
-        socket.on("end", () => resolve(JSON.parse(reply) as Record<string, unknown>));
-      });
+    const rpc = (message: Record<string, unknown>): Promise<Record<string, unknown>> =>
+      server["deploy"]!.request(message);
     const input = { type: "send_message", workspaceId: "ws-lead", content: "schedule deploy" };
     try {
       send({ ...input, requestId: "one" });
@@ -417,6 +410,9 @@ describe("server restart with projects", () => {
       const seal = { ...status, cmd: "seal", deployId: "job" };
       expect(await rpc(seal)).toMatchObject({ sealed: false });
       launches[0].emit({ kind: "result", content: "" });
+      await vi.waitFor(async () =>
+        expect((await rpc({ cmd: "status" })).blockers).toMatchObject({ workspaces: 0 }),
+      );
       expect(await rpc(seal)).toMatchObject({ sealed: true, commitReady: true });
       send({ ...input, requestId: "two", content: "keep this draft" });
       await until(
@@ -433,24 +429,15 @@ describe("server restart with projects", () => {
       );
       expect(launches[0].prompts).toEqual(["schedule deploy", "keep this draft"]);
     } finally {
-      stop();
-      await server.close();
+      await stop();
     }
   });
 
   it("sends send_receipt on acceptance without waiting for cold-start session.send()", async () => {
     const { base, web } = seed();
     const { server, frames, send, stop } = await start(base, web, true);
-    const rpc = (message: Record<string, unknown>) =>
-      new Promise<Record<string, unknown>>((resolve, reject) => {
-        const socket = createConnection(path.join(base, "deploy-control/control.sock"), () =>
-          socket.write(JSON.stringify(message) + "\n"),
-        );
-        let reply = "";
-        socket.on("data", (chunk: Buffer) => (reply += chunk.toString()));
-        socket.on("error", reject);
-        socket.on("end", () => resolve(JSON.parse(reply) as Record<string, unknown>));
-      });
+    const rpc = (message: Record<string, unknown>): Promise<Record<string, unknown>> =>
+      server["deploy"]!.request(message);
     const leadSession = sessionsByAgent.get("a-lead")!;
     const origSend = leadSession.send.bind(leadSession);
     let releaseColdStart!: () => void;
@@ -515,24 +502,15 @@ describe("server restart with projects", () => {
       );
       launches[0].emit({ kind: "result", content: "" });
     } finally {
-      stop();
-      await server.close();
+      await stop();
     }
   });
 
   it("preserves sendOrder admission receipts across a slow image download while dispatch stays pending", async () => {
     const { base, web } = seed();
     const { server, frames, send, stop } = await start(base, web, true);
-    const rpc = (message: Record<string, unknown>) =>
-      new Promise<Record<string, unknown>>((resolve, reject) => {
-        const socket = createConnection(path.join(base, "deploy-control/control.sock"), () =>
-          socket.write(JSON.stringify(message) + "\n"),
-        );
-        let reply = "";
-        socket.on("data", (chunk: Buffer) => (reply += chunk.toString()));
-        socket.on("error", reject);
-        socket.on("end", () => resolve(JSON.parse(reply) as Record<string, unknown>));
-      });
+    const rpc = (message: Record<string, unknown>): Promise<Record<string, unknown>> =>
+      server["deploy"]!.request(message);
     let releaseDownload!: () => void;
     let downloadStarted = false;
     vi.spyOn(
@@ -619,15 +597,14 @@ describe("server restart with projects", () => {
       }
       expect(idleStatus.blockers).toMatchObject({ workspaces: 0, requests: 0 });
     } finally {
-      stop();
-      await server.close();
+      await stop();
     }
   });
   it("keeps the candidate fenced, journals a worker report, and dispatches only after verification", async () => {
     const { base, web } = seed();
     const transaction = path.join(base, "transaction.json");
     fs.writeFileSync(transaction, "{}");
-    const { server, frames, send, stop } = await start(base, web, true, transaction);
+    const { frames, send, stop } = await start(base, web, true, transaction);
     const input = {
       type: "send_message",
       workspaceId: "ws-lead",
@@ -657,9 +634,8 @@ describe("server restart with projects", () => {
       );
       expect(launches[0].prompts).toHaveLength(1);
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -721,13 +697,11 @@ describe("server restart with projects", () => {
           canSwitchBackend: false,
         });
       } finally {
-        restarted.stop();
-        await restarted.server.close();
+        await restarted.stop();
       }
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -759,7 +733,7 @@ describe("server restart with projects", () => {
       primary: { usedPercent: 27, windowDurationMins: 300, resetsAt: null },
       secondary: null,
     });
-    const { server, frames, send, stop } = await start(base, web);
+    const { frames, send, stop } = await start(base, web);
     const latestQuota = () =>
       frames.filter((f) => f.type === "quota_snapshot").at(-1)?.quota as QuotaState | undefined;
     const acpRow = (quota?: QuotaState) => quota?.rows.find((r) => r.provider === ACP);
@@ -799,9 +773,8 @@ describe("server restart with projects", () => {
       await until(() => acpRow(latestQuota())?.reason === "not configured", "ACP not configured");
       expect(read.mock.calls.filter(([provider]) => provider === ACP)).toHaveLength(1);
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -818,9 +791,8 @@ describe("server restart with projects", () => {
         { force: false, providers: ["kimi-coding"] },
       ]);
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -838,9 +810,8 @@ describe("server restart with projects", () => {
         providers: [NATIVE_CODEX],
       });
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -893,6 +864,15 @@ describe("server restart with projects", () => {
       try {
         send({ type: "refresh_quota", force: true });
         await until(() => !!readLimits.mock.calls.length && snapshots().length > 1, "cold refresh");
+        if (overlap) {
+          // Queue a manual refresh during the blocked read, regardless of whether startup or the first WS request began it.
+          const refresh = vi.spyOn(server["quota"], "refresh");
+          send({ type: "refresh_quota", force: true });
+          await until(
+            () => refresh.mock.calls.some((args) => args[1]?.force === true),
+            "queued manual refresh",
+          );
+        }
         expect(readLimits.mock.calls[0]?.[0]?.CODEX_API_KEY).toBe("test-key");
         if (!overlap) {
           resolveNative(limits);
@@ -1065,7 +1045,7 @@ describe("server restart with projects", () => {
         resolveNative(limits);
         vi.unstubAllEnvs();
         await (closing ?? server.close());
-        fs.rmSync(base, { recursive: true, force: true });
+        fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
       }
     },
   );
@@ -1110,8 +1090,8 @@ describe("server restart with projects", () => {
       expect(startSessionDescription()).not.toContain('"One"');
       expect(startSessionDescription()).not.toContain("First dispatch hint");
     } finally {
-      stop();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -1149,8 +1129,8 @@ describe("server restart with projects", () => {
         { timeout: 3500 },
       );
     } finally {
-      stop();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -1229,8 +1209,8 @@ describe("server restart with projects", () => {
       );
       expect(startDescription(leadSession)).toContain("kimi-coding/k2p5");
     } finally {
-      stop();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -1307,14 +1287,14 @@ describe("server restart with projects", () => {
         from: { workspaceId: "ws-lead", role: "lead" },
       });
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const saved = readState(base, "ws-w");
     expect(saved.archivedAt).toBeNull();
     expect(saved.messages!.map((m) => m.id).slice(0, 2)).toEqual(["h1", "h2"]);
     expect(saved.messages!.some((m) => m.from?.role === "lead")).toBe(true);
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("shows a worker waiting for the user to a client that connects, and once restored", async () => {
@@ -1383,10 +1363,10 @@ describe("server restart with projects", () => {
       await until(() => updated().length > 0, "the restored worker's update");
       expect(updated()[0].awaitsUser).toBe(true);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("has the projects check a worker whose turn ended or who went idle", async () => {
@@ -1399,11 +1379,11 @@ describe("server restart with projects", () => {
       await until(() => idle.mock.calls.length > 0, "the check");
       expect(idle.mock.calls[0][0].id).toBe("ws-live");
     } finally {
-      stop();
+      await stop();
       idle.mockRestore();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("saves a worker's turn a shutdown cut off as cut by the restart, and what drove it", async () => {
@@ -1417,13 +1397,13 @@ describe("server restart with projects", () => {
       await tools.message_session.handler({ session_id: "ws-live", message: "build it" });
       await until(() => launches.length === 2, "worker query");
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const saved = readState(base, "ws-live");
     const asked = saved.messages!.find((m) => m.content === "build it")!;
     expect(saved.agents[0].delivered).toMatchObject({ id: asked.id, stopped: "restart" });
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("retries the turns a rate limit paused before the restart, one at a time", async () => {
@@ -1440,11 +1420,11 @@ describe("server restart with projects", () => {
       await vi.advanceTimersByTimeAsync(2500);
       expect(launches).toHaveLength(1);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     expect(readState(base, "ws-live").agents[0].pausedUntil).toBeUndefined();
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("retries a turn whose limit has reset without waiting behind another's retry hours away", async () => {
@@ -1456,10 +1436,10 @@ describe("server restart with projects", () => {
       await vi.advanceTimersByTimeAsync(1000);
       expect(launches).toHaveLength(1);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("starts a queued message and a due retry one slot apart", async () => {
@@ -1473,10 +1453,10 @@ describe("server restart with projects", () => {
       await vi.advanceTimersByTimeAsync(2500);
       expect(launches).toHaveLength(1);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("runs no retry for a worker archived while it waited for it", async () => {
@@ -1494,11 +1474,11 @@ describe("server restart with projects", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       expect(launches).toEqual([]);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     expect(readState(base, "ws-live").agents[0].pausedUntil).toBeUndefined();
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("archives a lead only with its project, which a session opened again brings back", async () => {
@@ -1529,12 +1509,12 @@ describe("server restart with projects", () => {
         .map((f) => f.workspaceId);
       expect(unarchived.sort()).toEqual(["ws-lead", "ws-w"]);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     expect(readState(base, "ws-lead").archivedAt).toBeNull();
     expect(readState(base, "ws-live").archivedAt).toBeGreaterThan(0);
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("archives at startup the sessions an archived project still had live", async () => {
@@ -1544,12 +1524,12 @@ describe("server restart with projects", () => {
     fs.writeFileSync(file, JSON.stringify({ ...saved, archivedAt: 5 }));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const { stop } = await start(base, web);
-    stop();
+    await stop();
     log.mockRestore();
     for (const id of ["ws-lead", "ws-live"]) {
       expect(readState(base, id).archivedAt).toBeGreaterThan(0);
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("runs a new lead and its workers on the default Codex model unless asked otherwise", async () => {
@@ -1575,10 +1555,10 @@ describe("server restart with projects", () => {
       await until(() => launches.length === 2, "worker query");
       expect(launches[1]).toMatchObject({ model: "gpt-6-astra", effort: undefined });
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("purges archived workers but never an archived lead, and the board forgets them", async () => {
@@ -1607,7 +1587,7 @@ describe("server restart with projects", () => {
       await until(() => frames.some((f) => f.type === "project_deleted"), "project delete");
       expect(frames).toContainEqual({ type: "workspace_deleted", workspaceId: "ws-lead" });
     } finally {
-      stop();
+      await stop();
     }
     const again = await start(base, web);
     try {
@@ -1632,10 +1612,10 @@ describe("server restart with projects", () => {
       });
       expect(infos.map((w) => w.id)).toContain(projects[0].leadWorkspaceId);
     } finally {
-      again.stop();
+      await again.stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 });
 
@@ -1688,10 +1668,10 @@ describe("rate limits on the server", () => {
       await until(() => launches[0].prompts.length === 3, "the user's message");
       expect(launches[0].prompts).toEqual(["P", "P", "U"]);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("waits a Codex weekly limit out to its reset without account failover", async () => {
@@ -1716,10 +1696,10 @@ describe("rate limits on the server", () => {
       );
       expect(launches).toHaveLength(1);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("tells the agent to carry on after a limit on a turn the CLI started itself", async () => {
@@ -1737,13 +1717,13 @@ describe("rate limits on the server", () => {
       await until(() => paused(frames).length > 0, "the pause");
       expect(paused(frames)[0]).toContain("it will be told to carry on at");
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const saved = readState(base, "ws-live").agents[0];
     expect(saved.pausedUntil).toBeDefined();
     expect(saved.lastEnvelope).toBeUndefined();
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("reports a wake-up the limit refuses while the retry waits, and keeps that retry", async () => {
@@ -1774,7 +1754,7 @@ describe("rate limits on the server", () => {
       expect(slots).not.toHaveBeenCalled();
       slots.mockRestore();
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const saved = readState(base, "ws-live");
@@ -1790,7 +1770,7 @@ describe("rate limits on the server", () => {
     expect(saved.agents[0].lastEnvelope?.inputId).toBe(
       saved.messages!.find((m) => m.content === "P")?.id,
     );
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("pauses for no 429 while no usage limit stands", async () => {
@@ -1806,7 +1786,7 @@ describe("rate limits on the server", () => {
       await until(() => frames.some((f) => f.type === "message_done"), "turn done");
       expect(paused(frames)).toEqual([]);
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const saved = readState(base, "ws-live");
@@ -1815,7 +1795,7 @@ describe("rate limits on the server", () => {
     expect(reply?.events?.find((e) => e.kind === "error")?.content).toContain(
       "not your usage limit",
     );
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("waits half an hour, not a minute, when a refusal names a reset already past", async () => {
@@ -1840,12 +1820,12 @@ describe("rate limits on the server", () => {
       launches[0].emit({ ...result("limit"), is_error: true });
       await until(() => paused(frames).length > 0, "the pause");
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
     const retryAt = readState(base, "ws-live").agents[0].pausedUntil!;
     expect(retryAt - before).toBeGreaterThanOrEqual(30 * 60_000);
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("saves the workspace once its retry has gone", async () => {
@@ -1859,10 +1839,10 @@ describe("rate limits on the server", () => {
       await vi.advanceTimersByTimeAsync(500);
       expect(readState(base, "ws-live").agents[0].pausedUntil).toBeUndefined();
     } finally {
-      stop();
+      await stop();
       log.mockRestore();
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
   it("keeps API-key Codex models enabled but excludes the account from quota reads and retries", async () => {
@@ -1889,9 +1869,8 @@ describe("rate limits on the server", () => {
       expect(readLimits).not.toHaveBeenCalled();
       expect(isNeutral(server["quota"].state())).toBe(true);
     } finally {
-      stop();
-      await server.close();
-      fs.rmSync(base, { recursive: true, force: true });
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 
@@ -2030,9 +2009,9 @@ describe("rate limits on the server", () => {
       );
     } finally {
       piCatalog.mockRestore();
-      stop();
+      await stop();
       log.mockRestore();
-      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
     }
   });
 });

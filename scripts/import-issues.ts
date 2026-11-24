@@ -140,7 +140,7 @@ function reproOf(id: string, root: string): string | undefined {
     : [id, id.replace("#", "-")];
   for (const n of names) {
     const file = path.join(listDir, "..", "repro", n, "run.sh");
-    if (fs.existsSync(file)) return path.relative(root, file);
+    if (fs.existsSync(file)) return path.relative(root, file).split(path.sep).join("/");
   }
   return undefined;
 }

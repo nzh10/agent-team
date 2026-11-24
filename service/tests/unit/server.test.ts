@@ -183,9 +183,13 @@ type = "local"
 }, 30000);
 
 afterAll(async () => {
-  child?.kill("SIGKILL");
+  if (child && child.exitCode === null && child.signalCode === null) {
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    child.kill("SIGKILL");
+    await closed;
+  }
   await new Promise<void>((r) => remote?.close(() => r()));
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
 });
 
 describe("server auth", () => {
