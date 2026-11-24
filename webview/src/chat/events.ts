@@ -1,4 +1,5 @@
 import type { StreamEvent, SubAgentInfo } from "../state/useServer";
+import { PANEL_ACTIONS, panelActionOf } from "../../../shared/panel-actions";
 
 export const SUBAGENT_KINDS = new Set(["subagent_start", "subagent_progress", "subagent_done"]);
 // One-line status banners that render inline rather than inside the
@@ -89,21 +90,8 @@ export function isBannerEvent(e: StreamEvent): boolean {
 // The panel's calls with an effect elsewhere — a session started, stopped
 // or archived, a message sent, a report to the lead — stand where they
 // happened as lines of their own, not folded among the steps.
-export const PANEL_ACTIONS = new Set([
-  "start_session",
-  "message_session",
-  "message_project",
-  "stop_session",
-  "archive_session",
-  "report_progress",
-  "finish_task",
-]);
-
-export function panelAction(e: StreamEvent): string | null {
-  if (e.kind !== "tool_use" || !e.toolName?.startsWith("mcp__panel__")) return null;
-  const name = e.toolName.slice("mcp__panel__".length);
-  return PANEL_ACTIONS.has(name) ? name : null;
-}
+export { PANEL_ACTIONS };
+export const panelAction = panelActionOf;
 
 // A subagent's lifecycle arrives as separate start/progress/done events (the
 // done event is appended rather than replacing the start so contentOffset

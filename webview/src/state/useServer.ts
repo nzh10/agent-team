@@ -4,7 +4,7 @@ import {
   type ExtensionUiEvent,
   type ExtensionUiSnapshot,
 } from "../../../shared/extension-ui";
-import type { QuotaState } from "../../../service/src/session/quota-schema";
+import type { QuotaState } from "../../../shared/quota";
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   MOCK_WORKSPACES,
