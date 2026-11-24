@@ -148,6 +148,14 @@ type = "local"
     PATH: process.env.PATH,
     HOME: home,
     USERPROFILE: home,
+    CODEX_HOME: path.join(home, ".codex"),
+    ...(process.platform === "win32" && {
+      SystemRoot: process.env.SystemRoot,
+      TEMP: os.tmpdir(),
+      TMP: os.tmpdir(),
+      LOCALAPPDATA: home,
+      APPDATA: home,
+    }),
     AGENT_TEAM_PORT: "0",
     AGENT_TEAM_HOST: "127.0.0.1",
     AGENT_TEAM_BASE_DIR: base,
@@ -454,6 +462,7 @@ describe("server websocket", () => {
 
   it("makes a new workspace a session of its folder's project, bringing the project once", async () => {
     const { ws, next } = await connect();
+    expect((await next("init")).codexAuth).toMatchObject({ authenticated: true });
     const folder = path.join(base, "fresh");
     fs.mkdirSync(folder, { recursive: true });
     ws.send(JSON.stringify({ type: "create_workspace", name: "first", path: folder }));
