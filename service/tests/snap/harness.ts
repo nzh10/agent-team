@@ -301,6 +301,7 @@ class PiRpcPlayer {
   private route?: { url: string; token: string };
   private stdout?: PassThrough;
   private exit?: (code: number) => void;
+  private readonly entries: Array<Record<string, unknown>> = [];
   image?: Buffer;
 
   constructor(
@@ -319,10 +320,13 @@ class PiRpcPlayer {
     if (saved)
       expect(saved === sessionFile, "restore reopens the synthetic session file").toBe(true);
     const sessionId = saved
-      ? (JSON.parse(fs.readFileSync(saved, "utf8")) as { id: string }).id
+      ? (JSON.parse(fs.readFileSync(saved, "utf8").split("\n")[0]) as { id: string }).id
       : arg("--session-id")!;
     if (!saved)
-      fs.writeFileSync(sessionFile, JSON.stringify({ type: "session", id: sessionId }) + "\n");
+      fs.writeFileSync(
+        sessionFile,
+        JSON.stringify({ type: "session", version: 3, id: sessionId, cwd: opts.cwd }) + "\n",
+      );
     this.connections.push({ restored: Boolean(saved) });
     this.route = {
       url: `${opts.env!.YAAT_PANEL_URL}/v1/sessions/${encodeURIComponent(opts.env!.YAAT_PANEL_KEY!)}`,
@@ -334,8 +338,8 @@ class PiRpcPlayer {
         sessionFile,
         cwd: opts.cwd!,
         headerCwd: opts.cwd!,
-        entryCount: 0,
-        leafId: null,
+        entryCount: this.entries.length,
+        leafId: (this.entries.at(-1)?.id as string | undefined) ?? null,
         anchorOnActiveBranch: true,
         anchorExistsInFile: true,
       },
@@ -370,6 +374,7 @@ class PiRpcPlayer {
         } else {
           this.sent.push(command);
           this.written.push(command);
+          if (command.type === "prompt") this.persistPrompt(command);
         }
         done();
       },
@@ -387,6 +392,18 @@ class PiRpcPlayer {
     stdin.on("finish", () => exit(0));
     return new PiRpcClient({ stdin, stdout, child }, { requestTimeoutMs: 1500 });
   };
+
+  private persistPrompt(command: PiFrame): void {
+    const id = `entry-${this.entries.length + 1}`;
+    const entry = {
+      type: "message",
+      id,
+      parentId: (this.entries.at(-1)?.id as string | undefined) ?? null,
+      message: { role: "user", content: String(command.message) },
+    };
+    this.entries.push(entry);
+    fs.appendFileSync(path.join(this.dir, "session.jsonl"), JSON.stringify(entry) + "\n");
+  }
 
   private async post(endpoint: string, body: unknown): Promise<unknown> {
     const { url, token } = this.route!;
@@ -505,7 +522,7 @@ async function replayPi(
 ): Promise<Replay> {
   const base = Date.parse(rec.header.recordedAt) - (rec.entries.at(-1)?.t ?? 0);
   if (vi.isFakeTimers()) vi.setSystemTime(base);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "yaat-pi-snap-"));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "yaat-pi-snap-")));
   const panel = new PanelHttpServer();
   const stats = rec.entries
     .flatMap((entry) =>

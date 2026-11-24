@@ -3,6 +3,7 @@ import { render, fireEvent, act } from "@testing-library/react";
 import { SubAgentItem, StepGroup, MessageItem, CreateWorkspaceDialog } from "../src/App";
 import { HostInfo } from "../src/state/useServer";
 import { StreamEvent, Message, AgentInfo } from "../src/state/useServer";
+import { applyEventsToMessage } from "../src/state/stream";
 
 const sa = (over: Partial<NonNullable<StreamEvent["subagent"]>> = {}): StreamEvent => ({
   kind: "subagent_start",
@@ -178,6 +179,52 @@ describe("MessageItem", () => {
     expect(item).toBeTruthy();
     expect(item.closest(".step-group")).toBeNull();
     expect(container.querySelector(".step-group")).toBeTruthy();
+  });
+
+  it("segments delayed thinking before text using the preserved offset", () => {
+    const streamed = applyEventsToMessage(msg({ status: "streaming" }), [
+      { kind: "text_delta", content: "Answer" },
+      { kind: "thinking", content: "plan", contentOffset: 0, durationMs: 1_000 },
+    ]);
+    expect(streamed.events?.map((event) => [event.kind, event.contentOffset])).toEqual([
+      ["thinking", 0],
+    ]);
+    const { container } = render(
+      <MessageItem msg={{ ...streamed, status: "done" }} agents={agents} />,
+    );
+    const segments = container.querySelectorAll(".message-content > div");
+    expect(segments).toHaveLength(2);
+    expect(segments[0].querySelector(".step-summary")?.textContent).toBe("1 thinking");
+    expect(segments[1].textContent).toBe("Answer");
+  });
+
+  it("renders delayed thinking before text and an interleaved tool in client aggregation", () => {
+    const streamed = applyEventsToMessage(msg({ status: "streaming" }), [
+      { kind: "text_delta", content: "Answer" },
+      {
+        kind: "tool_use",
+        content: "**Read** `a.ts`",
+        toolName: "Read",
+        toolUseId: "call-1",
+        contentOffset: 6,
+      },
+      { kind: "thinking", content: "plan", contentOffset: 0, durationMs: 1_000 },
+    ]);
+    expect(streamed.events?.map((event) => [event.kind, event.contentOffset])).toEqual([
+      ["tool_use", 6],
+      ["thinking", 0],
+    ]);
+    const { container } = render(
+      <MessageItem msg={{ ...streamed, status: "done" }} agents={agents} />,
+    );
+    const segments = container.querySelectorAll(".message-content > div");
+    expect(segments).toHaveLength(2);
+    expect(segments[0].querySelector(".step-summary")?.textContent).toBe("1 thinking");
+    expect(segments[1].textContent).toContain("Answer");
+    expect(segments[1].querySelector(".step-summary")?.textContent).toBe("1 tool call");
+    expect(segments[1].textContent.indexOf("Answer")).toBeLessThan(
+      segments[1].textContent.indexOf("1 tool call"),
+    );
   });
 
   it("keeps an opened step box open when the first text of the reply arrives", () => {

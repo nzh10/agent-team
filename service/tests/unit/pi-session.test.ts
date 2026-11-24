@@ -62,6 +62,7 @@ function harness(
     disposition?: string;
     delayedQuota?: boolean;
     retire?: { trailing?: object };
+    holdPromptReply?: boolean;
     enabledModels?: string[];
     startupModel?: { provider: string; id: string };
     models?: Array<{
@@ -98,17 +99,24 @@ function harness(
     const sessionFile = opts.args?.includes("--session")
       ? opts.args[opts.args.indexOf("--session") + 1]
       : path.join(dir, "session.jsonl");
+    const sessionHeader = opts.args?.includes("--session")
+      ? (JSON.parse(fs.readFileSync(sessionFile, "utf8").split("\n")[0]) as {
+          id: string;
+          cwd?: string;
+        })
+      : undefined;
     const sessionId = opts.args?.includes("--session-id")
       ? opts.args[opts.args.indexOf("--session-id") + 1]
-      : (JSON.parse(fs.readFileSync(sessionFile, "utf8").split("\n")[0]) as { id: string }).id;
+      : sessionHeader!.id;
+    const proofState = state ?? session.getState();
     const ready: PanelReadyReport = {
       sessionProof: {
         sessionId: sessionId ?? null,
         sessionFile: sessionFile ?? null,
-        cwd: fs.realpathSync.native(dir),
-        headerCwd: dir,
-        entryCount: state?.minEntryCount ?? 0,
-        leafId: state?.expectedLeafAnchorId ?? null,
+        cwd: fs.realpathSync.native(proofState.normalizedCwd ?? proofState.config.cwd),
+        headerCwd: sessionHeader?.cwd ?? dir,
+        entryCount: proofState.minEntryCount ?? 0,
+        leafId: proofState.expectedLeafAnchorId ?? null,
         anchorOnActiveBranch: true,
         anchorExistsInFile: true,
       },
@@ -185,6 +193,7 @@ function harness(
             break;
           case "prompt":
             order.push("write");
+            if (override.holdPromptReply) break;
             if (override.delayedQuota && frame.message === "/quota")
               setTimeout(() => respond(frame, { disposition }), 31_000);
             else respond(frame, { disposition }, disposition !== "rejected");
@@ -262,13 +271,89 @@ function saved(cfg: SessionConfig, runs: ActiveAsyncRunRecord[] = []): SessionSt
 
 function confirmed(cfg: SessionConfig): SessionState {
   const file = path.join(cfg.cwd, "saved.jsonl");
-  fs.writeFileSync(file, '{"type":"session","id":"saved"}\n');
+  writeSession(file, "saved", cfg.cwd, [
+    conversationEntry("one", null, "user", "first"),
+    conversationEntry("two", "one", "assistant", "reply"),
+    conversationEntry("three", "two", "user", "next"),
+    conversationEntry("anchor", "three", "assistant", "reply"),
+  ]);
   return {
     ...saved(cfg),
     sessionFile: file,
     expectedLeafAnchorId: "anchor",
     minEntryCount: 4,
     hasConfirmedTurns: true,
+  };
+}
+
+function assistantUpdate(type: string, contentIndex: number, fields: Record<string, unknown> = {}) {
+  return {
+    ...piFrame("message_update"),
+    assistantMessageEvent: { type, contentIndex, ...fields },
+  };
+}
+
+function assistantStart() {
+  return piFrame("message_start", { role: "assistant" });
+}
+
+function assistantEnd(content: Array<Record<string, unknown>>, stopReason = "stop") {
+  const frame = piFrame("message_end", { role: "assistant" });
+  return { ...frame, message: { ...frame.message, content, stopReason } };
+}
+
+function workspaceFor(h: ReturnType<typeof harness>, callbacks: Partial<WorkspaceCallbacks>) {
+  const registry = new HostRegistry();
+  const host = new LocalHost("local", "Local");
+  vi.spyOn(host, "createSession").mockReturnValue(h.session);
+  registry.register(host);
+  const ws = new Workspace("ws", "test", "project", "local", h.dir, registry, {
+    onNewMessage: () => {},
+    onStreamEvent: () => {},
+    onMessageDone: () => {},
+    ...callbacks,
+  });
+  return { ws, registry };
+}
+
+function conversationEntry(id: string, parentId: string | null, role: string, text: string) {
+  return {
+    type: "message",
+    id,
+    parentId,
+    message: {
+      role,
+      content: role === "assistant" ? [{ type: "text", text }] : text,
+    },
+  };
+}
+
+function writeSession(
+  file: string,
+  sessionId: string,
+  cwd: string,
+  entries: Array<Record<string, unknown>>,
+  tail = "",
+) {
+  const records = [{ type: "session", version: 3, id: sessionId, cwd }, ...entries];
+  fs.writeFileSync(file, `${records.map((entry) => JSON.stringify(entry)).join("\n")}\n${tail}`);
+}
+
+function anchored(cfg: SessionConfig): SessionState {
+  const file = path.join(cfg.cwd, "anchored.jsonl");
+  writeSession(file, "saved", cfg.cwd, [conversationEntry("input", null, "user", "first")]);
+  return {
+    ...saved(cfg),
+    sessionFile: file,
+    expectedLeafAnchorId: "input",
+    minEntryCount: 1,
+    hasUnanchoredInput: false,
+    persistedSessionAnchor: {
+      sessionFile: file,
+      sessionId: "saved",
+      leafId: "input",
+      entryCount: 1,
+    },
   };
 }
 
@@ -364,6 +449,35 @@ describe("Pi boundary steering", () => {
     h.client.event(piFrame("message_update", { update: "text_end" }));
     expect(replies).toEqual({ A: "initial", B: "xxxxx" });
     expect(h.finish.mock.calls).toEqual([["read"]]);
+  });
+
+  it("resets a delayed thinking offset when the steered input is read", async () => {
+    const h = await setup();
+    const c = h.client;
+    c.event(assistantStart());
+    c.event(assistantUpdate("text_delta", 0, { delta: "before" }));
+    const handoff = h.boundary();
+    const frame = await h.write();
+    c.respond(frame, { disposition: "queued" });
+    await handoff;
+    const user = piFrame("message_end", { role: "user" });
+    c.event({
+      ...user,
+      message: { ...user.message, content: [{ type: "text", text: frame.message }] },
+    });
+    c.event(assistantStart());
+    c.event(assistantUpdate("thinking_start", 0));
+    // The start belongs to the new reply, but only its first nonempty delta
+    // proves that Pi read the steer and splits the panel message.
+    c.event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    c.event(assistantUpdate("text_start", 1));
+    c.event(assistantUpdate("text_delta", 1, { delta: "after" }));
+    c.event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    c.event(assistantUpdate("text_end", 1, { content: "after" }));
+    expect(h.finish).toHaveBeenCalledExactlyOnceWith("read");
+    expect(h.events.filter((event) => event.kind === "thinking")).toEqual([
+      expect.objectContaining({ content: "plan", contentOffset: 0 }),
+    ]);
   });
 
   it.each(["read", "interrupted", "crash", "rejected", "handled"])(
@@ -867,20 +981,6 @@ describe("PiSession dispatch and stream state", () => {
     ]);
   });
 
-  function workspaceFor(h: ReturnType<typeof harness>, callbacks: Partial<WorkspaceCallbacks>) {
-    const registry = new HostRegistry();
-    const host = new LocalHost("local", "Local");
-    vi.spyOn(host, "createSession").mockReturnValue(h.session);
-    registry.register(host);
-    const ws = new Workspace("ws", "test", "project", "local", h.dir, registry, {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      ...callbacks,
-    });
-    return { ws, registry };
-  }
-
   it("restores a persistently claimed steer as unknown and drains only the next FIFO input", async () => {
     const h = harness();
     const { ws } = workspaceFor(h, { onSaveNow: () => saveWorkspace(h.dir, ws.getState()) });
@@ -1377,6 +1477,177 @@ describe("PiSession dispatch and stream state", () => {
     ]);
   });
 
+  it("places delayed openai-completions thinking before text and freezes its duration", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    event(assistantUpdate("thinking_start", 0));
+    clock.mockReturnValue(1_500);
+    event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    clock.mockReturnValue(2_000);
+    event(assistantUpdate("text_start", 1));
+    clock.mockReturnValue(3_000);
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    clock.mockReturnValue(4_000);
+    event(assistantUpdate("thinking_delta", 0, { delta: "late" }));
+    clock.mockReturnValue(9_000);
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    clock.mockReturnValue(10_000);
+    event(assistantUpdate("text_end", 1, { content: "Answer" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "plan",
+      contentOffset: 0,
+      durationMs: 1_000,
+    });
+    expect(events.filter((entry) => entry.kind === "thinking_delta").at(-1)).toMatchObject({
+      content: "",
+      durationMs: 1_000,
+    });
+  });
+
+  it("places message-end-only thinking before already streamed text", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    event(
+      assistantEnd([
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "Answer" },
+      ]),
+    );
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "plan",
+      contentOffset: 0,
+    });
+  });
+
+  it("bases a later assistant message's thinking offset after earlier reply text", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    const first = "First.";
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("text_delta", 0, { delta: "Fir" }));
+    event(assistantUpdate("text_end", 0, { content: first }));
+    event(assistantUpdate("toolcall_start", 1, { id: "call-1", toolName: "read" }));
+    event(
+      assistantUpdate("toolcall_end", 1, {
+        toolCall: { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      }),
+    );
+    event({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: {},
+    });
+    event({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      result: { content: [], details: {} },
+    });
+    event(
+      assistantEnd(
+        [
+          { type: "text", text: first },
+          { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+        ],
+        "toolUse",
+      ),
+    );
+    event(assistantStart());
+    event(assistantUpdate("thinking_start", 0));
+    event(assistantUpdate("thinking_delta", 0, { delta: "next plan" }));
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Second" }));
+    event(assistantUpdate("thinking_end", 0, { content: "next plan" }));
+    event(assistantUpdate("text_end", 1, { content: "Second" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "next plan",
+      contentOffset: first.length,
+    });
+  });
+
+  it("keeps early thinking_end duration and ordering unchanged", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    event(assistantUpdate("thinking_start", 0));
+    clock.mockReturnValue(1_700);
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    clock.mockReturnValue(2_000);
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      contentOffset: 0,
+      durationMs: 700,
+    });
+  });
+
+  it("preserves delayed thinking offsets through Workspace aggregation", async () => {
+    const h = harness();
+    const { ws } = workspaceFor(h, {});
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    await ws.sendMessage("stream", agent.id);
+    const { event } = h.clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("thinking_start", 0));
+    event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    event(assistantUpdate("toolcall_start", 2, { id: "call-1", toolName: "read" }));
+    event({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: {},
+    });
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    event(assistantUpdate("text_end", 1, { content: "Answer" }));
+    event(
+      assistantUpdate("toolcall_end", 2, {
+        toolCall: { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      }),
+    );
+    event({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      result: { content: [], details: {} },
+    });
+    event(
+      assistantEnd([
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "Answer" },
+        { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      ]),
+    );
+    event({ type: "agent_settled" });
+    const reply = ws.getMessages().find((msg) => msg.kind === "agent");
+    expect(reply).toMatchObject({ content: "Answer", status: "done" });
+    expect(
+      reply?.events?.map((entry) => ({
+        kind: entry.kind,
+        contentOffset: entry.contentOffset,
+      })),
+    ).toEqual([
+      { kind: "tool_use", contentOffset: 6 },
+      { kind: "thinking", contentOffset: 0 },
+    ]);
+  });
+
   it("recovers authoritative end-only output and replaces provisional usage with stats", async () => {
     const { session, clients, events } = harness();
     await session.send("stream");
@@ -1538,6 +1809,557 @@ describe("PiSession dispatch and stream state", () => {
   });
 });
 
+describe("PiSession persisted first-input anchor", () => {
+  it("treats a startup cut before write as never written", async () => {
+    const h = harness();
+    await h.session.ensureStarted();
+    const state = h.session.getState();
+    expect(state.hasUnanchoredInput).toBe(false);
+    expect(state.persistedSessionAnchor).toBeUndefined();
+
+    const restored = harness({ state: () => state });
+    await restored.session.ensureStarted();
+    const args = restored.factory.mock.calls[0][0].args ?? [];
+    expect(args).toContain("--session-dir");
+    expect(args).toContain("--session-id");
+    expect(args).not.toContain("--session");
+  });
+
+  it("rolls back the write claim when the pre-write snapshot hook throws", async () => {
+    const h = harness();
+    await expect(
+      h.session.send("never written", {
+        onBeforeWrite: () => {
+          throw new Error("pre-write save failed");
+        },
+      }),
+    ).rejects.toThrow("pre-write save failed");
+    expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expect(h.session.getState().hasUnanchoredInput).toBe(false);
+
+    const restored = harness({ state: () => h.session.getState() });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toContain("--session-dir");
+    expect(restored.factory.mock.calls[0][0].args).not.toContain("--session");
+  });
+
+  it("fails an after-write cut without a file as ambiguous instead of starting blank", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 25, anchorPollIntervalMs: 2 } });
+    await h.session.send({ inputId: "claimed", text: "first" });
+    const state = h.session.getState();
+    expect(state.hasUnanchoredInput).toBe(true);
+    expect(state.persistedSessionAnchor).toBeUndefined();
+    expect(fs.existsSync(path.join(h.dir, "session.jsonl"))).toBe(false);
+
+    const restored = harness({ state: () => state });
+    await expect(restored.session.ensureStarted()).rejects.toThrow(/recovery is ambiguous/);
+    expect(restored.factory).not.toHaveBeenCalled();
+    expect(restored.clients).toHaveLength(0);
+  });
+
+  it("atomically saves durable first-input proof before settle without accepting or resending it", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    const { ws } = workspaceFor(h, { onSaveNow: () => saveWorkspace(h.dir, ws.getState()) });
+    cleanup.push(() => closeHistory(h.dir));
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    saveIndex(h.dir, [ws.id]);
+    saveWorkspace(h.dir, ws.getState());
+    await ws.sendMessage("first input", agent.id);
+    const file = path.join(h.dir, "session.jsonl");
+    writeSession(file, h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", "first input"),
+    ]);
+
+    let persisted: SessionState | undefined;
+    await vi.waitFor(() => {
+      persisted = loadAll(h.dir)[0].agents[0].session;
+      expect(persisted.persistedSessionAnchor).toEqual({
+        sessionFile: fs.realpathSync.native(file),
+        sessionId: h.session.sessionId,
+        leafId: "input",
+        entryCount: 1,
+      });
+    });
+    expect(persisted!.hasUnanchoredInput).toBe(false);
+    expect(persisted!.hasConfirmedTurns).toBe(false);
+    expect(h.session.isRunning).toBe(true);
+    expect(h.done).not.toHaveBeenCalled();
+    expect(ws.getMessages().find((msg) => msg.content === "first input")?.status).toBe(
+      "dispatching",
+    );
+    expect(
+      h.clients[0].wire.filter((frame) => frame.type === "prompt").map((frame) => frame.message),
+    ).toEqual(["first input"]);
+
+    const restored = harness({ state: () => persisted! });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toEqual(
+      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
+    );
+    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+  });
+
+  it("proves and saves the anchor at the write boundary before the prompt reply", async () => {
+    const h = harness({
+      holdPromptReply: true,
+      options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 },
+    });
+    const { ws } = workspaceFor(h, { onSaveNow: () => saveWorkspace(h.dir, ws.getState()) });
+    cleanup.push(() => closeHistory(h.dir));
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    saveIndex(h.dir, [ws.id]);
+    saveWorkspace(h.dir, ws.getState());
+    const pending = ws.sendMessage("before reply", agent.id);
+    await vi.waitFor(() =>
+      expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(true),
+    );
+    const file = path.join(h.dir, "session.jsonl");
+    writeSession(file, h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", "before reply"),
+    ]);
+    await vi.waitFor(() =>
+      expect(loadAll(h.dir)[0].agents[0].session.persistedSessionAnchor).toMatchObject({
+        leafId: "input",
+        entryCount: 1,
+      }),
+    );
+    expect(h.done).not.toHaveBeenCalled();
+    expect(ws.getMessages().find((msg) => msg.content === "before reply")?.status).toBe(
+      "dispatching",
+    );
+    const prompt = h.clients[0].wire.find((frame) => frame.type === "prompt")!;
+    h.clients[0].respond(prompt, { disposition: "started" });
+    await pending;
+    expect(h.clients[0].wire.filter((frame) => frame.type === "prompt")).toHaveLength(1);
+  });
+
+  it("retries the atomic snapshot commit after an anchor-save failure", async () => {
+    const h = harness({
+      holdPromptReply: true,
+      options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 },
+    });
+    let failNextAnchorSave = true;
+    const { ws } = workspaceFor(h, {
+      onSaveNow: () => {
+        if (failNextAnchorSave && h.session.getState().persistedSessionAnchor) {
+          failNextAnchorSave = false;
+          throw new Error("snapshot write failed");
+        }
+        saveWorkspace(h.dir, ws.getState());
+      },
+    });
+    cleanup.push(() => closeHistory(h.dir));
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    saveIndex(h.dir, [ws.id]);
+    saveWorkspace(h.dir, ws.getState());
+    const pending = ws.sendMessage("retry save", agent.id);
+    await vi.waitFor(() =>
+      expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(true),
+    );
+    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", "retry save"),
+    ]);
+    await vi.waitFor(() => {
+      expect(failNextAnchorSave).toBe(false);
+      expect(loadAll(h.dir)[0].agents[0].session.persistedSessionAnchor).toMatchObject({
+        leafId: "input",
+        entryCount: 1,
+      });
+    });
+    expect(h.done).not.toHaveBeenCalled();
+    const prompt = h.clients[0].wire.find((frame) => frame.type === "prompt")!;
+    h.clients[0].respond(prompt, { disposition: "started" });
+    await pending;
+  });
+
+  it("matches the finalized skill-expanded user message instead of the raw RPC text", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    await h.session.send("/skill:example");
+    const expanded =
+      '<skill name="example" location="/tmp/example.md">\nExpanded instructions\n</skill>';
+    const file = path.join(h.dir, "session.jsonl");
+    writeSession(file, h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", expanded),
+    ]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
+    h.clients[0].event({
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: expanded }] },
+    });
+    await vi.waitFor(() =>
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
+        leafId: "input",
+        entryCount: 1,
+      }),
+    );
+
+    const restored = harness({ state: () => h.session.getState() });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toContain("--session");
+    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+  });
+
+  it("gives finalization a fresh proof window before the original write deadline expires", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 120, anchorPollIntervalMs: 5 } });
+    await h.session.send("raw");
+    await new Promise<void>((resolve) => setTimeout(resolve, 90));
+    const finalized = "finalized by an input hook";
+    h.clients[0].event({
+      type: "message_end",
+      message: { role: "user", content: finalized },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", finalized),
+    ]);
+    await vi.waitFor(() =>
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
+        leafId: "input",
+        entryCount: 1,
+      }),
+    );
+    expect(h.session.getState().hasConfirmedTurns).toBe(false);
+    expect(h.done).not.toHaveBeenCalled();
+  });
+
+  it("rechecks an expired first-input probe when Pi settles with a valid checkpoint", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 20, anchorPollIntervalMs: 2 } });
+    await h.session.send("late write");
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(h.session.getState()).toMatchObject({
+      hasUnanchoredInput: true,
+      hasConfirmedTurns: false,
+    });
+    expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
+    const file = path.join(h.dir, "session.jsonl");
+    writeSession(file, h.session.sessionId!, h.dir, [
+      conversationEntry("input", null, "user", "late write"),
+    ]);
+    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
+    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
+      sessionId: h.session.sessionId,
+      sessionFile: file,
+      leafId: "input",
+      entryCount: 1,
+    });
+    h.clients[0].event({ type: "agent_settled" });
+    await vi.waitFor(() =>
+      expect(h.session.getState()).toMatchObject({
+        hasConfirmedTurns: true,
+        hasUnanchoredInput: false,
+        persistedSessionAnchor: { leafId: "input", entryCount: 1 },
+      }),
+    );
+
+    const restored = harness({ state: () => h.session.getState() });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toContain("--session");
+    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+  });
+
+  it("anchors a delayed complete prefix but refuses a malformed unterminated tail on restore", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    await h.session.send("delayed");
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
+    const file = path.join(h.dir, "session.jsonl");
+    const assistant = `${JSON.stringify(conversationEntry("reply", "input", "assistant", "later"))}\n`;
+    writeSession(
+      file,
+      h.session.sessionId!,
+      h.dir,
+      [conversationEntry("input", null, "user", "delayed")],
+      assistant.slice(0, 24),
+    );
+    await vi.waitFor(() =>
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
+        leafId: "input",
+        entryCount: 1,
+      }),
+    );
+
+    // Pi appends LF when it loads a torn tail but leaves the malformed bytes.
+    // Refuse before that becomes a complete corrupt line on the next YAAT restore.
+    const restored = harness({ state: () => h.session.getState() });
+    await expect(restored.session.ensureStarted()).rejects.toThrow(/torn record/);
+    expect(restored.factory).not.toHaveBeenCalled();
+  });
+
+  it("accepts a valid unterminated record through Pi's LF repair and a later append", async () => {
+    const h = harness({ state: anchored });
+    const file = h.state!.sessionFile!;
+    fs.appendFileSync(
+      file,
+      JSON.stringify(conversationEntry("reply", "input", "assistant", "done")),
+    );
+    const first = harness({
+      state: () => h.state!,
+      ready: (report) => {
+        report.sessionProof.entryCount = 2;
+        report.sessionProof.leafId = "reply";
+      },
+    });
+    await first.session.ensureStarted();
+    expect(first.factory.mock.calls[0][0].args).toContain("--session");
+
+    // This is Pi 1.6.0's actual repair: add LF, retain all records, then append.
+    fs.appendFileSync(file, "\n");
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(conversationEntry("next", "reply", "user", "next"))}\n`,
+    );
+    const second = harness({
+      state: () => first.session.getState(),
+      ready: (report) => {
+        report.sessionProof.entryCount = 3;
+        report.sessionProof.leafId = "next";
+      },
+    });
+    await second.session.ensureStarted();
+    expect(second.session.getState()).toMatchObject({
+      expectedLeafAnchorId: "next",
+      minEntryCount: 3,
+    });
+  });
+
+  it("does not turn a corrupt complete JSONL tail into durable input proof", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 30, anchorPollIntervalMs: 2 } });
+    await h.session.send("first");
+    writeSession(
+      path.join(h.dir, "session.jsonl"),
+      h.session.sessionId!,
+      h.dir,
+      [conversationEntry("input", null, "user", "first")],
+      "{broken}\n",
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    expect(h.session.getState()).toMatchObject({
+      hasUnanchoredInput: true,
+      hasConfirmedTurns: false,
+    });
+    expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "an invalid content block",
+      [
+        {
+          type: "message",
+          id: "input",
+          parentId: null,
+          message: { role: "user", content: [null, { type: "text", text: "first" }] },
+        },
+      ],
+    ],
+    [
+      "a message without a payload after the valid input",
+      [
+        conversationEntry("input", null, "user", "first"),
+        { type: "message", id: "broken", parentId: "input" },
+      ],
+    ],
+    [
+      "an image without its required data",
+      [
+        {
+          type: "message",
+          id: "input",
+          parentId: null,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "first" }, { type: "image" }],
+          },
+        },
+      ],
+    ],
+    [
+      "a malformed assistant tool call after the valid input",
+      [
+        conversationEntry("input", null, "user", "first"),
+        {
+          type: "message",
+          id: "broken",
+          parentId: "input",
+          message: {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "call", name: "read" }],
+          },
+        },
+      ],
+    ],
+  ])("rejects %s instead of counting it as durable proof", async (_, entries) => {
+    const h = harness({ options: { anchorTimeoutMs: 30, anchorPollIntervalMs: 2 } });
+    await h.session.send("first");
+    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, entries);
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
+    expect(h.session.getState().hasUnanchoredInput).toBe(true);
+  });
+
+  it("keeps a settled but unproved first input ambiguous on restore", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 30, anchorPollIntervalMs: 2 } });
+    await h.session.send("first");
+    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, []);
+    h.clients[0].event({ type: "agent_settled" });
+    const state = h.session.getState();
+    expect(state).toMatchObject({ hasConfirmedTurns: true, hasUnanchoredInput: true });
+    expect(state.expectedLeafAnchorId).toBeNull();
+    expect(state.minEntryCount).toBe(0);
+
+    const restored = harness({ state: () => state });
+    await expect(restored.session.ensureStarted()).rejects.toThrow(/recovery is ambiguous/);
+    expect(restored.factory).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "header", "branch", "corrupt", "symlink", "fifo"])(
+    "refuses a once-proved session with %s history before spawning Pi",
+    async (damage) => {
+      const h = harness({ state: anchored });
+      const file = h.state!.sessionFile!;
+      if (damage === "missing") fs.rmSync(file);
+      if (damage === "header")
+        writeSession(file, "wrong", h.dir, [conversationEntry("input", null, "user", "first")]);
+      if (damage === "branch")
+        fs.appendFileSync(
+          file,
+          `${JSON.stringify(conversationEntry("other", null, "assistant", "other"))}\n`,
+        );
+      if (damage === "corrupt") fs.appendFileSync(file, "{broken}\n");
+      if (damage === "symlink") {
+        const copy = `${file}.copy`;
+        fs.copyFileSync(file, copy);
+        fs.rmSync(file);
+        fs.symlinkSync(copy, file);
+      }
+      if (damage === "fifo") {
+        fs.rmSync(file);
+        execFileSync("mkfifo", [file]);
+      }
+
+      await expect(h.session.ensureStarted()).rejects.toThrow(
+        /Pi persisted session recovery failed/,
+      );
+      expect(h.factory).not.toHaveBeenCalled();
+      expect(h.clients).toHaveLength(0);
+      expect(h.session.getState().persistedSessionAnchor).toEqual(h.state!.persistedSessionAnchor);
+    },
+    2_000,
+  );
+
+  it("keeps report probing idempotent on a first-input-only anchored restore", async () => {
+    const h = harness({ state: anchored });
+    vi.spyOn(h.panel, "probeDispatchedReport").mockResolvedValue({
+      found: true,
+      anchorMissing: false,
+      matchedEntryId: "input",
+    });
+    await expect(h.session.probeDispatchedReport(null, "report-1")).resolves.toMatchObject({
+      found: true,
+      anchorMissing: false,
+    });
+    expect(h.factory.mock.calls[0][0].args).toContain("--session");
+    expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expect(h.session.getState().hasConfirmedTurns).toBe(true);
+  });
+
+  it("preserves the canonical anchor when a settlement checkpoint uses a symlinked path", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    await h.session.send("first");
+    const file = path.join(h.dir, "session.jsonl");
+    const sessionId = h.session.sessionId!;
+    writeSession(file, sessionId, h.dir, [conversationEntry("input", null, "user", "first")]);
+    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(conversationEntry("reply", "input", "assistant", "done"))}\n`,
+    );
+    const alias = path.join(h.dir, "session-dir-alias");
+    fs.symlinkSync(h.dir, alias);
+    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
+    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
+      sessionId,
+      sessionFile: path.join(alias, "session.jsonl"),
+      leafId: "reply",
+      entryCount: 2,
+    });
+    h.clients[0].event({ type: "agent_settled" });
+    await vi.waitFor(() =>
+      expect(h.session.getState()).toMatchObject({
+        expectedLeafAnchorId: "reply",
+        minEntryCount: 2,
+      }),
+    );
+    expect(h.session.getState().sessionFile).toBe(fs.realpathSync.native(file));
+
+    const restored = harness({ state: () => h.session.getState() });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toEqual(
+      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
+    );
+    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+  });
+
+  it("resumes a confirmed second-turn cut from the exact file without replaying either input", async () => {
+    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    await h.session.send("first");
+    const file = path.join(h.dir, "session.jsonl");
+    const sessionId = h.session.sessionId!;
+    writeSession(file, sessionId, h.dir, [conversationEntry("input", null, "user", "first")]);
+    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(conversationEntry("reply", "input", "assistant", "done"))}\n`,
+    );
+    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
+    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
+      sessionId,
+      sessionFile: file,
+      leafId: "reply",
+      entryCount: 2,
+    });
+    h.clients[0].event({ type: "agent_settled" });
+    await vi.waitFor(() =>
+      expect(h.session.getState()).toMatchObject({
+        hasConfirmedTurns: true,
+        expectedLeafAnchorId: "reply",
+        minEntryCount: 2,
+      }),
+    );
+
+    await h.session.send("second");
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(conversationEntry("second", "reply", "user", "second"))}\n`,
+    );
+    const cut = h.session.getState();
+    expect(cut.hasConfirmedTurns).toBe(true);
+    expect(cut.persistedSessionAnchor).toMatchObject({ leafId: "input", entryCount: 1 });
+
+    const restored = harness({
+      state: () => cut,
+      ready: (report) => {
+        report.sessionProof.entryCount = 3;
+        report.sessionProof.leafId = "second";
+      },
+    });
+    await restored.session.ensureStarted();
+    expect(restored.factory.mock.calls[0][0].args).toEqual(
+      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
+    );
+    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expect(restored.session.getState()).toMatchObject({
+      hasConfirmedTurns: true,
+      expectedLeafAnchorId: "second",
+      minEntryCount: 3,
+    });
+    expect(
+      h.clients[0].wire.filter((frame) => frame.type === "prompt").map((frame) => frame.message),
+    ).toEqual(["first", "second"]);
+  });
+});
+
 describe("PiSession bounded recovery", () => {
   it.each([
     [
@@ -1580,6 +2402,82 @@ describe("PiSession bounded recovery", () => {
     const h = harness({ state: confirmed });
     fs.writeFileSync(h.state!.sessionFile!, '{"type":"session","id":"wrong"}\n');
     await expect(h.session.ensureStarted()).rejects.toThrow(/header/);
+    expect(h.factory).not.toHaveBeenCalled();
+  });
+
+  it("accepts valid legacy Bash, image, thinking, tool-call and tool-result records", async () => {
+    const h = harness({
+      state: confirmed,
+      ready: (report) => {
+        report.sessionProof.entryCount = 8;
+        report.sessionProof.leafId = "bash";
+      },
+    });
+    const file = h.state!.sessionFile!;
+    const entries = [
+      {
+        type: "message",
+        id: "image",
+        parentId: "anchor",
+        message: {
+          role: "user",
+          content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+        },
+      },
+      {
+        type: "message",
+        id: "call",
+        parentId: "image",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "plan" },
+            { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+          ],
+        },
+      },
+      {
+        type: "message",
+        id: "result",
+        parentId: "call",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: [
+            { type: "text", text: "result" },
+            { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+          ],
+          isError: false,
+        },
+      },
+      {
+        type: "message",
+        id: "bash",
+        parentId: "result",
+        message: {
+          role: "bashExecution",
+          command: "pwd",
+          output: "/tmp\n",
+          exitCode: 0,
+          cancelled: false,
+          truncated: false,
+          timestamp: 1,
+        },
+      },
+    ];
+    for (const entry of entries) fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+    await h.session.ensureStarted();
+    expect(h.factory.mock.calls[0][0].args).toContain("--session");
+    expect(h.session.getState()).toMatchObject({ expectedLeafAnchorId: "bash", minEntryCount: 8 });
+  });
+
+  it("rejects a malformed complete line in a confirmed-only session before spawning", async () => {
+    const h = harness({ state: confirmed });
+    fs.appendFileSync(h.state!.sessionFile!, "{broken}\n");
+    await expect(h.session.ensureStarted()).rejects.toThrow(
+      /Pi restore session validation failed: Pi session JSONL is corrupt/,
+    );
     expect(h.factory).not.toHaveBeenCalled();
   });
 
@@ -1657,10 +2555,10 @@ describe("PiSession interrupt recovery", () => {
           lateStats = resolve;
         }),
     );
-    fs.writeFileSync(
-      path.join(h.dir, "session.jsonl"),
-      JSON.stringify({ type: "session", id: h.session.sessionId }) + "\n",
-    );
+    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, [
+      conversationEntry("previous", null, "user", "previous"),
+    ]);
+    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
     old.event({ type: "agent_settled" });
     expect(stats).toHaveBeenCalledOnce();
     await h.session.send("timeout");
