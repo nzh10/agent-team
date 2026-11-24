@@ -691,13 +691,34 @@ describe("blocking UI dialog protocol", () => {
 });
 
 describe("Project v2", () => {
+  it("completes the repository path before creating a rooted project", () => {
+    const onCreate = vi.fn();
+    const onClose = vi.fn();
+    const onListDirs = vi.fn();
+    const view = render(
+      <CreateProjectDialog
+        onClose={onClose}
+        onCreate={onCreate}
+        onListDirs={onListDirs}
+        dirSuggestions={{ prefix: "/repo/co", dirs: ["/repo/code/"] }}
+      />,
+    );
+    fireEvent.change(view.getByLabelText("Name"), { target: { value: "Code" } });
+    const path = view.getByLabelText("Repository path");
+    fireEvent.change(path, { target: { value: "/repo/co" } });
+    expect(view.getByText("/repo/code/")).toBeTruthy();
+    fireEvent.keyDown(path, { key: "Tab" });
+    fireEvent.click(view.getByRole("button", { name: "Create project" }));
+    expect(onCreate).toHaveBeenCalledWith("Code", "/repo/code/");
+  });
+
   it("creates rooted or repository-less projects and sends seal requests", () => {
     const onCreate = vi.fn();
     const view = render(<CreateProjectDialog onClose={() => {}} onCreate={onCreate} />);
     fireEvent.change(view.getByLabelText("Name"), { target: { value: " Research " } });
     fireEvent.click(view.getByLabelText("Create without a Git repository"));
     expect((view.getByLabelText("Repository path") as HTMLInputElement).disabled).toBe(true);
-    fireEvent.click(view.getByRole("button", { name: "Create" }));
+    fireEvent.click(view.getByRole("button", { name: "Create project" }));
     expect(onCreate).toHaveBeenCalledWith("Research", null);
     view.unmount();
 

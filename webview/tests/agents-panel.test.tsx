@@ -245,13 +245,20 @@ describe("AgentsPanel", () => {
   });
 
   it("acts on the session and agent it was asked from", () => {
-    const { container, a } = panel();
+    const { container, a, getByRole } = panel();
     const card = within(container.querySelector('[aria-label="modules"]') as HTMLElement);
     fireEvent.click(card.getByTitle("Open this session"));
     fireEvent.click(card.getByText("Stop"));
     fireEvent.click(card.getByText("+ Agent"));
     fireEvent.click(card.getByLabelText("Clear kisara's context"));
+    expect(a.onClearContext).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: "Cancel" }));
+    expect(a.onClearContext).not.toHaveBeenCalled();
+    fireEvent.click(card.getByLabelText("Clear kisara's context"));
+    fireEvent.click(getByRole("button", { name: "Clear context" }));
     fireEvent.click(card.getByLabelText("Remove kisara"));
+    expect(a.onRemoveAgent).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: "Remove agent" }));
     expect(a.onOpen).toHaveBeenCalledWith("w1");
     expect(a.onStop).toHaveBeenCalledWith("w1");
     expect(a.onAddAgent).toHaveBeenCalledWith("w1");

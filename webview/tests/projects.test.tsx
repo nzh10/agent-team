@@ -100,7 +100,7 @@ describe("project groups", () => {
     const buttons = [
       ...container.querySelectorAll(".sidebar-header button, .ws-group-add, .task-delete"),
     ];
-    expect(buttons.length).toBeGreaterThanOrEqual(5);
+    expect(buttons.length).toBeGreaterThanOrEqual(4);
     for (const b of buttons) {
       expect(b.querySelector("svg.icon"), b.getAttribute("title")!).not.toBeNull();
       expect(b.textContent).toBe("");
@@ -189,10 +189,12 @@ describe("project groups", () => {
 
   it("delete the whole project from the lead's ×, a session on its own", () => {
     const props = sidebarProps();
-    const { getAllByTitle, getByTitle } = render(<Sidebar {...props} />);
+    const { getAllByTitle, getByTitle, getByText } = render(<Sidebar {...props} />);
     fireEvent.click(getByTitle("Delete project"));
     expect(props.onDeleteProject).toHaveBeenCalledWith("p1");
-    fireEvent.click(getAllByTitle("Delete")[0]);
+    fireEvent.click(getAllByTitle("Delete session")[0]);
+    expect(props.onDelete).not.toHaveBeenCalled();
+    fireEvent.click(getByText("Delete session"));
     expect(props.onDelete).toHaveBeenCalledWith("w1");
   });
 });
@@ -333,7 +335,7 @@ describe("CreateWorkspaceDialog", () => {
       target: { value: "/repo/clice" },
     });
     expect(queryByRole("checkbox")).toBeNull();
-    fireEvent.click(getByText("Create"));
+    fireEvent.click(getByText("Create session"));
     expect(onCreate).toHaveBeenCalledWith("clice", "/repo/clice", "local", undefined);
   });
 

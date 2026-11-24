@@ -387,7 +387,7 @@ describe("CreateWorkspaceDialog", () => {
   it("submits name + path, defaulting the name to the folder basename", () => {
     const { pathInput, onCreate, getByText } = setup();
     fireEvent.change(pathInput, { target: { value: "/home/example/clice" } });
-    fireEvent.click(getByText("Create"));
+    fireEvent.click(getByText("Create session"));
     expect(onCreate).toHaveBeenCalledWith("clice", "/home/example/clice", "local", undefined);
   });
 
@@ -411,7 +411,7 @@ describe("CreateWorkspaceDialog", () => {
     fireEvent.change(pathInput, { target: { value: "/repo/clice2" } });
     expect((getByLabelText("Project") as HTMLInputElement).placeholder).toBe("clice2");
     fireEvent.change(getByLabelText("Project"), { target: { value: " Clice Two " } });
-    fireEvent.click(getByText("Create"));
+    fireEvent.click(getByText("Create session"));
     expect(onCreate).toHaveBeenCalledWith("clice2", "/repo/clice2", "local", "Clice Two");
   });
 

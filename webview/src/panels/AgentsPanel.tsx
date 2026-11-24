@@ -7,7 +7,7 @@ import type {
   Workspace,
 } from "../state/useServer";
 import { AgentAvatar } from "../workspace/avatar";
-import { CODEX_SETUP_VALUE } from "../workspace/dialogs";
+import { CODEX_SETUP_VALUE, ConfirmDialog } from "../workspace/dialogs";
 import { EffortSelect, effortOf, selectableLevels } from "../workspace/EffortSelect";
 import { agentState, stateLabel } from "../workspace/agents";
 import { formatRelative, formatTokens, shortModel } from "../format";
@@ -345,104 +345,125 @@ function AgentRow({
   const effortLevels =
     !archived && !readOnly && connected && selectableLevels(a.effortLevels) ? a.effortLevels : null;
   const hasControls = hasModelSelect || !!effortLevels;
+  const [confirmation, setConfirmation] = useState<"clear" | "remove" | null>(null);
 
   return (
-    <div className={`ap-agent as-${state}`}>
-      <AgentAvatar agent={a} size={22} />
-      <div className="ap-agent-main">
-        <div className="ap-agent-top">
-          <span className="ap-agent-name" style={{ color: a.color }}>
-            {a.name}
-          </span>
-          <span className={`ap-meta${hasControls ? " has-controls" : ""}`}>
-            {hasModelSelect ? (
-              <select
-                className="ap-model"
-                aria-label={`${a.name}'s model`}
-                title="Switch model; the conversation carries over"
-                value={a.model}
-                onChange={(e) => {
-                  if (e.target.value === CODEX_SETUP_VALUE) {
-                    onOpenCodexSetup?.();
-                    return;
-                  }
-                  onModel(e.target.value);
-                }}
-              >
-                {modelOptions.map(({ id, label }) => (
-                  <option key={id} value={id}>
-                    {label}
-                  </option>
-                ))}
-                {showCodexSetup && (
-                  <option value={CODEX_SETUP_VALUE} className="codex-unauth-option">
-                    Codex (not signed in)
-                  </option>
-                )}
-              </select>
-            ) : hasControls ? (
-              <span className="ap-meta-model">{shortAgentModel(a.model)}</span>
-            ) : (
-              shortAgentModel(a.model)
-            )}
-            {effortLevels ? (
-              <>
-                <span className="ap-meta-sep" aria-hidden="true">
-                  {" · "}
-                </span>
-                <EffortSelect
-                  className="ap-model ap-effort"
-                  levels={effortLevels}
-                  fallback={effortOf(models, a.model).fallback}
-                  value={a.effort ?? ""}
-                  onChange={(level) => level && onEffort(level)}
-                  label={`${a.name}'s reasoning effort`}
-                />
-              </>
-            ) : (
-              a.effort &&
-              (hasControls ? (
-                <span className="ap-meta-effort">{` · ${a.effort}`}</span>
+    <>
+      <div className={`ap-agent as-${state}`}>
+        <AgentAvatar agent={a} size={22} />
+        <div className="ap-agent-main">
+          <div className="ap-agent-top">
+            <span className="ap-agent-name" style={{ color: a.color }}>
+              {a.name}
+            </span>
+            <span className={`ap-meta${hasControls ? " has-controls" : ""}`}>
+              {hasModelSelect ? (
+                <select
+                  className="ap-model"
+                  aria-label={`${a.name}'s model`}
+                  title="Switch model; the conversation carries over"
+                  value={a.model}
+                  onChange={(e) => {
+                    if (e.target.value === CODEX_SETUP_VALUE) {
+                      onOpenCodexSetup?.();
+                      return;
+                    }
+                    onModel(e.target.value);
+                  }}
+                >
+                  {modelOptions.map(({ id, label }) => (
+                    <option key={id} value={id}>
+                      {label}
+                    </option>
+                  ))}
+                  {showCodexSetup && (
+                    <option value={CODEX_SETUP_VALUE} className="codex-unauth-option">
+                      Codex (not signed in)
+                    </option>
+                  )}
+                </select>
+              ) : hasControls ? (
+                <span className="ap-meta-model">{shortAgentModel(a.model)}</span>
               ) : (
-                ` · ${a.effort}`
-              ))
+                shortAgentModel(a.model)
+              )}
+              {effortLevels ? (
+                <>
+                  <span className="ap-meta-sep" aria-hidden="true">
+                    {" · "}
+                  </span>
+                  <EffortSelect
+                    className="ap-model ap-effort"
+                    levels={effortLevels}
+                    fallback={effortOf(models, a.model).fallback}
+                    value={a.effort ?? ""}
+                    onChange={(level) => level && onEffort(level)}
+                    label={`${a.name}'s reasoning effort`}
+                  />
+                </>
+              ) : (
+                a.effort &&
+                (hasControls ? (
+                  <span className="ap-meta-effort">{` · ${a.effort}`}</span>
+                ) : (
+                  ` · ${a.effort}`
+                ))
+              )}
+              {a.fast && (hasControls ? <span className="ap-meta-fast">{" · ⚡"}</span> : " · ⚡")}
+            </span>
+            {!archived && !readOnly && (
+              <div className="ap-agent-actions">
+                <button
+                  title="Clear context"
+                  aria-label={`Clear ${a.name}'s context`}
+                  onClick={() => setConfirmation("clear")}
+                >
+                  <Icon name="clear" />
+                </button>
+                <button
+                  title="Remove"
+                  aria-label={`Remove ${a.name}`}
+                  onClick={() => setConfirmation("remove")}
+                >
+                  <Icon name="close" />
+                </button>
+              </div>
             )}
-            {a.fast && (hasControls ? <span className="ap-meta-fast">{" · ⚡"}</span> : " · ⚡")}
-          </span>
-          {!archived && !readOnly && (
-            <div className="ap-agent-actions">
-              <button
-                title="Clear context"
-                aria-label={`Clear ${a.name}'s context`}
-                onClick={onClear}
-              >
-                <Icon name="clear" />
-              </button>
-              <button title="Remove" aria-label={`Remove ${a.name}`} onClick={onRemove}>
-                <Icon name="close" />
-              </button>
+          </div>
+          {(archived || state !== "idle" || !connected || bg.length > 0) && (
+            <div className="ap-agent-state">
+              {archived ? "archived" : stateLabel(a, connected)}
+              {bg.length > 0 && state !== "waiting" && ` · ${bg.length} in background`}
+            </div>
+          )}
+          {ctx && pct !== null && (
+            <div
+              className="ap-context"
+              title={`${ctx.tokens.toLocaleString()} of ${ctx.window.toLocaleString()} tokens`}
+            >
+              <span className="ap-context-bar">
+                <span style={{ width: `${pct}%` }} className={pct >= 80 ? "high" : ""} />
+              </span>
+              {formatTokens(ctx.tokens)} / {formatTokens(ctx.window)}
             </div>
           )}
         </div>
-        {(archived || state !== "idle" || !connected || bg.length > 0) && (
-          <div className="ap-agent-state">
-            {archived ? "archived" : stateLabel(a, connected)}
-            {bg.length > 0 && state !== "waiting" && ` · ${bg.length} in background`}
-          </div>
-        )}
-        {ctx && pct !== null && (
-          <div
-            className="ap-context"
-            title={`${ctx.tokens.toLocaleString()} of ${ctx.window.toLocaleString()} tokens`}
-          >
-            <span className="ap-context-bar">
-              <span style={{ width: `${pct}%` }} className={pct >= 80 ? "high" : ""} />
-            </span>
-            {formatTokens(ctx.tokens)} / {formatTokens(ctx.window)}
-          </div>
-        )}
       </div>
-    </div>
+      {!archived && !readOnly && confirmation && (
+        <ConfirmDialog
+          title={confirmation === "clear" ? `Clear ${a.name}'s context?` : `Remove ${a.name}?`}
+          body={
+            confirmation === "clear"
+              ? "The agent will start with a fresh context."
+              : "This agent will be removed from the session."
+          }
+          confirmLabel={confirmation === "clear" ? "Clear context" : "Remove agent"}
+          danger
+          onConfirm={confirmation === "clear" ? onClear : onRemove}
+          onClose={() => setConfirmation(null)}
+        />
+      )}
+    </>
   );
 }
 

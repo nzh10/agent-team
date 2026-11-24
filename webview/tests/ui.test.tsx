@@ -612,11 +612,11 @@ describe("ConfirmDialog", () => {
       />
     );
     const { getByText, rerender } = render(dialog(() => {}));
-    expect(document.activeElement).toBe(getByText("Delete all"));
-    getByText("Cancel").focus();
+    expect(document.activeElement).toBe(getByText("Cancel"));
+    getByText("Delete all").focus();
     const onClose = vi.fn();
     rerender(dialog(onClose));
-    expect(document.activeElement).toBe(getByText("Cancel"));
+    expect(document.activeElement).toBe(getByText("Delete all"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalled();
   });
@@ -722,7 +722,7 @@ describe("CreateWorkspaceDialog initial path", () => {
     );
     expect(getByDisplayValue("/home/me/repo")).toBeTruthy();
     expect(getByPlaceholderText("repo")).toBeTruthy();
-    fireEvent.click(getByText("Create"));
+    fireEvent.click(getByText("Create session"));
     expect(onCreate).toHaveBeenCalledWith("repo", "/home/me/repo", "local", undefined);
   });
 });

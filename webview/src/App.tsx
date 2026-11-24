@@ -1980,6 +1980,9 @@ export function App() {
           <CreateProjectDialog
             onClose={() => setShowCreateProject(false)}
             onCreate={createProject}
+            hosts={hosts}
+            onListDirs={listDirs}
+            dirSuggestions={dirSuggestions}
           />
         )}
 

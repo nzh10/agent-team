@@ -18,6 +18,7 @@ import { DEFAULT_BRANCH } from "../panels/scope";
 import { formatBytes, formatRelative } from "../format";
 import { RoleTag } from "../workspace/RoleTag";
 import { NameInput } from "../project/NameInput";
+import { ConfirmDialog } from "../workspace/dialogs";
 
 function gitTitle(git: { dirty: number; ahead: number; behind: number }): string {
   const parts: string[] = [];
@@ -225,7 +226,20 @@ export function QuotaPanel({
           aria-label={quota.refreshing ? "Refreshing…" : "Refresh"}
           title={quota.refreshing ? "Refreshing…" : "Refresh quota"}
         >
-          <Icon name="clear" />
+          <svg
+            className="icon"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M20 4v5h-5M4 20v-5h5M5 9a7.5 7.5 0 0 1 13-2l2 2M4 15l2 2a7.5 7.5 0 0 0 13-2" />
+          </svg>
         </button>
       </header>
       {quota.rows.length > 0 && (
@@ -380,6 +394,33 @@ export interface SidebarProps {
 
 export const Sidebar = memo(function Sidebar(p: SidebarProps) {
   const now = p.now ?? Date.now();
+  const debug = new URLSearchParams(window.location.search).get("debug") === "1";
+  const [healthy, setHealthy] = useState(false);
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const deleting = p.workspaces.find((ws) => ws.id === deleteId);
+  useEffect(() => {
+    setHealthy(false);
+    if (!p.connected || debug) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch("api/diagnostics", { signal: controller.signal });
+        if (!response.ok) return;
+        const report: unknown = await response.json();
+        if (
+          !controller.signal.aborted &&
+          report &&
+          typeof report === "object" &&
+          "issues" in report
+        ) {
+          setHealthy(Array.isArray(report.issues) && report.issues.length === 0);
+        }
+      } catch {
+        // An unavailable report must not hide the diagnostics link.
+      }
+    })();
+    return () => controller.abort();
+  }, [p.connected, debug]);
   const known = new Set((p.projects ?? []).map((pr) => pr.id));
   // A lead takes its project with it; one whose project is unknown (its
   // project.json unreadable) is just a workspace.
@@ -391,11 +432,11 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
     return (
       <button
         className="task-delete"
-        title={project ? "Delete project" : "Delete"}
+        title={project ? "Delete project" : "Delete session"}
         onClick={(e) => {
           e.stopPropagation();
           if (project && p.onDeleteProject) p.onDeleteProject(project);
-          else p.onDelete(ws.id);
+          else setDeleteId(ws.id);
         }}
       >
         <Icon name="close" />
@@ -677,13 +718,15 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
           Workspaces {!p.connected && <span className="disconnected">offline</span>}
         </span>
         <span className="sidebar-actions">
-          <button
-            title="Replay rendering demo (synthetic events for visual review)"
-            onClick={p.onReplayDemo}
-          >
-            <Icon name="play" />
-          </button>
-          <button title="New workspace" onClick={p.onCreate}>
+          {debug && (
+            <button
+              title="Replay rendering demo (synthetic events for visual review)"
+              onClick={p.onReplayDemo}
+            >
+              <Icon name="play" />
+            </button>
+          )}
+          <button title="New session" onClick={p.onCreate}>
             <Icon name="plus" />
           </button>
           {p.onCreateProject && (
@@ -691,13 +734,15 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
               <Icon name="board" />
             </button>
           )}
-          <button
-            className="sidebar-debug"
-            title="Save a layout debug snapshot (viewport, geometry, DOM) on the server"
-            onClick={p.onDebugSnapshot}
-          >
-            <Icon name="snapshot" />
-          </button>
+          {debug && (
+            <button
+              className="sidebar-debug"
+              title="Save a layout debug snapshot (viewport, geometry, DOM) on the server"
+              onClick={p.onDebugSnapshot}
+            >
+              <Icon name="snapshot" />
+            </button>
+          )}
         </span>
       </div>
       <div className="search-bar">
@@ -793,7 +838,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
           )}
         </div>
       )}
-      {p.connected && (
+      {(debug || !p.connected || !healthy) && (
         <small className="system-status-panel">
           <a href="api/diagnostics?format=text" target="_blank" rel="noreferrer">
             Service diagnostics
@@ -808,6 +853,16 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
         <QuotaPanel quota={p.quota} refresh={p.onRefreshQuota} now={now} connected={p.connected} />
       )}
       {p.systemStatus && <SystemStatusPanel status={p.systemStatus} />}
+      {deleting && (
+        <ConfirmDialog
+          title={`Delete ${deleting.name}?`}
+          body="This session and its message history will be deleted."
+          confirmLabel="Delete session"
+          danger
+          onConfirm={() => p.onDelete(deleting.id)}
+          onClose={() => setDeleteId(null)}
+        />
+      )}
     </>
   );
 });

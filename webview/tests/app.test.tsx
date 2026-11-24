@@ -602,6 +602,13 @@ describe("files panel", () => {
 describe("changes panel", () => {
   const urls: string[] = [];
   const fetchMock = vi.fn((url: string) => {
+    if (url === "api/diagnostics") {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ issues: [] }),
+      });
+    }
     urls.push(url);
     const body = url.startsWith("api/diff/file")
       ? { path: "src/a.ts", binary: false, truncated: false, diff: "@@ -1 +1 @@\n-a\n+b\n" }

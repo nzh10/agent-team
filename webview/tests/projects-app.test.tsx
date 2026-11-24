@@ -334,7 +334,13 @@ describe("a lead whose project the server could not read", () => {
 
   it("is deleted like any workspace", () => {
     const { sock } = boot([orphan], [], "lead");
-    fireEvent.click(document.querySelector('.task-item [title="Delete"]')!);
+    const remove = document.querySelector('.task-item [title="Delete session"]')!;
+    fireEvent.click(remove);
+    expect(sock.frames().filter((f) => f.type === "delete_workspace")).toEqual([]);
+    fireEvent.click(document.querySelector(".dialog-confirm .btn-secondary")!);
+    expect(sock.frames().filter((f) => f.type === "delete_workspace")).toEqual([]);
+    fireEvent.click(remove);
+    fireEvent.click(document.querySelector(".dialog-confirm .btn-danger")!);
     expect(sock.frames().filter((f) => f.type === "delete_workspace")).toEqual([
       { type: "delete_workspace", workspaceId: "lead" },
     ]);

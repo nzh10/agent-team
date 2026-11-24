@@ -79,6 +79,20 @@ const sidebar: SidebarProps = {
   onRestoreProject: no,
 };
 
+it("keeps session deletion confirmation in the viewport outside the mobile drawer", async () => {
+  await page.viewport(390, 760);
+  const { container } = render(
+    <div className="sidebar sidebar-open">
+      <Sidebar {...sidebar} />
+    </div>,
+  );
+  fireEvent.click(get(container, '[title="Delete session"]'));
+  const modal = get(document, ".dialog-confirm");
+  expect(rect(modal.parentElement!).width).toBe(390);
+  expect(rect(modal).left).toBeGreaterThanOrEqual(0);
+  expect(rect(modal).right).toBeLessThanOrEqual(390);
+});
+
 const archivedProject = {
   id: "archived",
   name: "Archived",

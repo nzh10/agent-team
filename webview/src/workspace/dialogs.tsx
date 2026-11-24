@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { EffortSelect, effortOf } from "./EffortSelect";
 import type { AgentPreset, CodexAuthState, ModelOption, HostInfo } from "../state/useServer";
 import { isImageAvatar } from "./avatar";
@@ -24,19 +25,30 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  const confirmRef = useRef<HTMLButtonElement>(null);
-  useDialogKeys(confirmRef, onClose);
-  return (
-    <div className="dialog-overlay" onClick={onClose}>
+  const initialFocus = useRef<HTMLButtonElement>(null);
+  useDialogKeys(initialFocus, onClose);
+  return createPortal(
+    <div
+      className="dialog-overlay"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClose();
+      }}
+    >
       <div className="dialog dialog-confirm" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">{title}</div>
         <p className="dialog-body">{body}</p>
         <div className="dialog-actions">
-          <button type="button" className="btn-secondary" onClick={onClose}>
+          <button
+            ref={danger ? initialFocus : undefined}
+            type="button"
+            className="btn-secondary"
+            onClick={onClose}
+          >
             Cancel
           </button>
           <button
-            ref={confirmRef}
+            ref={danger ? undefined : initialFocus}
             type="button"
             className={danger ? "btn-danger" : "btn-primary"}
             onClick={() => {
@@ -48,7 +60,8 @@ export function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -405,17 +418,34 @@ export function CodexSetupDialog({
 
 // Projects can be organisational-only: no repository or checkout is needed.
 export function CreateProjectDialog({
+  hosts = [],
+  onListDirs,
+  dirSuggestions,
   onClose,
   onCreate,
 }: {
+  hosts?: HostInfo[];
   onClose: () => void;
   onCreate: (name: string, root: string | null) => void;
-}) {
+} & DirectorySource) {
   const [name, setName] = useState("");
-  const [root, setRoot] = useState("");
   const [withoutGit, setWithoutGit] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
-  useDialogKeys(nameRef, onClose);
+  const local = hosts.find((host) => host.type === "local");
+  const {
+    path: root,
+    field,
+    dismiss,
+  } = useDirectoryField({
+    onListDirs: local?.connected === false ? undefined : onListDirs,
+    dirSuggestions,
+    disabled: withoutGit,
+    label: "Repository path",
+    placeholder: withoutGit ? "No repository" : "/path/to/repository",
+  });
+  useDialogKeys(nameRef, () => {
+    if (!dismiss()) onClose();
+  });
   const canSubmit = name.trim().length > 0 && (withoutGit || root.trim().length > 0);
   return (
     <div className="dialog-overlay" onClick={onClose}>
@@ -439,15 +469,7 @@ export function CreateProjectDialog({
             onChange={(e) => setName(e.target.value)}
           />
         </label>
-        <label className="dialog-field">
-          <span>Repository path</span>
-          <input
-            value={root}
-            disabled={withoutGit}
-            placeholder={withoutGit ? "No repository" : "/path/to/repository"}
-            onChange={(e) => setRoot(e.target.value)}
-          />
-        </label>
+        {field}
         <label className="dialog-checkbox">
           <input
             type="checkbox"
@@ -464,12 +486,136 @@ export function CreateProjectDialog({
             Cancel
           </button>
           <button type="submit" className="btn-primary" disabled={!canSubmit}>
-            Create
+            Create project
           </button>
         </div>
       </form>
     </div>
   );
+}
+
+type DirectorySource = {
+  onListDirs?: (prefix: string) => void;
+  dirSuggestions?: { prefix: string; dirs: string[] };
+};
+
+function useDirectoryField({
+  onListDirs,
+  dirSuggestions,
+  initialPath = "",
+  disabled = false,
+  label,
+  placeholder,
+}: DirectorySource & {
+  initialPath?: string;
+  disabled?: boolean;
+  label: string;
+  placeholder: string;
+}) {
+  const [dirPath, setDirPath] = useState(initialPath);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [suggestIdx, setSuggestIdx] = useState(0);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => {
+    return () => {
+      clearTimeout(debounceRef.current);
+      clearTimeout(blurTimerRef.current);
+    };
+  }, []);
+
+  const requestDirs = (value: string) => {
+    clearTimeout(debounceRef.current);
+    if (onListDirs) debounceRef.current = setTimeout(() => onListDirs(value), 120);
+  };
+
+  // The server echoes the prefix, so stale replies for older input are ignored.
+  const suggestions =
+    !disabled && onListDirs && dirSuggestions?.prefix === dirPath ? dirSuggestions.dirs : [];
+
+  const handlePathChange = (value: string) => {
+    setDirPath(value);
+    setSuggestOpen(true);
+    setSuggestIdx(0);
+    requestDirs(value);
+  };
+
+  const pickSuggestion = (dir: string) => {
+    setDirPath(dir);
+    setSuggestIdx(0);
+    requestDirs(dir);
+  };
+
+  const handlePathKeyDown = (e: React.KeyboardEvent) => {
+    if (e.nativeEvent.isComposing) return;
+    if (!suggestOpen || suggestions.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSuggestIdx((i) => (i + 1) % suggestions.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSuggestIdx((i) => (i - 1 + suggestions.length) % suggestions.length);
+    } else if (e.key === "Tab" || e.key === "Enter") {
+      e.preventDefault();
+      pickSuggestion(suggestions[suggestIdx % suggestions.length]);
+    } else if (e.key === "Escape") {
+      setSuggestOpen(false);
+    }
+  };
+
+  const field = (
+    <label className="dialog-field path-field">
+      <span>{label}</span>
+      <input
+        value={dirPath}
+        disabled={disabled}
+        onChange={(e) => handlePathChange(e.target.value)}
+        onKeyDown={handlePathKeyDown}
+        onFocus={() => {
+          clearTimeout(blurTimerRef.current);
+          setSuggestOpen(true);
+          requestDirs(dirPath);
+        }}
+        onBlur={() => {
+          // Tapping/clicking anywhere else closes the list — the only way
+          // to dismiss on mobile, where there is no Esc. Delayed so a
+          // click that lands past the list (e.g. on Create after the
+          // list shrinks) completes before the layout shifts. Picking a
+          // suggestion never blurs: items preventDefault on mousedown.
+          blurTimerRef.current = setTimeout(() => setSuggestOpen(false), 150);
+        }}
+        placeholder={placeholder}
+        autoComplete="off"
+        spellCheck={false}
+      />
+      {suggestOpen && suggestions.length > 0 && (
+        <div className="dir-suggest">
+          {suggestions.map((dir, i) => (
+            <div
+              key={dir}
+              className={`dir-suggest-item ${i === suggestIdx ? "active" : ""}`}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                pickSuggestion(dir);
+              }}
+            >
+              {dir}
+            </div>
+          ))}
+        </div>
+      )}
+    </label>
+  );
+  return {
+    path: dirPath,
+    field,
+    dismiss: () => {
+      if (!suggestOpen || suggestions.length === 0) return false;
+      setSuggestOpen(false);
+      return true;
+    },
+  };
 }
 
 // A workspace is just a name plus a directory, a session of that folder's
@@ -497,64 +643,22 @@ export function CreateWorkspaceDialog({
 }) {
   const [name, setName] = useState("");
   const [projectName, setProjectName] = useState("");
-  const [dirPath, setDirPath] = useState(initialPath ?? "~/");
-  const [suggestOpen, setSuggestOpen] = useState(false);
-  const [suggestIdx, setSuggestIdx] = useState(0);
   const [hostId, setHostId] = useState(hosts[0]?.id ?? "local");
   const nameRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const blurTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  useEffect(() => {
-    nameRef.current?.focus();
-    return () => {
-      clearTimeout(debounceRef.current);
-      clearTimeout(blurTimerRef.current);
-    };
-  }, []);
-
-  const requestDirs = (value: string) => {
-    clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => onListDirs(value), 120);
-  };
-
-  // The server echoes the prefix, so stale replies for older input are ignored.
-  const suggestions = dirSuggestions.prefix === dirPath ? dirSuggestions.dirs : [];
-
-  const handlePathChange = (value: string) => {
-    setDirPath(value);
-    setSuggestOpen(true);
-    setSuggestIdx(0);
-    requestDirs(value);
-  };
-
-  const pickSuggestion = (dir: string) => {
-    setDirPath(dir);
-    setSuggestIdx(0);
-    requestDirs(dir);
-  };
-
-  const handlePathKeyDown = (e: React.KeyboardEvent) => {
-    if (e.nativeEvent.isComposing) return;
-    if (!suggestOpen || suggestions.length === 0) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setSuggestIdx((i) => (i + 1) % suggestions.length);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setSuggestIdx((i) => (i - 1 + suggestions.length) % suggestions.length);
-    } else if (e.key === "Tab" || e.key === "Enter") {
-      e.preventDefault();
-      pickSuggestion(suggestions[suggestIdx]);
-    } else if (e.key === "Escape") {
-      setSuggestOpen(false);
-    }
-  };
-
-  // Escape folds the suggestions first, then closes.
-  useDialogKeys(nameRef, () =>
-    suggestOpen && suggestions.length > 0 ? setSuggestOpen(false) : onClose(),
-  );
+  const {
+    path: dirPath,
+    field,
+    dismiss,
+  } = useDirectoryField({
+    onListDirs,
+    dirSuggestions,
+    initialPath: initialPath ?? "~/",
+    label: "Directory path",
+    placeholder: "~/workspace/...",
+  });
+  useDialogKeys(nameRef, () => {
+    if (!dismiss()) onClose();
+  });
 
   const canSubmit = dirPath.trim().length > 0;
   const defaultName = dirPath.split("/").filter(Boolean).pop() ?? "";
@@ -567,7 +671,7 @@ export function CreateWorkspaceDialog({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    const finalName = (name.trim() || defaultName || "workspace").trim();
+    const finalName = (name.trim() || defaultName || "session").trim();
     const project = newProject ? projectName.trim() : "";
     onCreate(finalName, dirPath.trim(), hostId || undefined, project || undefined);
     onClose();
@@ -576,56 +680,17 @@ export function CreateWorkspaceDialog({
   return (
     <div className="dialog-overlay" onClick={onClose}>
       <form className="dialog" onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <div className="dialog-title">New Workspace</div>
+        <div className="dialog-title">New Session</div>
         <label className="dialog-field">
           <span>Name</span>
           <input
             ref={nameRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder={defaultName || "Workspace name..."}
+            placeholder={defaultName || "Session name…"}
           />
         </label>
-        <label className="dialog-field path-field">
-          <span>Path</span>
-          <input
-            value={dirPath}
-            onChange={(e) => handlePathChange(e.target.value)}
-            onKeyDown={handlePathKeyDown}
-            onFocus={() => {
-              clearTimeout(blurTimerRef.current);
-              setSuggestOpen(true);
-              requestDirs(dirPath);
-            }}
-            onBlur={() => {
-              // Tapping/clicking anywhere else closes the list — the only way
-              // to dismiss on mobile, where there is no Esc. Delayed so a
-              // click that lands past the list (e.g. on Create after the
-              // list shrinks) completes before the layout shifts. Picking a
-              // suggestion never blurs: items preventDefault on mousedown.
-              blurTimerRef.current = setTimeout(() => setSuggestOpen(false), 150);
-            }}
-            placeholder="~/workspace/..."
-            autoComplete="off"
-            spellCheck={false}
-          />
-          {suggestOpen && suggestions.length > 0 && (
-            <div className="dir-suggest">
-              {suggestions.map((dir, i) => (
-                <div
-                  key={dir}
-                  className={`dir-suggest-item ${i === suggestIdx ? "active" : ""}`}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    pickSuggestion(dir);
-                  }}
-                >
-                  {dir}
-                </div>
-              ))}
-            </div>
-          )}
-        </label>
+        {field}
         {newProject && (
           <label className="dialog-field">
             <span>Project</span>
@@ -653,7 +718,7 @@ export function CreateWorkspaceDialog({
             Cancel
           </button>
           <button type="submit" className="btn-primary" disabled={!canSubmit}>
-            Create
+            Create session
           </button>
         </div>
       </form>

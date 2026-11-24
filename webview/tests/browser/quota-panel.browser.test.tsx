@@ -207,6 +207,15 @@ it("renders compact quota rows on desktop with threshold colors, error badges, a
   ]);
 });
 
+it("animates the dedicated quota refresh icon while refreshing", () => {
+  const { container } = render(
+    <QuotaPanel quota={{ rows: [], refreshing: true }} now={NOW} connected />,
+  );
+  const icon = container.querySelector(".quota-refresh svg.icon")!;
+  expect(icon).not.toBeNull();
+  expect(getComputedStyle(icon).animationName).toBe("quota-spin");
+});
+
 it("gives explicit setup instructions and distinguishes warming from a transient quota error", () => {
   const waitingRows = [
     ["antigravity-acp", "waiting for ACP setup"],
