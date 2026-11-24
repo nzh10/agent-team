@@ -402,63 +402,69 @@ describe("deferred cutover", () => {
     },
   );
 
-  it("checks the launchd job's exact launcher and PID before targeting a restart", async () => {
-    const bin = path.join(dir, "launchctl");
-    const output = path.join(dir, "print");
-    fs.writeFileSync(
-      bin,
-      `#!/bin/bash\n[ "$*" = 'print gui/17/test' ] && exec cat '${output}'\n[ "$*" = 'kickstart -k gui/17/test' ]`,
-      { mode: 0o700 },
-    );
-    const manager = serviceManager("test", dir, {
-      YAAT_SERVICE_OS: "Darwin",
-      YAAT_LAUNCHCTL_BIN: bin,
-      YAAT_UID: "17",
-    });
-    await expect(manager.verifyLauncher()).rejects.toThrow();
-    const launcher = `${dir}/scripts/start-server.sh`;
-    const printed = (program: string, args = "") =>
-      fs.writeFileSync(output, `gui/17/test = {\n\tprogram = ${program}\n${args}\tpid = 52\n}\n`);
-    printed(launcher);
-    await manager.verify(52);
-    const args = `\targuments = {\n\t\t/bin/bash\n\t\t${launcher}\n\t}\n`;
-    printed("/bin/bash", args);
-    await manager.verify(52);
-    await expect(manager.verify(5)).rejects.toThrow("PID");
-    printed("/bin/bash", args.replace(launcher, `-c\n\t\t${launcher}`));
-    await expect(manager.verifyLauncher()).rejects.toThrow("launcher");
-    printed("/wrong/bash", args);
-    await expect(manager.verifyLauncher()).rejects.toThrow("launcher");
-    await manager.restart();
-  });
+  it.skipIf(process.platform === "win32")(
+    "checks the launchd job's exact launcher and PID before targeting a restart",
+    async () => {
+      const bin = path.join(dir, "launchctl");
+      const output = path.join(dir, "print");
+      fs.writeFileSync(
+        bin,
+        `#!/bin/bash\n[ "$*" = 'print gui/17/test' ] && exec cat '${output}'\n[ "$*" = 'kickstart -k gui/17/test' ]`,
+        { mode: 0o700 },
+      );
+      const manager = serviceManager("test", dir, {
+        YAAT_SERVICE_OS: "Darwin",
+        YAAT_LAUNCHCTL_BIN: bin,
+        YAAT_UID: "17",
+      });
+      await expect(manager.verifyLauncher()).rejects.toThrow();
+      const launcher = `${dir}/scripts/start-server.sh`;
+      const printed = (program: string, args = "") =>
+        fs.writeFileSync(output, `gui/17/test = {\n\tprogram = ${program}\n${args}\tpid = 52\n}\n`);
+      printed(launcher);
+      await manager.verify(52);
+      const args = `\targuments = {\n\t\t/bin/bash\n\t\t${launcher}\n\t}\n`;
+      printed("/bin/bash", args);
+      await manager.verify(52);
+      await expect(manager.verify(5)).rejects.toThrow("PID");
+      printed("/bin/bash", args.replace(launcher, `-c\n\t\t${launcher}`));
+      await expect(manager.verifyLauncher()).rejects.toThrow("launcher");
+      printed("/wrong/bash", args);
+      await expect(manager.verifyLauncher()).rejects.toThrow("launcher");
+      await manager.restart();
+    },
+  );
 
-  it("rejects a concurrent controller at the repository lock", () => {
-    const scripts = path.resolve(__dirname, "../../../scripts");
-    const installed = path.join(dir, "scripts");
-    fs.cpSync(scripts, installed, { recursive: true });
-    const controller = path.join(installed, "deploy-controller.mjs");
-    const prepared = spawnSync(process.execPath, [controller, "prepare", dir, "two"], {
-      encoding: "utf8",
-    });
-    expect(prepared.stderr).toBe("");
-    expect(prepared.status).toBe(0);
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'REPO_DIR=$1; source "$1/scripts/deploy-lock.sh"; deploy_lock || exit 9; "$1/scripts/deploy-deferred.sh" --when-idle --timeout 1 --job two; result=$?; exit "$result"',
-        "bash",
-        dir,
-      ],
-      {
-        env: { ...process.env, AGENT_TEAM_BASE_DIR: dir, YAAT_NODE_BIN: process.execPath },
+  it.skipIf(process.platform === "win32")(
+    "rejects a concurrent controller at the repository lock",
+    () => {
+      const scripts = path.resolve(__dirname, "../../../scripts");
+      const installed = path.join(dir, "scripts");
+      fs.cpSync(scripts, installed, { recursive: true });
+      const controller = path.join(installed, "deploy-controller.mjs");
+      const prepared = spawnSync(process.execPath, [controller, "prepare", dir, "two"], {
         encoding: "utf8",
-        timeout: 5000,
-      },
-    );
-    expect(result.status, result.stderr).toBe(1);
-    expect(
-      fs.readFileSync(path.join(dir, ".agent-team/releases/jobs/two/status.json"), "utf8"),
-    ).toContain("lock-failed");
-  });
+      });
+      expect(prepared.stderr).toBe("");
+      expect(prepared.status).toBe(0);
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          'REPO_DIR=$1; source "$1/scripts/deploy-lock.sh"; deploy_lock || exit 9; "$1/scripts/deploy-deferred.sh" --when-idle --timeout 1 --job two; result=$?; exit "$result"',
+          "bash",
+          dir,
+        ],
+        {
+          env: { ...process.env, AGENT_TEAM_BASE_DIR: dir, YAAT_NODE_BIN: process.execPath },
+          encoding: "utf8",
+          timeout: 5000,
+        },
+      );
+      expect(result.status, result.stderr).toBe(1);
+      expect(
+        fs.readFileSync(path.join(dir, ".agent-team/releases/jobs/two/status.json"), "utf8"),
+      ).toContain("lock-failed");
+    },
+  );
 });

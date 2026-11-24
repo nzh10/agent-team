@@ -147,6 +147,7 @@ type = "local"
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     HOME: home,
+    USERPROFILE: home,
     AGENT_TEAM_PORT: "0",
     AGENT_TEAM_HOST: "127.0.0.1",
     AGENT_TEAM_BASE_DIR: base,

@@ -59,7 +59,7 @@ describe("a branch's changes", () => {
   it("lists what changed since the base, committed or not, and what git does not know yet", async () => {
     const c = await changes(path.join(shared.work));
     expect(c).toMatchObject({
-      top: fs.realpathSync(shared.work),
+      top: fs.realpathSync(shared.work).split(path.sep).join("/"),
       branch: "feature",
       base: "origin/main",
       truncated: false,

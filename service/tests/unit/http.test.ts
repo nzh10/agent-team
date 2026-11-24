@@ -372,7 +372,7 @@ describe("uploads and snapshots", () => {
       body: '{"x":1}',
     });
     const { path: rel } = JSON.parse(res.body.toString()) as { path: string };
-    expect(rel).toMatch(/^\.agent-team\/debug\/snapshot-.*\.json$/);
+    expect(rel.split(path.sep).join("/")).toMatch(/^\.agent-team\/debug\/snapshot-.*\.json$/);
     expect(fs.readFileSync(path.join(base, rel), "utf-8")).toBe('{"x":1}');
   });
 });
@@ -388,60 +388,69 @@ describe("file previews", () => {
   const get = (route: string, p: string) =>
     request(`/api/${route}?path=${encodeURIComponent(p)}`, { headers: { Cookie: cookie } });
 
-  it("refuse a file that cannot be opened, and keep serving", async () => {
-    const locked = path.join(dir, "locked.png");
-    fs.writeFileSync(locked, "png");
-    fs.chmodSync(locked, 0o000);
-    expect((await get("file", locked)).status).toBe(200);
-    expect((await get("file/raw", locked)).status).toBe(403);
-    expect((await get("file/raw", locked)).status).toBe(403);
-    expect((await request("/", { headers: { Cookie: cookie } })).status).toBe(200);
-  });
+  it.skipIf(process.platform === "win32")(
+    "refuse a file that cannot be opened, and keep serving",
+    async () => {
+      const locked = path.join(dir, "locked.png");
+      fs.writeFileSync(locked, "png");
+      fs.chmodSync(locked, 0o000);
+      expect((await get("file", locked)).status).toBe(200);
+      expect((await get("file/raw", locked)).status).toBe(403);
+      expect((await get("file/raw", locked)).status).toBe(403);
+      expect((await request("/", { headers: { Cookie: cookie } })).status).toBe(200);
+    },
+  );
 
-  it("do not open a pipe or a device, which would block the server", async () => {
-    const fifo = path.join(dir, "pipe");
-    execFileSync("mkfifo", [fifo]);
-    const view = await get("file", fifo);
-    expect(view.status).toBe(400);
-    expect(JSON.parse(view.body.toString())).toMatchObject({ error: "Not a regular file" });
-    expect((await get("file/raw", fifo)).status).toBe(400);
-  });
+  it.skipIf(process.platform === "win32")(
+    "do not open a pipe or a device, which would block the server",
+    async () => {
+      const fifo = path.join(dir, "pipe");
+      execFileSync("mkfifo", [fifo]);
+      const view = await get("file", fifo);
+      expect(view.status).toBe(400);
+      expect(JSON.parse(view.body.toString())).toMatchObject({ error: "Not a regular file" });
+      expect((await get("file/raw", fifo)).status).toBe(400);
+    },
+  );
 
-  it("close the file when a download is cancelled", async () => {
-    const big = path.join(dir, "big.bin");
-    fs.writeFileSync(big, Buffer.alloc(16 * 1024 * 1024));
-    const openOnBig = () => {
-      if (process.platform === "darwin") {
-        const canonical = fs.realpathSync(big);
-        return execFileSync(lsofBinary(), ["-p", String(process.pid)], { encoding: "utf8" })
-          .split("\n")
-          .filter((line) => line.endsWith(canonical)).length;
-      }
-      return fs.readdirSync("/proc/self/fd").filter((fd) => {
-        try {
-          return fs.readlinkSync(`/proc/self/fd/${fd}`) === big;
-        } catch {
-          return false;
+  it.skipIf(process.platform === "win32")(
+    "close the file when a download is cancelled",
+    async () => {
+      const big = path.join(dir, "big.bin");
+      fs.writeFileSync(big, Buffer.alloc(16 * 1024 * 1024));
+      const openOnBig = () => {
+        if (process.platform === "darwin") {
+          const canonical = fs.realpathSync(big);
+          return execFileSync(lsofBinary(), ["-p", String(process.pid)], { encoding: "utf8" })
+            .split("\n")
+            .filter((line) => line.endsWith(canonical)).length;
         }
-      }).length;
-    };
-    for (let i = 0; i < 3; i++) {
-      await new Promise<void>((resolve, reject) => {
-        const req = http.get(
-          {
-            host: "127.0.0.1",
-            port,
-            path: `/api/file/raw?path=${encodeURIComponent(big)}`,
-            headers: { Cookie: cookie },
-            agent: false,
-          },
-          (res) => res.once("data", () => (req.destroy(), resolve())),
-        );
-        req.on("error", reject);
-      });
-    }
-    await vi.waitFor(() => expect(openOnBig()).toBe(0));
-  });
+        return fs.readdirSync("/proc/self/fd").filter((fd) => {
+          try {
+            return fs.readlinkSync(`/proc/self/fd/${fd}`) === big;
+          } catch {
+            return false;
+          }
+        }).length;
+      };
+      for (let i = 0; i < 3; i++) {
+        await new Promise<void>((resolve, reject) => {
+          const req = http.get(
+            {
+              host: "127.0.0.1",
+              port,
+              path: `/api/file/raw?path=${encodeURIComponent(big)}`,
+              headers: { Cookie: cookie },
+              agent: false,
+            },
+            (res) => res.once("data", () => (req.destroy(), resolve())),
+          );
+          req.on("error", reject);
+        });
+      }
+      await vi.waitFor(() => expect(openOnBig()).toBe(0));
+    },
+  );
 
   it("list folders first even when the listing is cut short", async () => {
     const crowd = path.join(dir, "crowd");

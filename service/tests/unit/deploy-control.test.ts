@@ -45,60 +45,69 @@ function setup(retire = (_signal: AbortSignal) => Promise.resolve(), leaseMs = 2
 }
 
 describe("deploy control", () => {
-  it("waits for the requesting turn and rejects wrong generation/boot/repo/target over an owner-only socket", async () => {
-    const { control, seal, blockers } = setup();
-    const socket = join(baseDir, "deploy-control/control.sock");
-    try {
-      await control.listen();
-      expect(lstatSync(join(baseDir, "deploy-control")).mode & 0o777).toBe(0o700);
-      expect(lstatSync(socket).mode & 0o777).toBe(0o600);
-      expect(await rpc(socket, { cmd: "status" })).toMatchObject({
-        pid: process.pid,
-        bootId: seal.bootId,
-      });
-      for (const key of [
-        "bootId",
-        "releaseId",
-        "installedRepoDir",
-        "label",
-        "port",
-        "baseDir",
-        "pid",
-      ]) {
-        expect(await rpc(socket, { ...seal, [key]: "wrong" })).toEqual({
-          error: "Target identity mismatch",
+  it.skipIf(process.platform === "win32")(
+    "waits for the requesting turn and rejects wrong generation/boot/repo/target over an owner-only socket",
+    async () => {
+      const { control, seal, blockers } = setup();
+      const socket = join(baseDir, "deploy-control/control.sock");
+      try {
+        await control.listen();
+        expect(lstatSync(join(baseDir, "deploy-control")).mode & 0o777).toBe(0o700);
+        expect(lstatSync(socket).mode & 0o777).toBe(0o600);
+        expect(await rpc(socket, { cmd: "status" })).toMatchObject({
+          pid: process.pid,
+          bootId: seal.bootId,
         });
+        for (const key of [
+          "bootId",
+          "releaseId",
+          "installedRepoDir",
+          "label",
+          "port",
+          "baseDir",
+          "pid",
+        ]) {
+          expect(await rpc(socket, { ...seal, [key]: "wrong" })).toEqual({
+            error: "Target identity mismatch",
+          });
+        }
+        blockers.workspaces = 1;
+        expect(await rpc(socket, seal)).toMatchObject({
+          sealed: false,
+          blockers: { workspaces: 1 },
+        });
+        blockers.workspaces = 0;
+        expect(await rpc(socket, seal)).toMatchObject({
+          sealed: true,
+          deployId: "job",
+          commitReady: true,
+        });
+        expect(await rpc(socket, { ...seal, cmd: "unseal", deployId: "another" })).toEqual({
+          error: "Seal owner mismatch",
+        });
+        expect(await rpc(socket, { ...seal, cmd: "unseal" })).toMatchObject({ sealed: false });
+      } finally {
+        await control.close();
       }
-      blockers.workspaces = 1;
-      expect(await rpc(socket, seal)).toMatchObject({ sealed: false, blockers: { workspaces: 1 } });
-      blockers.workspaces = 0;
-      expect(await rpc(socket, seal)).toMatchObject({
-        sealed: true,
-        deployId: "job",
-        commitReady: true,
-      });
-      expect(await rpc(socket, { ...seal, cmd: "unseal", deployId: "another" })).toEqual({
-        error: "Seal owner mismatch",
-      });
-      expect(await rpc(socket, { ...seal, cmd: "unseal" })).toMatchObject({ sealed: false });
-    } finally {
-      await control.close();
-    }
-  });
+    },
+  );
 
-  it("will not replace a live listener or use an exposed directory", async () => {
-    const first = setup().control;
-    const another = setup().control;
-    try {
-      await first.listen();
-      await expect(another.listen()).rejects.toThrow("already listening");
-      chmodSync(join(baseDir, "deploy-control"), 0o755);
-      await expect(another.listen()).rejects.toThrow("owner-only");
-    } finally {
-      await first.close();
-      await another.close();
-    }
-  });
+  it.skipIf(process.platform === "win32")(
+    "will not replace a live listener or use an exposed directory",
+    async () => {
+      const first = setup().control;
+      const another = setup().control;
+      try {
+        await first.listen();
+        await expect(another.listen()).rejects.toThrow("already listening");
+        chmodSync(join(baseDir, "deploy-control"), 0o755);
+        await expect(another.listen()).rejects.toThrow("owner-only");
+      } finally {
+        await first.close();
+        await another.close();
+      }
+    },
+  );
 
   it("revokes the lease even if unsolicited work ends before retirement returns", async () => {
     const { control, seal, resumed } = setup(

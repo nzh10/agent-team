@@ -2275,7 +2275,14 @@ describe("PiSession persisted first-input anchor", () => {
     expect(restored.factory).not.toHaveBeenCalled();
   });
 
-  it.each(["missing", "header", "branch", "corrupt", "symlink", "fifo"])(
+  it.each([
+    "missing",
+    "header",
+    "branch",
+    "corrupt",
+    "symlink",
+    ...(process.platform === "win32" ? [] : ["fifo"]),
+  ])(
     "refuses a once-proved session with %s history before spawning Pi",
     async (damage) => {
       const h = harness({ state: anchored });
@@ -2773,7 +2780,7 @@ describe("PiSession interrupt recovery", () => {
   });
 });
 
-describe("PiSession detached runner cleanup", () => {
+describe.skipIf(process.platform === "win32")("PiSession detached runner cleanup", () => {
   it("reaps a registered cross-PGID runner after its Pi parent has already exited and frees its port", async () => {
     const dir = temp();
     const cfg = config(dir);

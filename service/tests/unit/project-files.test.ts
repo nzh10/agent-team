@@ -240,132 +240,146 @@ describe("api/file for a project whose folder is gone", () => {
 });
 
 describe("VS Code's CLI", () => {
-  it("is called with the hook of a live window, the newest live socket first", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-    try {
-      const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      const log = path.join(dir, "log");
-      fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI $*" > ${log}\n`, {
-        mode: 0o755,
-      });
-      const run = path.join(dir, "run");
-      fs.mkdirSync(run);
-      const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
-
-      await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toBeInstanceOf(VSCodeUnavailable);
-
-      const live = path.join(run, "vscode-ipc-live.sock");
-      const window = net.createServer((c) => c.end());
-      await new Promise<void>((r) => window.listen(live, r));
-      // Left behind by a closed window, and newer.
-      const dead = path.join(run, "vscode-ipc-dead.sock");
-      const gone = net.createServer();
-      await new Promise<void>((r) => gone.listen(dead, r));
-      await new Promise<void>((r) => gone.close(() => r()));
-      fs.writeFileSync(dead, "");
-      fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
-
-      await openInVSCode("/repo/a.cpp", 3, env);
-      expect(fs.readFileSync(log, "utf-8").trim()).toBe(`${live} --goto /repo/a.cpp:3`);
-      await new Promise<void>((r) => window.close(() => r()));
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("finds a window's socket in any of the runtime dirs", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-    try {
-      const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      const log = path.join(dir, "log");
-      fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`, { mode: 0o755 });
-      const [run, tmp] = ["run", "tmp"].map((d) => path.join(dir, d));
-      fs.mkdirSync(run);
-      fs.mkdirSync(tmp);
-      const live = path.join(tmp, "vscode-ipc-live.sock");
-      const window = net.createServer((c) => c.end());
-      await new Promise<void>((r) => window.listen(live, r));
-      // The hook the server was started with, of a window closed since.
-      const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run, tmp], hook: "/gone" };
-      await openInVSCode("/repo/a.cpp", undefined, env);
-      expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
-      await new Promise<void>((r) => window.close(() => r()));
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("moves on from a window that does not answer, leaving nothing behind", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-    try {
-      const run = path.join(dir, "run");
-      fs.mkdirSync(run);
-      const hung = path.join(run, "vscode-ipc-hung.sock");
-      const live = path.join(run, "vscode-ipc-live.sock");
-      const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      const log = path.join(dir, "log");
-      const pid = path.join(dir, "pid");
-      fs.writeFileSync(
-        cli,
-        `#!/bin/sh\nif [ "$VSCODE_IPC_HOOK_CLI" = "${hung}" ]; then sleep 30 & echo $! > ${pid}; wait; fi\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`,
-        { mode: 0o755 },
-      );
-      const servers = [hung, live].map(() => net.createServer(() => {}));
-      await Promise.all(
-        servers.map((srv, i) => new Promise<void>((r) => srv.listen([hung, live][i], r))),
-      );
-      fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
-
-      await openInVSCode("/repo/a.cpp", undefined, {
-        serverDir: path.join(dir, "server"),
-        runtimeDirs: [run],
-        timeoutMs: 300,
-      });
-      expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
-      const sleeper = Number(fs.readFileSync(pid, "utf-8"));
-      await vi.waitFor(() => expect(() => process.kill(sleeper, 0)).toThrow(), {
-        timeout: 1000,
-        interval: 10,
-      });
-      await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("is run once when it fails by itself, and without --goto for no line", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-    try {
-      const run = path.join(dir, "run");
-      fs.mkdirSync(run);
-      const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      const log = path.join(dir, "log");
-      fs.writeFileSync(
-        cli,
-        `#!/bin/sh\necho "$*" >> ${log}\n[ "$1" = "--goto" ] || exit 0\nexit 1\n`,
-        {
+  it.skipIf(process.platform === "win32")(
+    "is called with the hook of a live window, the newest live socket first",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
+      try {
+        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        const log = path.join(dir, "log");
+        fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI $*" > ${log}\n`, {
           mode: 0o755,
-        },
-      );
-      const socks = ["a", "b", "c"].map((n) => path.join(run, `vscode-ipc-${n}.sock`));
-      const servers = socks.map(() => net.createServer((c) => c.end()));
-      await Promise.all(servers.map((srv, i) => new Promise<void>((r) => srv.listen(socks[i], r))));
-      const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
+        });
+        const run = path.join(dir, "run");
+        fs.mkdirSync(run);
+        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
 
-      await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toThrow();
-      expect(fs.readFileSync(log, "utf-8").trim().split("\n")).toEqual(["--goto /repo/a.cpp:3"]);
-      fs.rmSync(log);
-      await openInVSCode("/repo/a:3", undefined, env);
-      expect(fs.readFileSync(log, "utf-8").trim()).toBe("/repo/a:3");
-      await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
+        await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toBeInstanceOf(VSCodeUnavailable);
+
+        const live = path.join(run, "vscode-ipc-live.sock");
+        const window = net.createServer((c) => c.end());
+        await new Promise<void>((r) => window.listen(live, r));
+        // Left behind by a closed window, and newer.
+        const dead = path.join(run, "vscode-ipc-dead.sock");
+        const gone = net.createServer();
+        await new Promise<void>((r) => gone.listen(dead, r));
+        await new Promise<void>((r) => gone.close(() => r()));
+        fs.writeFileSync(dead, "");
+        fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+
+        await openInVSCode("/repo/a.cpp", 3, env);
+        expect(fs.readFileSync(log, "utf-8").trim()).toBe(`${live} --goto /repo/a.cpp:3`);
+        await new Promise<void>((r) => window.close(() => r()));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "finds a window's socket in any of the runtime dirs",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
+      try {
+        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        const log = path.join(dir, "log");
+        fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`, { mode: 0o755 });
+        const [run, tmp] = ["run", "tmp"].map((d) => path.join(dir, d));
+        fs.mkdirSync(run);
+        fs.mkdirSync(tmp);
+        const live = path.join(tmp, "vscode-ipc-live.sock");
+        const window = net.createServer((c) => c.end());
+        await new Promise<void>((r) => window.listen(live, r));
+        // The hook the server was started with, of a window closed since.
+        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run, tmp], hook: "/gone" };
+        await openInVSCode("/repo/a.cpp", undefined, env);
+        expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
+        await new Promise<void>((r) => window.close(() => r()));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "moves on from a window that does not answer, leaving nothing behind",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
+      try {
+        const run = path.join(dir, "run");
+        fs.mkdirSync(run);
+        const hung = path.join(run, "vscode-ipc-hung.sock");
+        const live = path.join(run, "vscode-ipc-live.sock");
+        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        const log = path.join(dir, "log");
+        const pid = path.join(dir, "pid");
+        fs.writeFileSync(
+          cli,
+          `#!/bin/sh\nif [ "$VSCODE_IPC_HOOK_CLI" = "${hung}" ]; then sleep 30 & echo $! > ${pid}; wait; fi\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`,
+          { mode: 0o755 },
+        );
+        const servers = [hung, live].map(() => net.createServer(() => {}));
+        await Promise.all(
+          servers.map((srv, i) => new Promise<void>((r) => srv.listen([hung, live][i], r))),
+        );
+        fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+
+        await openInVSCode("/repo/a.cpp", undefined, {
+          serverDir: path.join(dir, "server"),
+          runtimeDirs: [run],
+          timeoutMs: 300,
+        });
+        expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
+        const sleeper = Number(fs.readFileSync(pid, "utf-8"));
+        await vi.waitFor(() => expect(() => process.kill(sleeper, 0)).toThrow(), {
+          timeout: 1000,
+          interval: 10,
+        });
+        await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "is run once when it fails by itself, and without --goto for no line",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
+      try {
+        const run = path.join(dir, "run");
+        fs.mkdirSync(run);
+        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        const log = path.join(dir, "log");
+        fs.writeFileSync(
+          cli,
+          `#!/bin/sh\necho "$*" >> ${log}\n[ "$1" = "--goto" ] || exit 0\nexit 1\n`,
+          {
+            mode: 0o755,
+          },
+        );
+        const socks = ["a", "b", "c"].map((n) => path.join(run, `vscode-ipc-${n}.sock`));
+        const servers = socks.map(() => net.createServer((c) => c.end()));
+        await Promise.all(
+          servers.map((srv, i) => new Promise<void>((r) => srv.listen(socks[i], r))),
+        );
+        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
+
+        await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toThrow();
+        expect(fs.readFileSync(log, "utf-8").trim().split("\n")).toEqual(["--goto /repo/a.cpp:3"]);
+        fs.rmSync(log);
+        await openInVSCode("/repo/a:3", undefined, env);
+        expect(fs.readFileSync(log, "utf-8").trim()).toBe("/repo/a:3");
+        await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("is reported missing when no VS Code server is installed", async () => {
     await expect(

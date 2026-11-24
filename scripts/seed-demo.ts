@@ -11,6 +11,7 @@
 import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { seedFileLinks } from "./demo-file-links";
 import { ProjectStore } from "../service/src/project/store";
 import { ObjectiveStore, type Objective } from "../service/src/project/objectives";
 import { IssueStore } from "../service/src/project/issues";
@@ -56,6 +57,7 @@ export interface SeedDemoResult {
   repo: string;
   projectId: string;
   projectName: string;
+  fileLinks: ReturnType<typeof seedFileLinks>["links"];
   worktrees: {
     mobilePanels: string;
     wakeTime: string;
@@ -80,7 +82,11 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
   }
   // The production data lives in the repository root; a clone elsewhere in
   // the working tree would show up as untracked files.
-  if (!inRepo.startsWith("..") && !path.isAbsolute(inRepo) && !inRepo.startsWith(".agent-team/")) {
+  if (
+    !inRepo.startsWith("..") &&
+    !path.isAbsolute(inRepo) &&
+    !inRepo.startsWith(`.agent-team${path.sep}`)
+  ) {
     throw new Error(`${base} is in the repository; use a dir under .agent-team/ or outside it`);
   }
   for (const taken of [".agent-team", "demo"]) {
@@ -609,13 +615,15 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
     const pastAgent = agent("Ayanami", "avatars/Ayanami.jpg", "#A5B4FC", repo);
     const past = session("parser crash", repo, pastAgent, null, 60 * 24 * 9);
     past.archivedAt = ago(60 * 24 * 7);
+    const { markdown, links } = seedFileLinks(demo);
     past.messages = [
       joined(60 * 24 * 9, pastAgent),
       user(60 * 24 * 9, "clice 在打开 `src/Index/Parser.cpp` 时崩了，帮我看下。"),
       reply(
         pastAgent,
         60 * 24 * 9 - 30,
-        "ASAN 报告指向 `TemplateResolver::resolve` 的 use-after-free：缓存的 `Decl*` 在重新解析后失效。改成按 USR 重新查找，已修复并加了回归测试。",
+        "ASAN 报告指向 `TemplateResolver::resolve` 的 use-after-free：缓存的 `Decl*` 在重新解析后失效。改成按 USR 重新查找，已修复并加了回归测试。\n\n" +
+          markdown,
         [bash("ctest -R parser", "100% tests passed", 1)],
         88_000,
       ),
@@ -815,6 +823,7 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
       repo,
       projectId: project.id,
       projectName: project.name,
+      fileLinks: links,
       worktrees: {
         mobilePanels: tree("mobile-panels"),
         wakeTime: tree("wake-time"),

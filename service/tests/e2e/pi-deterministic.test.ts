@@ -197,15 +197,17 @@ async function verifyPortClosed(port: number) {
 
 const subagents = localPiBinary && discoverLocalPiPackages().piSubagentsRoot;
 
-it.skipIf(!subagents)(
+it.skipIf(!process.env.CI && !subagents)(
   "runs a deterministic scenario against real WebSocket, Pi RPC and pi-subagents",
   runDeterministicPiScenario,
   180_000,
 );
 
 async function runDeterministicPiScenario() {
-  const basePorts = listeningPorts();
+  if (!localPiBinary)
+    throw new Error("Pi E2E requires the pi binary (@earendil-works/pi-coding-agent) on PATH");
   if (!subagents) throw new Error("Pi E2E requires a local pi-subagents installation");
+  const basePorts = listeningPorts();
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "yaat-pi-e2e-")));
   const home = prepareControlledPiAgentHome({
     mode: "test-synthetic",

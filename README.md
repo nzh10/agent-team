@@ -166,8 +166,18 @@ cp config.example.toml .agent-team/dev/config.toml
 AGENT_TEAM_PORT=9801 AGENT_TEAM_BASE_DIR=$PWD/.agent-team/dev node dist/server.js
 ```
 
-CI (`.github/workflows/ci.yml`) runs `check`, `test` and `build` on every push
-and pull request. Agent-facing project rules live in `AGENTS.md`, with
+Linux and Windows CI run `check`, `test`, `build`, Chromium layout tests and the demo browser E2E.
+Linux also runs the real deterministic Pi RPC scenario with pinned Pi and pi-subagents, no account required.
+The demo opens an archived parser session, follows recorded Markdown link forms and checks the real
+file's highlighted lines. Only the Markdown input is replayed; each target contains a fresh disk-only marker.
+
+Regression control for `088c313`: on macOS, the same Chromium journey passed with a temporary
+`C:/解析 trace.txt` link and a real file under a `C:` directory in the archived workspace.
+Restoring the pre-fix scheme rejection in `linkFileRef` (`git show 088c313^:webview/src/chat/fileRef.ts`)
+made the `Parser trace` click time out: no `.file-ref` rendered. That control isolates the renderer;
+the Windows job checks native drive resolution and file URIs without a substitute directory.
+
+Agent-facing project rules live in `AGENTS.md`, with
 task-specific playbooks under `.agents/skills/` (deploy, capture-sdk,
 stream-debug, add-model, review).
 

@@ -21,28 +21,28 @@ afterAll(() => {
 
 describe("completeDirs", () => {
   it("lists all visible directories for a trailing-slash prefix", () => {
-    const dirs = completeDirs(root + "/");
+    const dirs = completeDirs(root + path.sep);
     expect(dirs).toEqual([
-      path.join(root, "alpha") + "/",
-      path.join(root, "alps") + "/",
-      path.join(root, "beta") + "/",
+      path.join(root, "alpha") + path.sep,
+      path.join(root, "alps") + path.sep,
+      path.join(root, "beta") + path.sep,
     ]);
   });
 
   it("filters by partial name and excludes files", () => {
     const dirs = completeDirs(path.join(root, "alp"));
     // "alpine.txt" is a file and must not appear even though it matches.
-    expect(dirs).toEqual([path.join(root, "alpha") + "/", path.join(root, "alps") + "/"]);
+    expect(dirs).toEqual([path.join(root, "alpha") + path.sep, path.join(root, "alps") + path.sep]);
   });
 
   it("shows hidden directories only when the partial starts with a dot", () => {
-    expect(completeDirs(root + "/")).not.toContain(path.join(root, ".hidden") + "/");
-    expect(completeDirs(path.join(root, ".hi"))).toEqual([path.join(root, ".hidden") + "/"]);
+    expect(completeDirs(root + path.sep)).not.toContain(path.join(root, ".hidden") + path.sep);
+    expect(completeDirs(path.join(root, ".hi"))).toEqual([path.join(root, ".hidden") + path.sep]);
   });
 
   it("descends into subdirectories", () => {
-    expect(completeDirs(path.join(root, "alpha") + "/")).toEqual([
-      path.join(root, "alpha", "nested") + "/",
+    expect(completeDirs(path.join(root, "alpha") + path.sep)).toEqual([
+      path.join(root, "alpha", "nested") + path.sep,
     ]);
   });
 

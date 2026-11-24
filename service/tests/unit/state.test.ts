@@ -199,7 +199,7 @@ describe("unloaded workspaces", () => {
     db.close();
   });
 
-  it("state files are private to the user", () => {
+  it.skipIf(process.platform === "win32")("state files are private to the user", () => {
     const base = tmpBase();
     saveWorkspace(base, wsWithRaw());
     const file = path.join(base, ".agent-team", "cache", "workspaces", "ws-1.json");
@@ -252,7 +252,7 @@ describe("unloaded workspaces", () => {
     saveIndex(base, ["ws-1"]);
     loadAll(base);
     expect(fs.readFileSync(file, "utf-8")).not.toContain("sk-old");
-    expect(fs.statSync(file).mode & 0o077).toBe(0);
+    if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o077).toBe(0);
   });
 });
 

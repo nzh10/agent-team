@@ -222,12 +222,14 @@ afterEach(() => {
 });
 
 describe("runBudgetedShutdown", () => {
-  it("reaps a real detached grandchild in another process group after its parent exits", async () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-pgid-test-"));
-    temporaryDirectories.push(directory);
-    const pidFile = path.join(directory, "grandchild.pid");
-    const token = `pi-rpc-detached-${process.pid}-${Date.now()}`;
-    const parentSource = `
+  it.skipIf(process.platform === "win32")(
+    "reaps a real detached grandchild in another process group after its parent exits",
+    async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rpc-pgid-test-"));
+      temporaryDirectories.push(directory);
+      const pidFile = path.join(directory, "grandchild.pid");
+      const token = `pi-rpc-detached-${process.pid}-${Date.now()}`;
+      const parentSource = `
       const { spawn } = require("node:child_process");
       const fs = require("node:fs");
       const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000); // ${token}"], {
@@ -239,53 +241,55 @@ describe("runBudgetedShutdown", () => {
       process.stdin.resume();
       setInterval(() => {}, 1000);
     `;
-    const parent = spawn(process.execPath, ["-e", parentSource, pidFile], {
-      detached: true,
-      stdio: ["pipe", "ignore", "ignore"],
-    });
-    let grandchildPid = 0;
-    try {
-      const deadline = Date.now() + 3_000;
-      while (!fs.existsSync(pidFile) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      grandchildPid = Number(fs.readFileSync(pidFile, "utf8"));
-      expect(Number.isSafeInteger(grandchildPid)).toBe(true);
-      const parentPgid = Number(
-        execFileSync("ps", ["-o", "pgid=", "-p", String(parent.pid)], { encoding: "utf8" }),
-      );
-      const childPgid = Number(
-        execFileSync("ps", ["-o", "pgid=", "-p", String(grandchildPid)], { encoding: "utf8" }),
-      );
-      expect(childPgid).toBe(grandchildPid);
-      expect(parentPgid).not.toBe(childPgid);
-      await expect(verifyPidCommand(grandchildPid, [token])).resolves.toBe(true);
-
-      await runBudgetedShutdown({
-        totalTimeoutMs: 10_000,
-        child: parent,
-        stdin: parent.stdin,
-        stopDetachedChildren: () => Promise.resolve([{ pid: grandchildPid, matchers: [token] }]),
+      const parent = spawn(process.execPath, ["-e", parentSource, pidFile], {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
       });
-      expect(parent.exitCode).toBe(0);
-      await expect(verifyPidCommand(grandchildPid, [token])).resolves.toBe(false);
-    } finally {
-      if (parent.exitCode === null && parent.signalCode === null && parent.pid) {
-        try {
-          process.kill(-parent.pid, "SIGKILL");
-        } catch {
-          // The graceful path already exited.
+      let grandchildPid = 0;
+      try {
+        const deadline = Date.now() + 3_000;
+        while (!fs.existsSync(pidFile) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        grandchildPid = Number(fs.readFileSync(pidFile, "utf8"));
+        expect(Number.isSafeInteger(grandchildPid)).toBe(true);
+        const parentPgid = Number(
+          execFileSync("ps", ["-o", "pgid=", "-p", String(parent.pid)], { encoding: "utf8" }),
+        );
+        const childPgid = Number(
+          execFileSync("ps", ["-o", "pgid=", "-p", String(grandchildPid)], { encoding: "utf8" }),
+        );
+        expect(childPgid).toBe(grandchildPid);
+        expect(parentPgid).not.toBe(childPgid);
+        await expect(verifyPidCommand(grandchildPid, [token])).resolves.toBe(true);
+
+        await runBudgetedShutdown({
+          totalTimeoutMs: 10_000,
+          child: parent,
+          stdin: parent.stdin,
+          stopDetachedChildren: () => Promise.resolve([{ pid: grandchildPid, matchers: [token] }]),
+        });
+        expect(parent.exitCode).toBe(0);
+        await expect(verifyPidCommand(grandchildPid, [token])).resolves.toBe(false);
+      } finally {
+        if (parent.exitCode === null && parent.signalCode === null && parent.pid) {
+          try {
+            process.kill(-parent.pid, "SIGKILL");
+          } catch {
+            // The graceful path already exited.
+          }
+        }
+        if (grandchildPid > 0) {
+          try {
+            process.kill(grandchildPid, "SIGKILL");
+          } catch {
+            // The shutdown helper already reaped it.
+          }
         }
       }
-      if (grandchildPid > 0) {
-        try {
-          process.kill(grandchildPid, "SIGKILL");
-        } catch {
-          // The shutdown helper already reaped it.
-        }
-      }
-    }
-  }, 15_000);
+    },
+    15_000,
+  );
 });
 
 describe("prepareControlledPiAgentHome", () => {
@@ -1035,13 +1039,17 @@ describe("prepareControlledPiAgentHome", () => {
       token: "secret",
     });
     expectIsolatedRouting(home);
-    expect(fs.lstatSync(path.join(home.piAgentDir, "auth.json")).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32")
+      expect(fs.lstatSync(path.join(home.piAgentDir, "auth.json")).mode & 0o777).toBe(0o600);
     expect(
       JSON.parse(fs.readFileSync(path.join(home.geminiHome!, "oauth_creds.json"), "utf8")),
     ).toEqual({
       access: "secret",
     });
-    expect(fs.lstatSync(path.join(home.geminiHome!, "oauth_creds.json")).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32")
+      expect(fs.lstatSync(path.join(home.geminiHome!, "oauth_creds.json")).mode & 0o777).toBe(
+        0o600,
+      );
     expect(home.env.AGY_ACP_FORCE_FILE_STORAGE).toBe("1");
     expectNoSymlinks(home.piAgentDir);
     expectNoSymlinks(home.geminiHome!);

@@ -265,7 +265,8 @@ describe("ReportJournalStore", () => {
       boardState: "applied",
       leadDelivery: { state: "sent_to_pi", acceptedByPiAt: 1_700_000_000_100 },
     });
-    expect(fs.statSync(path.join(projectDir, "inbox.json")).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32")
+      expect(fs.statSync(path.join(projectDir, "inbox.json")).mode & 0o777).toBe(0o600);
   });
 
   it("upgrades legacy sequence numbers and keeps a larger durable high-water mark", () => {

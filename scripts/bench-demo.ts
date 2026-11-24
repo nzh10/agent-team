@@ -152,10 +152,15 @@ export function ensureWebviewBuilt(force = false, quiet = false): void {
     if (srcMtime > builtMtime) needsBuild = true;
   }
   if (!needsBuild) return;
-  const out = execFileSync("npm", ["run", "build", "-w", "webview"], {
-    cwd: ROOT,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const npm = process.env.npm_execpath;
+  const out = execFileSync(
+    npm ? process.execPath : "npm",
+    [...(npm ? [npm] : []), "run", "build", "-w", "webview"],
+    {
+      cwd: ROOT,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   if (!quiet && out.length > 0) {
     process.stderr.write(out);
   }
@@ -362,6 +367,53 @@ export async function runDemoBrowserSuite(
       state: "visible",
       timeout: 10_000,
     });
+
+    for (const { label, file, line, end } of seeded.fileLinks) {
+      const [response] = await Promise.all([
+        page.waitForResponse(
+          (r) => {
+            const url = new URL(r.url());
+            return (
+              url.pathname === "/api/file" &&
+              r.request().method() === "GET" &&
+              url.searchParams.get("ws") === seeded!.workspaces.past &&
+              path.normalize(url.searchParams.get("path") ?? "") === file
+            );
+          },
+          { timeout: 10_000 },
+        ),
+        page.locator(".messages .file-ref", { hasText: label }).click({ timeout: 5000 }),
+      ]);
+      assert(response.ok(), `File preview returned ${response.status()} for ${label}`);
+      const marker = fs.readFileSync(file, "utf8").split("\n")[line - 1];
+      const code = page.locator(".files-panel .code-text", { hasText: marker });
+      await code.waitFor();
+      assert(
+        (await code.textContent())?.split("\n")[line - 1] === marker,
+        `Missing ${label} target line`,
+      );
+      const viewer = page.locator(".files-panel .code-view");
+      const [view, mark, text] = await Promise.all([
+        viewer.boundingBox(),
+        viewer.locator(".code-mark").boundingBox(),
+        code.boundingBox(),
+      ]);
+      const lineHeight = await page.evaluate<number>(
+        'parseFloat(getComputedStyle(document.querySelector(".files-panel .code-text")).lineHeight)',
+      );
+      assert(
+        view &&
+          mark &&
+          text &&
+          mark.y >= view.y &&
+          mark.y < view.y + view.height &&
+          mark.y - text.y === (line - 1) * lineHeight &&
+          mark.height === (end - line + 1) * lineHeight,
+        `Incorrect highlight for ${label}: ${JSON.stringify({ view, mark, text, lineHeight })}`,
+      );
+      await page.locator('aside.side-panel button[aria-label^="Close"]').click();
+    }
+    journeysVerified.push("archived-reply-file-links");
 
     // Global history search across all workspaces (including archived).
     const searchInput = page.locator(".search-bar input");

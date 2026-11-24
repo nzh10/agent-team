@@ -137,7 +137,7 @@ function ok(script: string, args: string[], extraEnv?: NodeJS.ProcessEnv, cwd?: 
   return result.stdout;
 }
 
-it.each([true, false])(
+it.skipIf(process.platform === "win32").each([true, false])(
   "schedules a separate launchd controller (bootstrap succeeds: %s)",
   (success) => {
     const darwin = { YAAT_SERVICE_OS: "Darwin" };
@@ -231,7 +231,7 @@ function traces() {
   return readFileSync(trace, "utf8");
 }
 
-describe("setup-prereqs.sh", () => {
+describe.skipIf(process.platform === "win32")("setup-prereqs.sh", () => {
   it("finds nvm in a minimal env without running npm, Pi, or installer commands during --check", () => {
     executable(bin, "node", "echo v24.1.0");
     const agentDir = join(home, ".pi", "agent");
@@ -278,7 +278,7 @@ describe("setup-prereqs.sh", () => {
   });
 });
 
-describe("yaat-service.sh and start-server.sh", () => {
+describe.skipIf(process.platform === "win32")("yaat-service.sh and start-server.sh", () => {
   it.each(["Linux", "Darwin"])(
     "pins the verified runtime for %s without starting a service",
     (os) => {
@@ -376,7 +376,7 @@ describe("yaat-service.sh and start-server.sh", () => {
   });
 });
 
-describe("runtime-paths.sh version managers", () => {
+describe.skipIf(process.platform === "win32")("runtime-paths.sh version managers", () => {
   const installArgs = ["install", "--no-start", "--no-build", "--no-auth"];
 
   it.each(["directory", "files"])(
@@ -502,7 +502,7 @@ esac`,
   });
 });
 
-describe("yaat-service.sh install-deps", () => {
+describe.skipIf(process.platform === "win32")("yaat-service.sh install-deps", () => {
   it("uses the requested instance pins instead of the caller's runtime without changing the instance", () => {
     const instance = join(home, "installed instance");
     ok("yaat-service", [
@@ -558,7 +558,7 @@ describe("yaat-service.sh install-deps", () => {
   });
 });
 
-describe("deploy-deferred.sh", () => {
+describe.skipIf(process.platform === "win32")("deploy-deferred.sh", () => {
   it("uses the installed runtime for deploys from a different PATH", () => {
     install();
     const otherDir = join(root, "other");

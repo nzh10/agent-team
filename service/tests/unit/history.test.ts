@@ -204,7 +204,7 @@ describe("the search index", () => {
     expect(await find(history, "giraffe")).toEqual([]);
     // Private, its side files too.
     for (const f of [historyIndexFile(base), `${historyIndexFile(base)}-wal`]) {
-      expect(fs.statSync(f).mode & 0o077).toBe(0);
+      if (process.platform !== "win32") expect(fs.statSync(f).mode & 0o077).toBe(0);
     }
   });
 

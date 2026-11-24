@@ -7,7 +7,7 @@ import * as os from "node:os";
 import { PassThrough, Writable } from "node:stream";
 import { piReply } from "./pi-wire";
 import { seededPng } from "./pixel";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, vi } from "vitest";
 import type { SessionConfig, StreamEvent } from "../../src/session/types";
 import { PiSession } from "../../src/session/pi";
@@ -70,7 +70,9 @@ export function listFixtures(backend: Backend): string[] {
 }
 
 export async function loadFixture(backend: Backend, name: string): Promise<Fixture> {
-  const mod = (await import(path.join(SNAP_DIR, backend, `${name}.ts`))) as { default: Fixture };
+  const mod = (await import(pathToFileURL(path.join(SNAP_DIR, backend, `${name}.ts`)).href)) as {
+    default: Fixture;
+  };
   return mod.default;
 }
 

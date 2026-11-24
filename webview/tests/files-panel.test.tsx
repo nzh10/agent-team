@@ -446,17 +446,13 @@ describe("file references in replies", () => {
       </FileOpenContext.Provider>,
     );
 
-  it("opens inline code that names a file, and local links", () => {
+  it("opens inline code that names a file but not a method", () => {
     const open = vi.fn();
-    const { container } = md(
-      "Fixed in `service/src/index.ts:1182`, see [notes](/tmp/notes.md). Call `ws.send`.",
-      open,
-    );
+    const { container } = md("Fixed in `service/src/index.ts:1182`. Call `ws.send`.", open);
     const refs = [...container.querySelectorAll(".file-ref")];
-    expect(refs.map((r) => r.textContent)).toEqual(["service/src/index.ts:1182", "notes"]);
+    expect(refs.map((r) => r.textContent)).toEqual(["service/src/index.ts:1182"]);
     fireEvent.click(refs[0]);
-    fireEvent.click(refs[1]);
-    expect(open.mock.calls).toEqual([["service/src/index.ts:1182"], ["/tmp/notes.md"]]);
+    expect(open.mock.calls).toEqual([["service/src/index.ts:1182"]]);
   });
 
   const refs = (text: string) => {

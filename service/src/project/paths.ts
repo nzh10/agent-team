@@ -35,11 +35,12 @@ export function resolveProjectPath(
 // resolveProjectPath to the same file.
 export function boardRef(abs: string, root: string | null, notesDir: string): string {
   for (const notes of [notesDir, realOr(notesDir)]) {
-    if (within(notes, abs)) return path.join("notes", path.relative(notes, abs));
+    if (within(notes, abs))
+      return path.join("notes", path.relative(notes, abs)).split(path.sep).join("/");
   }
   for (const repo of root ? [root, realOr(root)] : []) {
     if (!within(repo, abs)) continue;
-    const rel = path.relative(repo, abs) || ".";
+    const rel = path.relative(repo, abs).split(path.sep).join("/") || ".";
     return /^(notes|~)(\/|$)/.test(rel) ? `./${rel}` : rel;
   }
   return abs;

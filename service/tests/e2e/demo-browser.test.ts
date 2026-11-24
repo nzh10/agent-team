@@ -26,6 +26,7 @@ describe("full-stack Demo Browser E2E + Performance Benchmark", () => {
     console.log(`\n${formatBenchmarkTable(result)}\n`);
 
     expect(result.journeysVerified).toEqual([
+      "archived-reply-file-links",
       "hydration-sidebar-archive-search",
       "workspace-switch-history-git-indicators",
       "side-panels-files-diff-asklines-agents",

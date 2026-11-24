@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { lsofBinary } from "../lsof";
 
-describe("lsofBinary", () => {
+describe.skipIf(process.platform === "win32")("lsofBinary", () => {
   const dirs: string[] = [];
   const origPath = process.env.PATH;
 
