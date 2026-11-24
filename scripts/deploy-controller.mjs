@@ -10,15 +10,25 @@ const exec = promisify(execFile);
 const keys = ["pid", "bootId", "installedRepoDir", "label", "port", "baseDir", "releaseId"];
 const generation = /^gen-[a-zA-Z0-9-]+$/;
 const jobId = /^[a-zA-Z0-9-]{1,80}$/;
-const artifacts = [
+const baselineArtifacts = [
   "server.js",
   "history-worker.js",
+  "webview/index.html",
+  "webview/manifest.webmanifest",
+];
+const artifacts = [
+  ...baselineArtifacts,
   "pi-panel-bridge.ts",
   "pi-quota.ts",
   "quota-schema.ts",
   "acp-readiness.ts",
-  "webview/index.html",
-  "webview/manifest.webmanifest",
+  "quota/antigravity.ts",
+  "quota/kimi-coding.ts",
+  "quota/oauth.ts",
+  "quota/openai-codex.ts",
+  "quota/pi-adapters.ts",
+  "quota/pi-context.ts",
+  "quota/registry.ts",
 ];
 
 function atomicJson(file, value) {
@@ -102,18 +112,120 @@ function pointer(root, name, release) {
   fs.renameSync(temporary, path.join(root, name));
 }
 
-function current(root) {
-  const file = path.join(root, "current");
-  if (!fs.lstatSync(file, { throwIfNoEntry: false })) return "legacy";
+function readPointer(root, name) {
+  const file = path.join(root, name);
+  if (!fs.lstatSync(file, { throwIfNoEntry: false })) return null;
   const release = fs.readlinkSync(file);
   if (!generation.test(release) || !fs.lstatSync(path.join(root, release)).isDirectory())
-    throw new Error("Invalid current release pointer");
+    throw new Error(`Invalid ${name} release pointer`);
   return release;
 }
 
-function validateArtifacts(dir) {
-  for (const file of artifacts)
-    if (!fs.lstatSync(path.join(dir, file)).isFile())
+function current(root) {
+  return readPointer(root, "current") ?? "legacy";
+}
+
+// Run under the same checkout lock as stage/cutover. A job is deletable only
+// with explicit terminal status; absence or an unreadable status never proves
+// completion. The grace period leaves its diagnostics available for a day.
+export async function gcReleases({
+  root,
+  now = Date.now(),
+  listProcesses = async () => {
+    const { stdout } = await exec("/bin/ps", ["-ww", "-axo", "pid=,command="], {
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    if (!stdout.trim()) throw new Error("Could not enumerate live release processes");
+    return stdout;
+  },
+}) {
+  root = fs.realpathSync(root);
+  ownerOnly(root);
+  if (fs.lstatSync(path.join(root, "transaction.json"), { throwIfNoEntry: false }))
+    throw new Error("Unresolved cutover: do not prune until recovery is complete");
+  const currentRelease = readPointer(root, "current");
+  const previous = readPointer(root, "previous");
+  const protectedReleases = new Set([currentRelease, previous]);
+  const verified = new Map();
+  const jobs = path.join(root, "jobs");
+  ownerOnly(jobs);
+  const finished = new Map();
+  for (const item of fs.readdirSync(jobs, { withFileTypes: true })) {
+    const { name } = item;
+    if (!item.isDirectory() || !jobId.test(name)) continue;
+    const file = path.join(jobs, name, "status.json");
+    const ownReleases = [`gen-${name}`, `gen-${name}-prior`];
+    try {
+      const info = fs.lstatSync(file);
+      if (!info.isFile()) throw new Error("invalid job status");
+      const status = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (status.id !== name || status.recoveryRequired) throw new Error("job not proven finished");
+      const healthy =
+        status.phase === "succeeded"
+          ? [status.candidate, status.prior]
+          : status.phase === "rolled_back"
+            ? [status.prior]
+            : [];
+      for (const release of healthy) {
+        if (
+          typeof release === "string" &&
+          generation.test(release) &&
+          release !== currentRelease &&
+          fs.lstatSync(path.join(root, release), { throwIfNoEntry: false })?.isDirectory()
+        ) {
+          verified.set(release, Math.max(info.mtimeMs, verified.get(release) ?? 0));
+        }
+      }
+      if (
+        ["succeeded", "rolled_back", "failed", "cancelled", "timed_out"].includes(status.phase) &&
+        now - info.mtimeMs >= 86_400_000
+      ) {
+        finished.set(name, ownReleases);
+        continue;
+      }
+    } catch {
+      /* Not proven finished. */
+    }
+    for (const release of ownReleases) protectedReleases.add(release);
+  }
+  // After a rollback both pointers can name the same generation. Retain a
+  // known-good fallback, never a newer build that failed verification.
+  if (!previous || previous === currentRelease) {
+    const newestVerified = [...verified].sort((a, b) => b[1] - a[1])[0];
+    if (newestVerified) protectedReleases.add(newestVerified[0]);
+  }
+  // start-server execs the absolute physical release path. Read the full
+  // command line, on both launchd and systemd, without relying on a manager's
+  // single MainPID (an old or independently launched process can outlive it).
+  const processes = await listProcesses();
+  const removed = { releases: [], jobs: [] };
+  for (const [id, releases] of finished) {
+    for (const release of releases) {
+      if (
+        protectedReleases.has(release) ||
+        processes.includes(`${path.join(root, release)}${path.sep}`)
+      )
+        continue;
+      const dir = path.join(root, release);
+      if (!fs.lstatSync(dir, { throwIfNoEntry: false })?.isDirectory()) continue;
+      fs.rmSync(dir, { recursive: true });
+      removed.releases.push(release);
+    }
+    // Keep ownership records while any associated generation may become
+    // collectible later. Jobs with no staged directory can be removed now.
+    if (
+      releases.some((release) => fs.lstatSync(path.join(root, release), { throwIfNoEntry: false }))
+    )
+      continue;
+    fs.rmSync(path.join(jobs, id), { recursive: true });
+    removed.jobs.push(id);
+  }
+  return removed;
+}
+
+function validateArtifacts(dir, manifest = artifacts) {
+  for (const file of manifest)
+    if (!fs.lstatSync(path.join(dir, file), { throwIfNoEntry: false })?.isFile())
       throw new Error(`Missing release artifact: ${file}`);
 }
 
@@ -300,7 +412,7 @@ export async function deploy({
       validateArtifacts(directory);
       if (before === "legacy" && !stopping()) {
         const source = path.join(target.installedRepoDir, "dist");
-        validateArtifacts(source);
+        validateArtifacts(source, baselineArtifacts);
         fs.cpSync(source, path.join(root, prior), {
           recursive: true,
           errorOnExist: true,
@@ -447,7 +559,7 @@ export async function deploy({
 
 async function main() {
   const [cmd, repoArg, id, seconds] = process.argv.slice(2);
-  if (!jobId.test(id ?? "")) throw new Error("Invalid deploy ID");
+  if (cmd !== "gc" && !jobId.test(id ?? "")) throw new Error("Invalid deploy ID");
   const repo = fs.realpathSync(repoArg);
   const control = path.join(repo, ".agent-team");
   fs.mkdirSync(control, { recursive: true, mode: 0o700 });
@@ -456,6 +568,7 @@ async function main() {
   ownerOnly(root);
   const jobs = path.join(root, "jobs");
   ownerOnly(jobs);
+  if (cmd === "gc") return console.log(JSON.stringify(await gcReleases({ root })));
   const job = path.join(jobs, id);
   if (cmd === "prepare") {
     fs.mkdirSync(job, { mode: 0o700 });

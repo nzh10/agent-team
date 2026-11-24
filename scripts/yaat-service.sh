@@ -55,6 +55,7 @@ Commands:
   deploy-deferred --when-idle --timeout <sec>  Stage and schedule a safe deploy (systemd or launchd)
   deploy-status <id>        Show deferred deployment state
   deploy-cancel <id>        Cancel before cutover
+  deploy-gc                 Prune finished staging jobs and unused generations older than one day
   deploy-deferred [delay]   Legacy disruptive deploy for an unstaged instance
   uninstall                 Remove service registration (preserves base dir data)
 
@@ -1016,6 +1017,15 @@ cmd_deploy_job() {
   run_cmd "$YAAT_NODE_BIN" "$REPO_DIR/scripts/deploy-controller.mjs" "$1" "$REPO_DIR" "$EXTRA_ARGS"
 }
 
+cmd_deploy_gc() {
+  runtime_load_pins "$BASE_DIR"
+  runtime_require_node
+  if [ "$DRY_RUN" -eq 0 ]; then
+    deploy_lock || die 'Another deploy holds the release lock'
+  fi
+  run_cmd "$YAAT_NODE_BIN" "$REPO_DIR/scripts/deploy-controller.mjs" gc "$REPO_DIR"
+}
+
 cmd_deploy_deferred() {
   if [ "$WHEN_IDLE" -eq 1 ]; then cmd_deploy_safe; return; fi
   local delay="${EXTRA_ARGS:-10}"
@@ -1097,6 +1107,9 @@ case "$SUBCOMMAND" in
     ;;
   deploy-status)
     cmd_deploy_job status
+    ;;
+  deploy-gc)
+    cmd_deploy_gc
     ;;
   deploy-cancel)
     cmd_deploy_job cancel
