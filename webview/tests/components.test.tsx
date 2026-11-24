@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { render, fireEvent, act } from "@testing-library/react";
 import { SubAgentItem, StepGroup, MessageItem, CreateWorkspaceDialog } from "../src/App";
 import { HostInfo } from "../src/state/useServer";
@@ -471,7 +471,15 @@ describe("CreateWorkspaceDialog", () => {
   });
 });
 
-describe("MessageItem queued state", () => {
+describe("MessageItem delivery state", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const advance = (ms: number) => {
+    act(() => {
+      vi.advanceTimersByTime(ms);
+    });
+  };
   const agents: AgentInfo[] = [
     { id: "a1", name: "Alice", model: "m", avatar: "A", color: "#888", isDefault: true },
   ];
@@ -484,6 +492,75 @@ describe("MessageItem queued state", () => {
     status: "queued",
     queuedFor: "a1",
   };
+
+  const view = (status: Message["status"], queuedFor = "a1") => (
+    <MessageItem msg={{ ...queuedMsg, status, queuedFor }} agents={agents} />
+  );
+
+  it.each([
+    ["starting", "done"],
+    ["dispatching", "done"],
+    ["dispatching", "error"],
+  ] as const)("does not flash a status when %s settles quickly to %s", (pending, settled) => {
+    const { container, rerender } = render(view(pending));
+    const status = () => container.querySelector('[role="status"], [role="alert"], .queued-badge');
+    expect(status()).toBeNull();
+    advance(349);
+    expect(status()).toBeNull();
+    rerender(view(settled));
+    expect(vi.getTimerCount()).toBe(0);
+    advance(350);
+    expect(status()).toBeNull();
+  });
+
+  it.each([
+    ["a1", "Starting Alice…"],
+    ["missing", "Starting agent…"],
+  ])(
+    "shows delayed startup copy for target %s and changes to Sending… without hiding",
+    (id, label) => {
+      const { container, getByRole, queryByRole, rerender } = render(view("starting", id));
+      expect(queryByRole("status")).toBeNull();
+      advance(350);
+      const inline = getByRole("status");
+      expect(inline.closest(".message-header")).not.toBeNull();
+      expect(inline.textContent?.trim()).toBe(label);
+      expect(container.querySelector(".queued-badge, .queued-cancel, .delivery-status")).toBeNull();
+
+      rerender(view("dispatching", id));
+      expect(getByRole("status")).toBe(inline);
+      expect(inline.textContent?.trim()).toBe("Sending…");
+      expect(container.querySelector(".queued-badge, .queued-cancel, .delivery-status")).toBeNull();
+      rerender(view("done"));
+      expect(queryByRole("status")).toBeNull();
+    },
+  );
+
+  it("carries time spent starting into dispatch and clears a later timer on unmount", () => {
+    const { getByRole, queryByRole, rerender, unmount } = render(view("starting"));
+    advance(200);
+    rerender(view("dispatching"));
+    advance(149);
+    expect(queryByRole("status")).toBeNull();
+    advance(1);
+    expect(getByRole("status").textContent?.trim()).toBe("Sending…");
+
+    rerender(view("queued"));
+    rerender(view("dispatching"));
+    expect(queryByRole("status")).toBeNull();
+    expect(vi.getTimerCount()).toBe(1);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shows the outcome-unknown alert immediately instead of a pending indicator", () => {
+    const { getByRole, queryByRole, rerender } = render(view("dispatching"));
+    rerender(view("outcome_unknown"));
+    const alert = getByRole("alert");
+    expect(alert.matches(".delivery-status.delivery-outcome-unknown")).toBe(true);
+    expect(alert.textContent).toContain("Delivery outcome unknown.");
+    expect(queryByRole("status")).toBeNull();
+  });
 
   it("renders a queued badge, dims the message, and cancels via the badge", () => {
     const onCancelQueued = vi.fn();

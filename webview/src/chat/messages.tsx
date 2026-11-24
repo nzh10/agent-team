@@ -1050,6 +1050,23 @@ function systemAvatar(content: string): [string | null, string] {
   return m ? [m[1], m[2]] : [null, content];
 }
 
+const DELIVERY_STATUS_DELAY_MS = 350;
+
+function PendingDeliveryStatus({ label }: { label: string }) {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setVisible(true), DELIVERY_STATUS_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  if (!visible) return null;
+  return (
+    <span className="delivery-inline" role="status">
+      <span className="streaming-dot" aria-hidden="true" /> {label}
+    </span>
+  );
+}
+
 export const MessageItem = memo(function MessageItem({
   user = DEFAULT_USER,
   msg,
@@ -1116,16 +1133,21 @@ export const MessageItem = memo(function MessageItem({
   const from = isUser ? msg.from : undefined;
   const agent = !isUser ? agents.find((a) => a.id === msg.agentId) : null;
   const streaming = msg.status === "streaming";
+  const deliveryLabel = !isUser
+    ? null
+    : msg.status === "starting"
+      ? `Starting ${agents.find((a) => a.id === msg.queuedFor)?.name || "agent"}…`
+      : msg.status === "dispatching"
+        ? "Sending…"
+        : null;
   const deliveryClass =
     msg.status === "queued"
       ? " message-queued"
-      : msg.status === "dispatching"
-        ? " message-dispatching"
-        : msg.status === "outcome_unknown"
-          ? " message-outcome-unknown"
-          : msg.status === "error"
-            ? " message-error"
-            : "";
+      : msg.status === "outcome_unknown"
+        ? " message-outcome-unknown"
+        : msg.status === "error"
+          ? " message-error"
+          : "";
   const events = msg.events ?? [];
   const detailEvents = events.filter(
     (e) => e.kind !== "text" && e.kind !== "text_delta" && e.kind !== "thinking_delta",
@@ -1258,7 +1280,9 @@ export const MessageItem = memo(function MessageItem({
                         {originLabel(from)}
                       </button>
                     ) : (
-                      <span className="message-author user-author">{user.name}</span>
+                      <span className="message-author user-author" title={user.name}>
+                        {user.name}
+                      </span>
                     )}
                     {msg.status === "queued" && (
                       <span
@@ -1287,6 +1311,11 @@ export const MessageItem = memo(function MessageItem({
                   </>
                 ) : null}
                 <span className="message-time">{time}</span>
+                {isUser && msg.status !== "queued" && (
+                  <span className="delivery-inline-slot">
+                    {deliveryLabel && <PendingDeliveryStatus key={msg.id} label={deliveryLabel} />}
+                  </span>
+                )}
                 {streaming && <span className="streaming-dot" />}
                 {!streaming && quoteButton}
               </div>
@@ -1300,12 +1329,6 @@ export const MessageItem = memo(function MessageItem({
             )}
             {!isUser && <MessageStatus msg={msg} />}
 
-            {(msg.status === "starting" || msg.status === "dispatching") && (
-              <div className="delivery-status delivery-dispatching" role="status">
-                <span className="streaming-dot" />{" "}
-                {msg.status === "starting" ? "Starting the agent…" : "Sending to the agent…"}
-              </div>
-            )}
             {msg.status === "outcome_unknown" && (
               <div className="delivery-status delivery-outcome-unknown" role="alert">
                 <strong>Delivery outcome unknown.</strong> The agent may still process this message.

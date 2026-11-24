@@ -777,23 +777,16 @@ describe("Project v2", () => {
 });
 
 describe("stream and message rendering", () => {
-  it("shows dispatching and outcome_unknown as distinct delivery states", () => {
-    const base: Message = {
+  it("warns that a message with an unknown delivery outcome will not be sent again", () => {
+    const msg: Message = {
       id: "m1",
       kind: "user",
       agentId: null,
       content: "do the work",
       timestamp: NOW,
-      status: "dispatching",
+      status: "outcome_unknown",
     };
-    const sending = render(<MessageItem msg={base} agents={[agent]} />);
-    expect(sending.getByRole("status").textContent).toContain("Sending to the agent");
-    expect(sending.container.querySelector(".message-dispatching")).not.toBeNull();
-    sending.unmount();
-
-    const unknown = render(
-      <MessageItem msg={{ ...base, status: "outcome_unknown" }} agents={[agent]} />,
-    );
+    const unknown = render(<MessageItem msg={msg} agents={[agent]} />);
     expect(unknown.getByRole("alert").textContent).toMatch(/may still process this message/i);
     expect(unknown.getByRole("alert").textContent).toMatch(/will not resend it automatically/i);
     expect(unknown.container.querySelector(".message-outcome-unknown")).not.toBeNull();

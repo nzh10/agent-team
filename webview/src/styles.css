@@ -1091,7 +1091,8 @@ button {
   color: var(--accent);
 }
 .message-model,
-.message-time {
+.message-time,
+.delivery-inline-slot {
   font-size: 10.5px;
   color: var(--text-muted);
   white-space: nowrap;
@@ -1105,6 +1106,36 @@ button {
   animation: pulse 1s infinite;
   flex-shrink: 0;
   align-self: center;
+}
+/* Keep delivery on one row and reserve room before the label appears. */
+.message-user:not(.message-queued) .message-header {
+  flex-wrap: nowrap;
+}
+.message-user:not(.message-queued) .user-author {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.delivery-inline-slot {
+  flex: 1 1 0;
+  min-width: min(85px, 35%);
+}
+.delivery-inline {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.delivery-inline .streaming-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  vertical-align: middle;
+}
+@media (prefers-reduced-motion: reduce) {
+  .delivery-inline .streaming-dot {
+    animation: none;
+  }
 }
 .compact-header {
   display: flex;
@@ -5911,11 +5942,6 @@ button.quote-bar-content:focus-visible {
   border-radius: var(--radius-sm);
   font-size: 12px;
   line-height: 1.45;
-}
-.delivery-dispatching {
-  border: 1px solid var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent-hover);
 }
 .delivery-outcome-unknown {
   display: block;
