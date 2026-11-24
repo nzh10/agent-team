@@ -29,7 +29,7 @@ Run installation from a shell where your preferred Node 26+ and Pi are available
 
 ### Diagnose a new installation
 
-Open **Service diagnostics** in the sidebar for the running service's effective settings and last model probe. **JSON** exposes the same report to an agent (`GET api/diagnostics`, with the panel's normal authentication). Each issue gives a stage, stable code, effective value/source, affected capability, and next step. Proxy values and provider credentials are not printed.
+Open **Service diagnostics** in the sidebar for the running service's effective settings and last model probe. Unhealthy or degraded installations show diagnostics directly; when the service is healthy, add `?debug=1` to the panel URL to show the diagnostics link. **JSON** exposes the same report to an agent (`GET api/diagnostics`, with the panel's normal authentication). Each issue gives a stage, stable code, effective value/source, affected capability, and next step. Proxy values are not printed.
 
 After building, you can diagnose an instance even if the service did not start:
 
@@ -118,6 +118,8 @@ The job builds into `.agent-team/releases/<generation>` using the installed runt
 
 `deploy-status` shows the job phase and aggregate blockers. The transient service journal contains build output. Job state and the rollback journal are under `.agent-team/releases/`. If `recoveryRequired` is true, inspect `transaction.json`, `current`, and the target unit before taking manual action. A boot from an unfinished transaction does not admit work; clear the journal only after you verify the intended release and unit are healthy. No staged release is automatically deleted.
 
+Run `./scripts/yaat-service.sh deploy-gc` in the installed checkout to prune staging jobs finished at least a day ago and their unused generations. It keeps the current and rollback generations, any generation still used by a running process, and unfinished jobs. An unresolved cutover blocks pruning.
+
 Custom supervisors and Linux without a systemd user bus do not support `--when-idle`. The legacy `deploy` and `deploy-deferred [sec]` commands are disruptive and are only available before a release is staged. They do not provide the idle or rollback guarantees.
 
 ---
@@ -150,6 +152,7 @@ To register a separate background service for dev, pass distinct `--label`, `--p
 | `deploy`                                      | Optional `--verify`, build (unless `--no-build`), restart, `health --wait 15`                             |
 | `deploy-deferred --when-idle --timeout <sec>` | Stage and deploy at quiescence (Linux systemd / macOS launchd)                                            |
 | `deploy-status <id>` / `deploy-cancel <id>`   | Inspect or cancel a deferred job before cutover                                                           |
+| `deploy-gc`                                   | Prune old finished staging jobs and unused generations without a restart                                  |
 | `deploy-deferred [sec]`                       | Legacy disruptive deployment for an unstaged service                                                      |
 | `uninstall`                                   | Unload and remove service file; preserves `~/.yaat` data                                                  |
 
