@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { App } from "../../src/App";
 import type { AgentInfo, Message } from "../../src/state/useServer";
 import { FakeSocket } from "../fakeSocket";
@@ -67,7 +67,7 @@ function connect(sock: FakeSocket, workspaces = [ws]) {
     });
   });
 }
-async function boot(tail: Message[] = [], workspaces = [ws]) {
+async function boot(tail: Message[] = [], workspaces = [ws], hasMore = false) {
   await page.viewport(390, 760);
   localStorage.clear();
   FakeSocket.instances = [];
@@ -82,7 +82,7 @@ async function boot(tail: Message[] = [], workspaces = [ws]) {
   const receive = (frame: object) => {
     act(() => sock.receive({ workspaceId: "w", ...frame }));
   };
-  receive({ type: "workspace_messages", messages: [...history, ...tail], hasMore: false });
+  receive({ type: "workspace_messages", messages: [...history, ...tail], hasMore });
   const scroll = get(".messages");
   expect(scroll.clientHeight).toBeGreaterThan(350);
   expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
@@ -124,6 +124,172 @@ it("follows a growing tail only until the reader moves up, and resumes at the bo
   move(scroll, scroll.scrollHeight);
   await grow();
   await bottom(scroll);
+});
+
+function reply(i: number, messageId: string) {
+  return turn(i, {
+    kind: "user",
+    forwardRef: {
+      messageId,
+      fromAgent: agent.name,
+      fromAvatar: agent.avatar,
+      preview: "Quoted reply",
+    },
+  });
+}
+
+function expectInView(scroll: HTMLElement, target: HTMLElement) {
+  const viewport = scroll.getBoundingClientRect();
+  const rect = target.getBoundingClientRect();
+  expect(rect.top).toBeGreaterThanOrEqual(viewport.top);
+  expect(rect.bottom).toBeLessThanOrEqual(viewport.bottom);
+}
+
+it("jumps within the transcript without clearing search or being pulled back by streaming", async () => {
+  const live = turn(20, { status: "streaming", content: "Working" });
+  const { scroll, sock, receive } = await boot([reply(18, "m3"), reply(19, "m8"), live]);
+  const search = get<HTMLInputElement>('input[placeholder="Search messages…"]');
+  fireEvent.change(search, { target: { value: "keep this search" } });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const advance = (ms: number) => {
+    void act(() => vi.advanceTimersByTime(ms));
+  };
+  const first = get("#msg-m3");
+  const second = get("#msg-m8");
+
+  fireEvent.click(get("#msg-m18 .forward-ref-icon"));
+  advance(100);
+  expect(first.matches(".message-highlight")).toBe(true);
+  expectInView(scroll, first);
+  advance(900);
+  fireEvent.click(get("#msg-m19 .forward-ref-preview"));
+  advance(100);
+  expect(first.matches(".message-highlight")).toBe(false);
+  expect(second.matches(".message-highlight")).toBe(true);
+  expectInView(scroll, second);
+  expect(search.value).toBe("keep this search");
+  expect(sock.frames().filter((frame) => frame.type === "load_messages")).toHaveLength(1);
+
+  await nextPaint();
+  const oldHeight = scroll.scrollHeight;
+  const top = scroll.scrollTop;
+  receive({
+    type: "stream_event",
+    messageId: live.id,
+    event: { kind: "text_delta", content: "\n\nAnother paragraph at the streaming tail." },
+  });
+  await vi.waitFor(() => expect(scroll.scrollHeight).toBeGreaterThan(oldHeight));
+  expect(scroll.scrollTop).toBe(top);
+  advance(1_000); // The first highlight would now have expired.
+  expect(second.matches(".message-highlight")).toBe(true);
+  advance(900);
+  expect(second.matches(".message-highlight")).toBe(false);
+});
+
+it("pages back to a quote and recovers from a reference missing from history", async () => {
+  const { scroll, sock, receive } = await boot(
+    [reply(18, "m-2"), reply(19, "deleted"), reply(20, "m3")],
+    [ws],
+    true,
+  );
+  fireEvent.click(get("#msg-m18 .forward-ref"));
+  const first = turn(-1);
+  expect(sock.frames().at(-1)).toMatchObject({
+    type: "load_messages",
+    before: history[0].timestamp,
+  });
+  receive({
+    type: "workspace_messages",
+    before: history[0].timestamp,
+    messages: [first],
+    hasMore: true,
+  });
+  expect(sock.frames().at(-1)).toMatchObject({ type: "load_messages", before: first.timestamp });
+  receive({
+    type: "workspace_messages",
+    before: first.timestamp,
+    messages: [turn(-2)],
+    hasMore: false,
+  });
+  await expect.poll(() => get("#msg-m-2").matches(".message-highlight")).toBe(true);
+  await expect.poll(() => scroll.scrollTop).toBe(0);
+  expectInView(scroll, get("#msg-m-2"));
+
+  const sent = sock.frames().length;
+  fireEvent.click(get("#msg-m19 .forward-ref"));
+  expect(document.querySelector(".message-highlight")).toBeNull();
+  expect(sock.frames()).toHaveLength(sent);
+  expect(scroll.scrollTop).toBe(0);
+  fireEvent.click(get("#msg-m20 .forward-ref"));
+  await expect.poll(() => get("#msg-m3").matches(".message-highlight")).toBe(true);
+});
+
+it("keeps the visible history anchored when paging cannot find a quote", async () => {
+  const { scroll, receive } = await boot([reply(18, "deleted")], [ws], true);
+  scroll.style.overflowAnchor = "none";
+  move(scroll, 360);
+  fireEvent.click(get("#msg-m18 .forward-ref"));
+  move(scroll, 500);
+  const target = get("#msg-m5");
+  const top = target.getBoundingClientRect().top;
+  receive({
+    type: "workspace_messages",
+    before: history[0].timestamp,
+    messages: [turn(-2), turn(-1)],
+    hasMore: false,
+  });
+  await nextPaint();
+  expect(get("#msg-m-2")).toBeTruthy();
+  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
+  expect(document.querySelector(".message-highlight")).toBeNull();
+});
+
+it("keeps a quote from another workspace visible without paging unrelated history", async () => {
+  const { sock, receive } = await boot([], [ws, { ...ws, id: "other", name: "Other workspace" }]);
+  fireEvent.click(get("#msg-m3 .btn-quote"));
+  expect(get("button.quote-bar-content")).toBeTruthy();
+  fireEvent.click(get(".mobile-menu-btn"));
+  const row = [...document.querySelectorAll<HTMLElement>(".task-item")].find((item) =>
+    item.textContent?.includes("Other workspace"),
+  )!;
+  fireEvent.click(row);
+  receive({
+    type: "workspace_messages",
+    workspaceId: "other",
+    messages: [turn(100)],
+    hasMore: true,
+  });
+  const sent = sock.frames().length;
+  const preview = get("div.quote-bar-content");
+  expect(preview.textContent).toContain("Reply 3");
+  fireEvent.click(preview);
+  expect(sock.frames()).toHaveLength(sent);
+});
+
+it("jumps from the composer preview and closes the quote without a second jump", async () => {
+  const { scroll } = await boot();
+  const target = get("#msg-m3");
+  fireEvent.click(get("#msg-m3 .btn-quote"));
+  const preview = get("button.quote-bar-content");
+  const close = get("button.quote-bar-close");
+  expect(preview.nextElementSibling).toBe(close);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  preview.focus();
+  await userEvent.keyboard("{Enter}");
+  void act(() => vi.advanceTimersByTime(100));
+  expect(target.matches(".message-highlight")).toBe(true);
+  expect(document.activeElement).toBe(target);
+  expectInView(scroll, target);
+  expect(get(".quote-bar-content")).toBe(preview);
+  void act(() => vi.advanceTimersByTime(1900));
+  expect(target.matches(".message-highlight")).toBe(false);
+
+  move(scroll, scroll.scrollHeight);
+  fireEvent.click(close);
+  void act(() => vi.advanceTimersByTime(100));
+  expect(document.querySelector(".quote-bar")).toBeNull();
+  expect(target.matches(".message-highlight")).toBe(false);
+  expect(gap(scroll)).toBeLessThanOrEqual(1);
 });
 
 it("keeps the opened step in view when its details arrive and the composer grows", async () => {

@@ -263,6 +263,46 @@ describe("MessageItem", () => {
     expect(who.querySelector("img")!.getAttribute("src")).toBe("avatars/Alice.jpg");
   });
 
+  it("jumps from the reference button, its arrow, and its preview", () => {
+    const onJumpToMessage = vi.fn();
+    const reply = msg({
+      kind: "user",
+      forwardRef: {
+        messageId: "original",
+        fromAgent: "Alice",
+        fromAvatar: "A",
+        preview: "the answer",
+      },
+    });
+    const { getByRole, getByText } = render(
+      <MessageItem msg={reply} agents={agents} onJumpToMessage={onJumpToMessage} />,
+    );
+    const ref = getByRole("button", { name: "Jump to quoted message from Alice: the answer" });
+    expect(ref.getAttribute("type")).toBe("button");
+    fireEvent.click(ref);
+    fireEvent.click(getByText("↩"));
+    fireEvent.click(getByText("the answer"));
+    expect(onJumpToMessage.mock.calls).toEqual([["original"], ["original"], ["original"]]);
+  });
+
+  it.each([
+    ["missing handler", "original", undefined],
+    ["empty ID", "", vi.fn()],
+  ])("keeps a static preview with %s", (_, messageId, onJumpToMessage) => {
+    const reply = msg({
+      kind: "user",
+      forwardRef: { messageId, fromAgent: "Alice", fromAvatar: "A", preview: "the answer" },
+    });
+    const { container, queryByRole } = render(
+      <MessageItem msg={reply} agents={agents} onJumpToMessage={onJumpToMessage} />,
+    );
+    const ref = container.querySelector("div.forward-ref")!;
+    expect(ref.textContent).toContain("the answer");
+    expect(queryByRole("button", { name: /jump to quoted message/i })).toBeNull();
+    fireEvent.click(ref);
+    if (onJumpToMessage) expect(onJumpToMessage).not.toHaveBeenCalled();
+  });
+
   it("wires cancel through to the owning agent", () => {
     const onCancelSubagent = vi.fn();
     const events: StreamEvent[] = [sa({ status: "running" })];

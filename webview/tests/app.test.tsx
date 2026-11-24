@@ -309,7 +309,7 @@ describe("search jumps", () => {
     act(() => {
       vi.advanceTimersByTime(100);
     });
-    expect(scrollIntoView).toHaveBeenLastCalledWith({ behavior: "smooth", block: "center" });
+    expect(scrollIntoView).toHaveBeenLastCalledWith({ behavior: "instant", block: "center" });
   });
 
   it("is dropped when the reader leaves the workspace before it lands", () => {

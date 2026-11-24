@@ -2503,6 +2503,31 @@ button.action-target:hover {
 }
 
 /* Quote bar and forwarded reference */
+:where(button).forward-ref,
+button.quote-bar-content {
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+button.forward-ref {
+  width: 100%;
+}
+button.forward-ref:hover,
+button.quote-bar-content:hover {
+  background: color-mix(in srgb, var(--text-primary) 6%, var(--bg-secondary));
+}
+button.forward-ref:active,
+button.quote-bar-content:active {
+  background: color-mix(in srgb, var(--text-primary) 10%, var(--bg-secondary));
+}
+button.forward-ref:focus-visible,
+button.quote-bar-content:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 .forward-ref {
   display: flex;
   align-items: center;

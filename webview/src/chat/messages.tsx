@@ -1057,6 +1057,7 @@ export const MessageItem = memo(function MessageItem({
   compact,
   highlight,
   onQuote,
+  onJumpToMessage,
   onLoadSubagentEvents,
   onCancelSubagent,
   onCancelQueued,
@@ -1070,6 +1071,7 @@ export const MessageItem = memo(function MessageItem({
   highlight?: boolean;
   onOpenWorkspace?: (workspaceId: string) => void;
   onQuote?: (msg: Message) => void;
+  onJumpToMessage?: (messageId: string) => void;
   onLoadSubagentEvents?: (messageId: string, taskId: string) => void;
   onCancelSubagent?: (agentId: string, taskId: string) => void;
   onCancelQueued?: (messageId: string) => void;
@@ -1204,11 +1206,16 @@ export const MessageItem = memo(function MessageItem({
       </button>
     ) : null;
 
+  const forward = msg.forwardRef;
+  const jump = forward?.messageId && onJumpToMessage;
+  const ForwardRef = jump ? "button" : "div";
+
   return (
     <SessionLinkContext.Provider value={sessionLinks}>
       <TurnRunningContext.Provider value={streaming}>
         <div
           id={`msg-${msg.id}`}
+          tabIndex={-1}
           className={`message${isUser ? " message-user" : " message-agent"}${compact ? " message-compact" : ""}${highlight ? " message-highlight" : ""}${deliveryClass}`}
         >
           <div className="message-gutter">
@@ -1306,23 +1313,28 @@ export const MessageItem = memo(function MessageItem({
               </div>
             )}
 
-            {msg.forwardRef && (
-              <div className="forward-ref">
+            {forward && (
+              <ForwardRef
+                className="forward-ref"
+                {...(jump && {
+                  type: "button" as const,
+                  title: "Jump to quoted message",
+                  "aria-label": `Jump to quoted message from ${forward.fromAgent}: ${forward.preview}`,
+                  onClick: () => jump(forward.messageId),
+                })}
+              >
                 <span className="forward-ref-icon">↩</span>
                 <span className="forward-ref-agent">
                   <Avatar
-                    avatar={msg.forwardRef.fromAvatar}
-                    color={
-                      agents.find((a) => a.name === msg.forwardRef!.fromAgent)?.color ??
-                      "transparent"
-                    }
-                    name={msg.forwardRef.fromAgent}
+                    avatar={forward.fromAvatar}
+                    color={agents.find((a) => a.name === forward.fromAgent)?.color ?? "transparent"}
+                    name={forward.fromAgent}
                     size={16}
                   />
-                  {msg.forwardRef.fromAgent}
+                  {forward.fromAgent}
                 </span>
-                <span className="forward-ref-preview">{msg.forwardRef.preview}</span>
-              </div>
+                <span className="forward-ref-preview">{forward.preview}</span>
+              </ForwardRef>
             )}
 
             {msg.images && msg.images.length > 0 && (

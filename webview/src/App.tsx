@@ -410,15 +410,27 @@ export function App() {
   const composingRef = useRef(false);
   const compositionEndTsRef = useRef(0);
 
+  const activeWsIdRef = useRef(activeWsId);
+  activeWsIdRef.current = activeWsId;
   const [quotedMsg, setQuotedMsg] = useState<{
     id: string;
+    wsId: string;
     agentId: string | null;
     content: string;
     from?: MessageOrigin;
   } | null>(null);
 
   const handleQuote = useCallback((msg: Message) => {
-    setQuotedMsg({ id: msg.id, agentId: msg.agentId, content: msg.content, from: msg.from });
+    const wsId = activeWsIdRef.current;
+    if (wsId) {
+      setQuotedMsg({
+        wsId,
+        id: msg.id,
+        agentId: msg.agentId,
+        content: msg.content,
+        from: msg.from,
+      });
+    }
   }, []);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -831,18 +843,47 @@ export function App() {
   // null = query in flight (debounce or awaiting the server echo).
   const searchHits = searchResults.query === searchQuery.trim() ? searchResults.hits : null;
 
-  // A search hit to scroll to once its message is loaded; older pages are
-  // fetched until it is (the loaded window must stay contiguous).
+  // Fetch older pages until the jump target is loaded, keeping history contiguous.
   const [pendingJump, setPendingJump] = useState<{
     wsId: string;
     msgId: string;
     pages: number;
+    fromSearch: boolean;
   } | null>(null);
-  const jumpToMessage = useCallback((wsId: string, msgId: string) => {
-    setActiveWsId(wsId);
-    setSearchQuery("");
-    setPendingJump({ wsId, msgId, pages: 0 });
+  const jumpScrollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const jumpHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const cancelJumpTimers = useCallback(() => {
+    clearTimeout(jumpScrollTimerRef.current);
+    clearTimeout(jumpHighlightTimerRef.current);
   }, []);
+  useLayoutEffect(() => {
+    setHighlightMsgId(null);
+    return cancelJumpTimers;
+  }, [activeWsId, cancelJumpTimers]);
+
+  const startJump = useCallback(
+    (wsId: string, msgId: string, fromSearch: boolean) => {
+      cancelJumpTimers();
+      setHighlightMsgId(null);
+      setPendingJump({ wsId, msgId, pages: 0, fromSearch });
+    },
+    [cancelJumpTimers],
+  );
+  const jumpToMessage = useCallback(
+    (wsId: string, msgId: string) => {
+      setActiveWsId(wsId);
+      setSearchQuery("");
+      startJump(wsId, msgId, true);
+    },
+    [startJump],
+  );
+  const jumpToMessageInActiveWs = useCallback(
+    (msgId: string) => {
+      const wsId = activeWsIdRef.current;
+      if (wsId) startJump(wsId, msgId, false);
+    },
+    [startJump],
+  );
 
   useEffect(() => {
     if (activeWsId) {
@@ -881,6 +922,8 @@ export function App() {
     userScrolledUpRef.current = false;
     stuckToBottomRef.current = true;
     prevMsgCountRef.current = 0;
+    jumpScrollTopRef.current = null;
+    anchorRef.current = null;
     requestAnimationFrame(() => {
       messagesEndRef.current?.scrollIntoView();
     });
@@ -909,32 +952,21 @@ export function App() {
   const anchorRef = useRef<{ wsId: string; firstId: string; height: number; top: number } | null>(
     null,
   );
+  const rememberHistoryAnchor = useCallback((wsId: string, firstId: string) => {
+    const el = messagesContainerRef.current;
+    if (el) anchorRef.current = { wsId, firstId, height: el.scrollHeight, top: el.scrollTop };
+  }, []);
   const onMessagesScroll = useCallback(() => {
     const el = messagesContainerRef.current;
     if (!el || !activeWs || activeWs.loadingOlder) return;
     if (el.scrollTop < 80 && activeWs.hasMore) {
       const oldest = activeWs.messages[0];
       if (oldest) {
-        anchorRef.current = {
-          wsId: activeWs.id,
-          firstId: oldest.id,
-          height: el.scrollHeight,
-          top: el.scrollTop,
-        };
+        rememberHistoryAnchor(activeWs.id, oldest.id);
         loadMessages(activeWs.id, oldest.timestamp);
       }
     }
-  }, [activeWs, loadMessages]);
-
-  const firstMsgId = activeWs?.messages[0]?.id;
-  useLayoutEffect(() => {
-    const a = anchorRef.current;
-    const el = messagesContainerRef.current;
-    if (!a || !el || !activeWs || a.wsId !== activeWs.id) return;
-    if (firstMsgId === a.firstId) return;
-    anchorRef.current = null;
-    el.scrollTop = a.top + (el.scrollHeight - a.height);
-  }, [firstMsgId, activeWs]);
+  }, [activeWs, loadMessages, rememberHistoryAnchor]);
 
   const prevMsgCountRef = useRef(0);
   const userScrolledUpRef = useRef(false);
@@ -943,11 +975,22 @@ export function App() {
   // frame, far less than "scrolled up"); the very bottom takes hold again.
   const stuckToBottomRef = useRef(true);
   const lastScrollTopRef = useRef(0);
+  const jumpScrollTopRef = useRef<number | null>(null);
   const wasStreamingRef = useRef(false);
 
   const onMessagesScrollTrack = useCallback(() => {
     const el = messagesContainerRef.current;
     if (!el) return;
+    const anchor = anchorRef.current;
+    if (anchor && anchor.wsId === activeWsIdRef.current) {
+      // Keep the reader's latest position if they scroll while a page is in flight.
+      anchor.height = el.scrollHeight;
+      anchor.top = el.scrollTop;
+    }
+    // A jump is not a request to reattach to the bottom or load another page.
+    const jumpTop = jumpScrollTopRef.current;
+    jumpScrollTopRef.current = null;
+    if (jumpTop === el.scrollTop) return;
     const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     userScrolledUpRef.current = distFromBottom > 150;
     if (distFromBottom <= 8) stuckToBottomRef.current = true;
@@ -991,6 +1034,13 @@ export function App() {
     const streaming = msgs.some((m) => m.status === "streaming");
     const wasStreaming = wasStreamingRef.current;
     wasStreamingRef.current = streaming;
+    const anchor = anchorRef.current;
+    const el = messagesContainerRef.current;
+    if (anchor && el && anchor.wsId === activeWs?.id && msgs[0]?.id !== anchor.firstId) {
+      anchorRef.current = null;
+      el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+      return;
+    }
     if (prevCount === 0 && msgs.length > 0) {
       messagesEndRef.current?.scrollIntoView();
     } else if (msgs.length > prevCount) {
@@ -998,10 +1048,9 @@ export function App() {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
       }
     } else if (stuckToBottomRef.current && (streaming || wasStreaming)) {
-      const el = messagesContainerRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     }
-  }, [activeWs?.messages]);
+  }, [activeWs?.id, activeWs?.messages]);
 
   useEffect(() => {
     const jump = pendingJump;
@@ -1015,27 +1064,34 @@ export function App() {
     if (activeWs.messages.some((m) => m.id === jump.msgId)) {
       setPendingJump(null);
       setHighlightMsgId(jump.msgId);
-      setTimeout(() => {
-        document
-          .getElementById(`msg-${jump.msgId}`)
-          ?.scrollIntoView({ behavior: "smooth", block: "center" });
-        setTimeout(() => setHighlightMsgId(null), 2000);
+      jumpScrollTimerRef.current = setTimeout(() => {
+        const target = document.getElementById(`msg-${jump.msgId}`);
+        const scroller = messagesContainerRef.current;
+        if (!target || !scroller?.contains(target)) return;
+        userScrolledUpRef.current = true;
+        stuckToBottomRef.current = false;
+        const before = scroller.scrollTop;
+        if (!jump.fromSearch) target.focus({ preventScroll: true });
+        target.scrollIntoView({ behavior: "instant", block: "center" });
+        const after = scroller.scrollTop;
+        lastScrollTopRef.current = after;
+        if (after !== before) jumpScrollTopRef.current = after;
       }, 100);
+      jumpHighlightTimerRef.current = setTimeout(() => setHighlightMsgId(null), 2000);
       return;
     }
     if (activeWs.loadingOlder) return;
     const oldest = activeWs.messages[0];
     if (activeWs.hasMore && oldest && jump.pages < JUMP_MAX_PAGES) {
-      // Prepended pages must not pull the view back to the bottom.
-      userScrolledUpRef.current = true;
-      stuckToBottomRef.current = false;
+      // Keep the viewport anchored in case the target never turns up.
+      rememberHistoryAnchor(activeWs.id, oldest.id);
       loadMessages(activeWs.id, oldest.timestamp, JUMP_PAGE);
       setPendingJump({ ...jump, pages: jump.pages + 1 });
     } else {
       setPendingJump(null);
-      setNotice("That message is no longer in the history.");
+      if (jump.fromSearch) setNotice("That message is no longer in the history.");
     }
-  }, [pendingJump, activeWsId, activeWs, loadMessages]);
+  }, [pendingJump, activeWsId, activeWs, loadMessages, rememberHistoryAnchor]);
 
   const isAnyRunning = activeWs?.agents.some(isAgentActive) ?? false;
   const hasAgents = (activeWs?.agents.length ?? 0) > 0;
@@ -1139,8 +1195,6 @@ export function App() {
 
   // From the board: open the project's lead with the objective named in the
   // composer, ready for the question.
-  const activeWsIdRef = useRef(activeWsId);
-  activeWsIdRef.current = activeWsId;
   const askLead = useCallback(
     (objectiveId: string) => {
       const project = projectsRef.current.find((p) => p.id === boardProjectId);
@@ -1571,6 +1625,7 @@ export function App() {
                               compact={compact}
                               highlight={msg.id === highlightMsgId}
                               onQuote={handleQuote}
+                              onJumpToMessage={jumpToMessageInActiveWs}
                               onLoadSubagentEvents={onLoadSubagentEvents}
                               onCancelSubagent={onCancelSubagent}
                               onCancelQueued={onCancelQueued}
@@ -1601,10 +1656,27 @@ export function App() {
               <div className="input-area">
                 {quotedMsg &&
                   (() => {
-                    const qa = activeWs.agents.find((a) => a.id === quotedMsg.agentId);
+                    const canJump = quotedMsg.wsId === activeWs.id;
+                    const QuotePreview = canJump ? "button" : "div";
+                    const qa = workspaces
+                      .find((ws) => ws.id === quotedMsg.wsId)
+                      ?.agents.find((a) => a.id === quotedMsg.agentId);
+                    const author =
+                      qa?.name ?? (quotedMsg.from ? originLabel(quotedMsg.from) : "User");
+                    const preview =
+                      quotedMsg.content.slice(0, 100) +
+                      (quotedMsg.content.length > 100 ? "..." : "");
                     return (
                       <div className="quote-bar">
-                        <div className="quote-bar-content">
+                        <QuotePreview
+                          className="quote-bar-content"
+                          {...(canJump && {
+                            type: "button" as const,
+                            title: "Jump to quoted message",
+                            "aria-label": `Jump to quoted message from ${author}: ${preview}`,
+                            onClick: () => jumpToMessageInActiveWs(quotedMsg.id),
+                          })}
+                        >
                           <span className="quote-bar-agent">
                             {qa ? (
                               <AgentAvatar agent={qa} size={16} />
@@ -1613,14 +1685,16 @@ export function App() {
                             ) : (
                               "👤"
                             )}{" "}
-                            {qa?.name ?? (quotedMsg.from ? originLabel(quotedMsg.from) : "User")}
+                            {author}
                           </span>
-                          <span className="quote-bar-preview">
-                            {quotedMsg.content.slice(0, 100)}
-                            {quotedMsg.content.length > 100 ? "..." : ""}
-                          </span>
-                        </div>
-                        <button className="quote-bar-close" onClick={() => setQuotedMsg(null)}>
+                          <span className="quote-bar-preview">{preview}</span>
+                        </QuotePreview>
+                        <button
+                          type="button"
+                          className="quote-bar-close"
+                          title="Remove quote"
+                          onClick={() => setQuotedMsg(null)}
+                        >
                           ✕
                         </button>
                       </div>
