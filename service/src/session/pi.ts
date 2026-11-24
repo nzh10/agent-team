@@ -157,6 +157,15 @@ function firstSessionRecord(file: string): Json {
   }
 }
 
+interface BlockState {
+  content: string;
+  startedAt: number;
+  ended?: boolean;
+  kind?: "text" | "thinking" | "toolcall";
+  emittedTextLength: number;
+  thinkingEndedAt?: number;
+}
+
 interface Turn {
   steer?: { input: BoundarySteer; wireText: string; claimed: boolean; observed: boolean };
   id: string;
@@ -168,7 +177,9 @@ interface Turn {
   started: boolean;
   accepted: boolean;
   startedAt: number;
-  blocks: Map<number, { content: string; startedAt: number; ended?: boolean }>;
+  blocks: Map<number, BlockState>;
+  replyTextLength: number;
+  messageBaseOffset: number;
   tools: Map<string, { name: string; args: Json; startedAt: number; emitted: boolean }>;
   subagents: Map<
     string,
@@ -205,6 +216,8 @@ function newTurn(generation: number, envelope?: PromptEnvelope): Turn {
     accepted: false,
     startedAt: Date.now(),
     blocks: new Map(),
+    replyTextLength: 0,
+    messageBaseOffset: 0,
     tools: new Map(),
     subagents: new Map(),
     finalText: "",
@@ -849,6 +862,11 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   private finishSteer(turn: Turn, outcome: Parameters<BoundarySteer["finish"]>[0]): void {
     const steer = turn.steer;
     delete turn.steer;
+    if (outcome === "read") {
+      turn.replyTextLength = 0;
+      turn.messageBaseOffset = 0;
+      for (const block of turn.blocks.values()) block.emittedTextLength = 0;
+    }
     if (steer?.claimed) steer.input.finish(outcome);
   }
 
@@ -1043,6 +1061,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     switch (event.type) {
       case "message_start":
         if (msg.role === "assistant") {
+          turn.messageBaseOffset = turn.replyTextLength;
           turn.blocks.clear();
           turn.finalText = "";
           turn.error = undefined;
@@ -1160,8 +1179,15 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   private updateMessage(turn: Turn, update: Json): void {
     const index = num(update.contentIndex);
     if (index === undefined) return;
-    const block = turn.blocks.get(index) ?? { content: "", startedAt: Date.now() };
+    const now = Date.now();
+    for (const [otherIndex, other] of turn.blocks) {
+      if (otherIndex !== index && other.kind === "thinking" && !other.ended)
+        other.thinkingEndedAt ??= now;
+    }
+    const block = turn.blocks.get(index) ?? { content: "", startedAt: now, emittedTextLength: 0 };
     turn.blocks.set(index, block);
+    const kind = String(update.type).split("_", 1)[0];
+    if (kind === "text" || kind === "thinking" || kind === "toolcall") block.kind ??= kind;
     switch (update.type) {
       case "thinking_start":
         this.event({ kind: "thinking_delta", content: "", startedAt: block.startedAt });
@@ -1170,6 +1196,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       case "thinking_delta": {
         const delta = text(update.delta) ?? "";
         block.content += delta;
+        if (update.type === "text_delta") {
+          block.emittedTextLength += delta.length;
+          turn.replyTextLength += delta.length;
+        }
         this.event({
           kind: update.type,
           content: delta,
@@ -1184,13 +1214,26 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
         const streamed = block.content;
         block.content = text(update.content) ?? streamed;
         if (update.type === "text_end") {
-          if (block.content.startsWith(streamed) && streamed.length < block.content.length)
-            this.event({ kind: "text_delta", content: block.content.slice(streamed.length) });
+          if (block.content.startsWith(streamed) && streamed.length < block.content.length) {
+            const delta = block.content.slice(streamed.length);
+            block.emittedTextLength += delta.length;
+            turn.replyTextLength += delta.length;
+            this.event({ kind: "text_delta", content: delta });
+          }
           this.event({ kind: "text", content: block.content });
         } else {
-          const durationMs = Date.now() - block.startedAt;
+          const durationMs = Math.max(0, (block.thinkingEndedAt ?? now) - block.startedAt);
+          const contentOffset =
+            turn.messageBaseOffset +
+            [...turn.blocks].reduce(
+              (offset, [otherIndex, other]) =>
+                otherIndex < index && other.kind === "text"
+                  ? offset + other.emittedTextLength
+                  : offset,
+              0,
+            );
           this.event({ kind: "thinking_delta", content: "", durationMs });
-          this.event({ kind: "thinking", content: block.content, durationMs });
+          this.event({ kind: "thinking", content: block.content, durationMs, contentOffset });
         }
         break;
       }

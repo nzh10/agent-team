@@ -972,7 +972,10 @@ export class Workspace {
         this.streamed(msg, event);
       } else {
         const msg = this.ensureAgentMsg(entry);
-        event.contentOffset = msg.content.length;
+        event.contentOffset =
+          event.contentOffset != null && Number.isFinite(event.contentOffset)
+            ? Math.min(Math.max(0, event.contentOffset), msg.content.length)
+            : msg.content.length;
         msg.events!.push(event);
         this.streamed(msg, event);
       }

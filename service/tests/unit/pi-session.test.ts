@@ -245,6 +245,22 @@ function confirmed(cfg: SessionConfig): SessionState {
   };
 }
 
+function assistantUpdate(type: string, contentIndex: number, fields: Record<string, unknown> = {}) {
+  return {
+    ...piFrame("message_update"),
+    assistantMessageEvent: { type, contentIndex, ...fields },
+  };
+}
+
+function assistantStart() {
+  return piFrame("message_start", { role: "assistant" });
+}
+
+function assistantEnd(content: Array<Record<string, unknown>>, stopReason = "stop") {
+  const frame = piFrame("message_end", { role: "assistant" });
+  return { ...frame, message: { ...frame.message, content, stopReason } };
+}
+
 describe("Pi boundary steering", () => {
   async function setup() {
     const h = harness();
@@ -312,6 +328,35 @@ describe("Pi boundary steering", () => {
     h.client.event(piFrame("message_update", { update: "text_end" }));
     expect(replies).toEqual({ A: "initial", B: "xxxxx" });
     expect(h.finish.mock.calls).toEqual([["read"]]);
+  });
+
+  it("resets a delayed thinking offset when the steered input is read", async () => {
+    const h = await setup();
+    const c = h.client;
+    c.event(assistantStart());
+    c.event(assistantUpdate("text_delta", 0, { delta: "before" }));
+    const handoff = h.boundary();
+    const frame = await h.write();
+    c.respond(frame, { disposition: "queued" });
+    await handoff;
+    const user = piFrame("message_end", { role: "user" });
+    c.event({
+      ...user,
+      message: { ...user.message, content: [{ type: "text", text: frame.message }] },
+    });
+    c.event(assistantStart());
+    c.event(assistantUpdate("thinking_start", 0));
+    // The start belongs to the new reply, but only its first nonempty delta
+    // proves that Pi read the steer and splits the panel message.
+    c.event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    c.event(assistantUpdate("text_start", 1));
+    c.event(assistantUpdate("text_delta", 1, { delta: "after" }));
+    c.event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    c.event(assistantUpdate("text_end", 1, { content: "after" }));
+    expect(h.finish).toHaveBeenCalledExactlyOnceWith("read");
+    expect(h.events.filter((event) => event.kind === "thinking")).toEqual([
+      expect.objectContaining({ content: "plan", contentOffset: 0 }),
+    ]);
   });
 
   it.each(["read", "interrupted", "crash", "rejected", "handled"])(
@@ -1095,6 +1140,177 @@ describe("PiSession dispatch and stream state", () => {
       ["thinking_delta", 10000, undefined],
       ["thinking_delta", undefined, 7000],
       ["thinking", undefined, 7000],
+    ]);
+  });
+
+  it("places delayed openai-completions thinking before text and freezes its duration", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    event(assistantUpdate("thinking_start", 0));
+    clock.mockReturnValue(1_500);
+    event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    clock.mockReturnValue(2_000);
+    event(assistantUpdate("text_start", 1));
+    clock.mockReturnValue(3_000);
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    clock.mockReturnValue(4_000);
+    event(assistantUpdate("thinking_delta", 0, { delta: "late" }));
+    clock.mockReturnValue(9_000);
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    clock.mockReturnValue(10_000);
+    event(assistantUpdate("text_end", 1, { content: "Answer" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "plan",
+      contentOffset: 0,
+      durationMs: 1_000,
+    });
+    expect(events.filter((entry) => entry.kind === "thinking_delta").at(-1)).toMatchObject({
+      content: "",
+      durationMs: 1_000,
+    });
+  });
+
+  it("places message-end-only thinking before already streamed text", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    event(
+      assistantEnd([
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "Answer" },
+      ]),
+    );
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "plan",
+      contentOffset: 0,
+    });
+  });
+
+  it("bases a later assistant message's thinking offset after earlier reply text", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    const first = "First.";
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("text_delta", 0, { delta: "Fir" }));
+    event(assistantUpdate("text_end", 0, { content: first }));
+    event(assistantUpdate("toolcall_start", 1, { id: "call-1", toolName: "read" }));
+    event(
+      assistantUpdate("toolcall_end", 1, {
+        toolCall: { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      }),
+    );
+    event({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: {},
+    });
+    event({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      result: { content: [], details: {} },
+    });
+    event(
+      assistantEnd(
+        [
+          { type: "text", text: first },
+          { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+        ],
+        "toolUse",
+      ),
+    );
+    event(assistantStart());
+    event(assistantUpdate("thinking_start", 0));
+    event(assistantUpdate("thinking_delta", 0, { delta: "next plan" }));
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Second" }));
+    event(assistantUpdate("thinking_end", 0, { content: "next plan" }));
+    event(assistantUpdate("text_end", 1, { content: "Second" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      content: "next plan",
+      contentOffset: first.length,
+    });
+  });
+
+  it("keeps early thinking_end duration and ordering unchanged", async () => {
+    const { session, clients, events } = harness();
+    await session.send("stream");
+    const { event } = clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    event(assistantUpdate("thinking_start", 0));
+    clock.mockReturnValue(1_700);
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    clock.mockReturnValue(2_000);
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    expect(events.find((entry) => entry.kind === "thinking")).toMatchObject({
+      contentOffset: 0,
+      durationMs: 700,
+    });
+  });
+
+  it("preserves delayed thinking offsets through Workspace aggregation", async () => {
+    const h = harness();
+    const { ws } = workspaceFor(h, {});
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    await ws.sendMessage("stream", agent.id);
+    const { event } = h.clients[0];
+    event({ type: "agent_start" });
+    event(assistantStart());
+    event(assistantUpdate("thinking_start", 0));
+    event(assistantUpdate("thinking_delta", 0, { delta: "plan" }));
+    event(assistantUpdate("text_start", 1));
+    event(assistantUpdate("text_delta", 1, { delta: "Answer" }));
+    event(assistantUpdate("toolcall_start", 2, { id: "call-1", toolName: "read" }));
+    event({
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "read",
+      args: {},
+    });
+    event(assistantUpdate("thinking_end", 0, { content: "plan" }));
+    event(assistantUpdate("text_end", 1, { content: "Answer" }));
+    event(
+      assistantUpdate("toolcall_end", 2, {
+        toolCall: { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      }),
+    );
+    event({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      result: { content: [], details: {} },
+    });
+    event(
+      assistantEnd([
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "Answer" },
+        { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+      ]),
+    );
+    event({ type: "agent_settled" });
+    const reply = ws.getMessages().find((msg) => msg.kind === "agent");
+    expect(reply).toMatchObject({ content: "Answer", status: "done" });
+    expect(
+      reply?.events?.map((entry) => ({
+        kind: entry.kind,
+        contentOffset: entry.contentOffset,
+      })),
+    ).toEqual([
+      { kind: "tool_use", contentOffset: 6 },
+      { kind: "thinking", contentOffset: 0 },
     ]);
   });
 
