@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { PanelApi } from "../../src/project/tools";
 import {
@@ -32,14 +33,13 @@ import {
 import {
   assertNoEmptyEnum,
   forGeminiSchema,
-  jsonSchemaToTypeBox,
   zodShapeToRestrictedJsonSchema,
   type RestrictedJsonSchema,
 } from "../../src/session/panel-schema";
 
 const piRequire = createRequire(localPiBinary ?? __filename);
 const subagents = localPiBinary && discoverLocalPiPackages().piSubagentsRoot;
-const { Type } = piRequire("typebox") as typeof import("typebox");
+import piPanelBridge from "../../src/session/pi-panel-bridge";
 const { Value } = piRequire("typebox/value") as typeof import("typebox/value");
 
 const servers: PanelHttpServer[] = [];
@@ -47,6 +47,7 @@ const clients: PiRpcClient[] = [];
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const client of clients.splice(0)) {
     await runBudgetedShutdown({
       totalTimeoutMs: 5_000,
@@ -172,8 +173,36 @@ function sampleFor(schema: RestrictedJsonSchema): unknown {
   }
 }
 
+async function registerParameters(
+  tools: PanelTool[],
+): Promise<Map<string, import("typebox").TSchema>> {
+  const { server, baseUrl } = await createPanelServer();
+  const key = "schema-test";
+  const token = server.registerSession({
+    sessionKey: key,
+    getToolset: () => ({ instructions: "", tools }),
+  });
+  vi.stubEnv("YAAT_PANEL_URL", baseUrl);
+  vi.stubEnv("YAAT_PANEL_TOKEN", token);
+  vi.stubEnv("YAAT_PANEL_KEY", key);
+  const schemas = new Map<string, import("typebox").TSchema>();
+  const hooks = new Map<string, (event: object) => Promise<void>>();
+  const api = {
+    on: (name: string, hook: (event: object) => Promise<void>) => hooks.set(name, hook),
+    events: { on: () => () => {} },
+    getAllTools: () => [],
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+    registerTool: (tool: { name: string; parameters: import("typebox").TSchema }) =>
+      schemas.set(tool.name, tool.parameters),
+  };
+  piPanelBridge(api as unknown as Parameters<typeof piPanelBridge>[0]);
+  await hooks.get("before_agent_start")!({});
+  return schemas;
+}
+
 describe("panel schema bridge", () => {
-  it("preserves every real panel tool constraint through Gemini and Pi TypeBox", () => {
+  it("registers Gemini-compatible TypeBox parameters for every production tool", async () => {
     const api = new Proxy({} as PanelApi, {
       get: () => () => {
         throw new Error("Schema tests must not invoke tool handlers");
@@ -191,12 +220,17 @@ describe("panel schema bridge", () => {
       for (const tool of toolset.tools) tools.set(tool.name, tool);
     }
     expect(tools.size).toBe(28);
+    const parametersByTool = await registerParameters([...tools.values()]);
+    expect(parametersByTool.size).toBe(tools.size);
 
     for (const [name, tool] of tools) {
       const schema = zodShapeToRestrictedJsonSchema(tool.shape);
       expect(schema.additionalProperties).toBe(false);
       const sample = sampleFor(schema);
-      const parameters = jsonSchemaToTypeBox(schema, Type);
+      const parameters = parametersByTool.get(name)!;
+      expect(parameters, name).toMatchObject({ type: "object", additionalProperties: false });
+      expect(JSON.stringify(parameters), name).not.toContain('"const":""');
+      assertNoEmptyEnum(parameters);
       expect(
         Value.Check(parameters, sample),
         `${name}: TypeBox rejected ${JSON.stringify(sample)}`,
@@ -206,10 +240,6 @@ describe("panel schema bridge", () => {
         parsed.success,
         `${name}: ${parsed.success ? "" : z.prettifyError(parsed.error)}`,
       ).toBe(true);
-
-      const gemini = forGeminiSchema(schema);
-      assertNoEmptyEnum(gemini);
-      expect(Value.Check(jsonSchemaToTypeBox(gemini, Type), sample), name).toBe(true);
     }
 
     const evidence = zodShapeToRestrictedJsonSchema({
@@ -221,14 +251,25 @@ describe("panel schema bridge", () => {
     expect(gemini.properties!.evidence.description).toContain('One of "R", "V", ""');
   });
 
-  it("supports nullable, defaults, integer bounds, arrays, and strict nested objects", () => {
-    const schema = zodShapeToRestrictedJsonSchema({
+  it("registers nullable, defaults, integer bounds, arrays, and strict nested objects", async () => {
+    const shape = {
+      evidence: z.enum(["R", "V", ""]).optional(),
       count: z.number().int().min(2).max(4),
       note: z.string().nullable(),
       mode: z.enum(["a", "b"]).default("a"),
       rows: z.array(z.object({ id: z.string(), flag: z.boolean().optional() }).strict()),
+    };
+    const parameters = (
+      await registerParameters([
+        { name: "limits", description: "Limits", shape, handler: () => Promise.resolve("") },
+      ])
+    ).get("limits")!;
+    expect(parameters.properties).toMatchObject({
+      mode: { default: "a" },
+      evidence: { type: "string" },
     });
-    const parameters = jsonSchemaToTypeBox(schema, Type);
+    const evidence = (parameters.properties as Record<string, { description?: string }>).evidence;
+    expect(evidence.description).toContain('One of "R", "V", ""');
     const valid = { count: 2, note: null, rows: [{ id: "r1" }] };
     expect(Value.Check(parameters, valid)).toBe(true);
     expect(z.object({ count: z.number().int().min(2).max(4) }).parse({ count: 2 })).toEqual({
@@ -303,6 +344,7 @@ async function startRealPi(options: {
   additionalExtension?: string;
   onQuota?: (snapshot: QuotaSnapshot) => void;
   extraEnv?: Record<string, string>;
+  extensionDir?: string;
 }): Promise<RealPiFixture> {
   const { server, baseUrl } = await createPanelServer();
   const key = `real-${clients.length + 1}`;
@@ -325,13 +367,16 @@ async function startRealPi(options: {
   });
   const home = prepareControlledPiAgentHome({
     mode: "test-synthetic",
-    packages: subagents ? [subagents] : [],
+    packages: !options.extensionDir && subagents ? [subagents] : [],
   });
   temporaryDirectories.push(home.piAgentDir, home.geminiHome!, home.env.PI_SUBAGENTS_TEMP_ROOT);
   const cwd = options.sessionFile
     ? path.dirname(options.sessionFile)
     : temporaryDirectory("panel-pi-cwd-");
-  const bridge = path.resolve(__dirname, "../../src/session/pi-panel-bridge.ts");
+  const bridge = path.join(
+    options.extensionDir ?? path.resolve(__dirname, "../../src/session"),
+    "pi-panel-bridge.ts",
+  );
   const cleanEnv = { ...process.env };
   delete cleanEnv.PI_SUBAGENT_PARENT_SESSION;
   delete cleanEnv.PI_SUBAGENT_CHILD;
@@ -375,20 +420,48 @@ async function startRealPi(options: {
     Boolean(home.resolvedPackages.piSubagentsRoot && home.resolvedPackages.piAntigravityEntryPath),
   );
   await waitUntil(() => server.isControlConnected(key), 10_000);
-  if (subagents && !report.subagentsRpcReady) {
+  const hasSubagents = Boolean(home.resolvedPackages.piSubagentsRoot);
+  if (hasSubagents && !report.subagentsRpcReady) {
     const diagnostic = await server.sendSubagentsRpc(key, "ping");
     throw new Error(
       `Initial subagents ping was not ready; later ping: ${JSON.stringify(diagnostic)}`,
     );
   }
-  expect(report.subagentsRpcReady).toBe(Boolean(subagents));
-  if (subagents) expect(report.subagentsSessionId).toBe(report.sessionProof.sessionId);
+  expect(report.subagentsRpcReady).toBe(hasSubagents);
+  if (hasSubagents) expect(report.subagentsSessionId).toBe(report.sessionProof.sessionId);
   expect(report.sessionProof.sessionId).toBeTruthy();
   expect(JSON.stringify(report).length).toBeLessThan(2_000);
   const state = await client.getState();
   expect(state.sessionId).toBe(report.sessionProof.sessionId);
   return { report, state, server, client, key };
 }
+
+it.skipIf(!localPiBinary)(
+  "loads published Pi bridge and quota extensions from a flat staged release",
+  async () => {
+    const root = temporaryDirectory("yaat-published-pi-");
+    const extensionDir = path.join(root, ".agent-team", "releases", "gen-test");
+    // Staged generations resolve regular dependencies from the installed
+    // checkout's node_modules. Only expose dependencies, not repository source.
+    const modules = path.join(root, "node_modules");
+    fs.mkdirSync(modules);
+    fs.symlinkSync(
+      path.dirname(require.resolve("zod/package.json")),
+      path.join(modules, "zod"),
+      "dir",
+    );
+    execFileSync(process.execPath, ["esbuild.mjs"], {
+      cwd: path.resolve(__dirname, "../.."),
+      env: { ...process.env, YAAT_BUILD_OUT_DIR: extensionDir },
+    });
+    expect(fs.existsSync(path.join(root, "shared"))).toBe(false);
+    const { client } = await startRealPi({ extensionDir });
+    expect((await client.getCommands()).commands).toContainEqual(
+      expect.objectContaining({ name: "quota" }),
+    );
+  },
+  30_000,
+);
 
 function writeSyntheticProviderObserver(directory: string): string {
   const file = path.join(directory, "synthetic-provider-observer.mjs");

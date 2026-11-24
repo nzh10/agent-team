@@ -1,11 +1,5 @@
 import { z } from "zod";
 
-export interface TypeBoxSchema {
-  [key: string]: unknown;
-}
-
-type TSchema = TypeBoxSchema;
-
 export type JsonSchemaType =
   "object" | "string" | "number" | "integer" | "boolean" | "array" | "null";
 
@@ -22,19 +16,6 @@ export interface RestrictedJsonSchema {
   maximum?: number;
   description?: string;
   default?: unknown;
-}
-
-export interface TypeBoxFactory {
-  Object(properties: Record<string, TSchema>, options?: Record<string, unknown>): TSchema;
-  Optional(schema: TSchema): TSchema;
-  String(options?: Record<string, unknown>): TSchema;
-  Number(options?: Record<string, unknown>): TSchema;
-  Integer(options?: Record<string, unknown>): TSchema;
-  Boolean(options?: Record<string, unknown>): TSchema;
-  Array(items: TSchema, options?: Record<string, unknown>): TSchema;
-  Union(schemas: TSchema[], options?: Record<string, unknown>): TSchema;
-  Literal(value: string | number | boolean): TSchema;
-  Null(): TSchema;
 }
 
 function restricted(value: unknown): RestrictedJsonSchema {
@@ -134,66 +115,4 @@ export function assertNoEmptyEnum(schema: unknown): void {
     throw new Error("Panel schemas must not contain an empty enum or an empty-string enum member");
   }
   for (const value of Object.values(record)) assertNoEmptyEnum(value);
-}
-
-function schemaOptions(schema: RestrictedJsonSchema): Record<string, unknown> {
-  const options: Record<string, unknown> = {};
-  if (schema.description !== undefined) options.description = schema.description;
-  if (schema.default !== undefined) options.default = schema.default;
-  if (schema.minimum !== undefined) options.minimum = schema.minimum;
-  if (schema.maximum !== undefined) options.maximum = schema.maximum;
-  return options;
-}
-
-function typeBox(schema: RestrictedJsonSchema, Type: TypeBoxFactory): TSchema {
-  const options = schemaOptions(schema);
-  if (schema.anyOf)
-    return Type.Union(
-      schema.anyOf.map((part) => typeBox(part, Type)),
-      options,
-    );
-  if (schema.enum) {
-    return Type.Union(
-      schema.enum.map((value) => Type.Literal(value)),
-      options,
-    );
-  }
-  if (Array.isArray(schema.type)) {
-    return Type.Union(
-      schema.type.map((type) => typeBox({ ...schema, type, anyOf: undefined }, Type)),
-      options,
-    );
-  }
-  switch (schema.type) {
-    case "object": {
-      const required = new Set(schema.required ?? []);
-      const properties = Object.fromEntries(
-        Object.entries(schema.properties ?? {}).map(([key, property]) => {
-          const converted = typeBox(property, Type);
-          return [key, required.has(key) ? converted : Type.Optional(converted)];
-        }),
-      );
-      return Type.Object(properties, { ...options, additionalProperties: false });
-    }
-    case "string":
-      return Type.String(options);
-    case "number":
-      return Type.Number(options);
-    case "integer":
-      return Type.Integer(options);
-    case "boolean":
-      return Type.Boolean(options);
-    case "array":
-      if (!schema.items) throw new Error("An array schema requires items");
-      return Type.Array(typeBox(schema.items, Type), options);
-    case "null":
-      return Type.Null();
-    default:
-      throw new Error(`Unsupported restricted JSON Schema: ${JSON.stringify(schema)}`);
-  }
-}
-
-/** Build real TypeBox schemas; raw JSON Schema / Type.Unsafe is never accepted. */
-export function jsonSchemaToTypeBox(schema: RestrictedJsonSchema, Type: TypeBoxFactory): TSchema {
-  return typeBox(schema, Type);
 }
