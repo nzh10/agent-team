@@ -244,6 +244,30 @@ it("keeps the visible history anchored when paging cannot find a quote", async (
   expect(document.querySelector(".message-highlight")).toBeNull();
 });
 
+it("keeps the visible history anchored even if new content grows below while paging", async () => {
+  const { scroll, receive } = await boot([], [ws], true);
+  scroll.style.overflowAnchor = "none";
+  move(scroll, 40);
+  const target = get("#msg-m2");
+  const top = target.getBoundingClientRect().top;
+  receive({
+    type: "message",
+    message: turn(99, {
+      content: "Streaming reply growing below while older history loads.\n\n".repeat(12),
+    }),
+  });
+  await nextPaint();
+  receive({
+    type: "workspace_messages",
+    before: history[0].timestamp,
+    messages: [turn(-2), turn(-1)],
+    hasMore: false,
+  });
+  await nextPaint();
+  expect(get("#msg-m-2")).toBeTruthy();
+  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
+});
+
 it("keeps a quote from another workspace visible without paging unrelated history", async () => {
   const { sock, receive } = await boot([], [ws, { ...ws, id: "other", name: "Other workspace" }]);
   fireEvent.click(get("#msg-m3 .btn-quote"));

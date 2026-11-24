@@ -949,15 +949,40 @@ export function App() {
     }
   }, [activeWsId, activeLoaded, connected, loadMessages]);
 
-  // Prepending a page changes scrollHeight; Safari has no overflow-anchor,
-  // so remember where we were and restore it once the page is in the DOM.
-  const anchorRef = useRef<{ wsId: string; firstId: string; height: number; top: number } | null>(
-    null,
-  );
-  const rememberHistoryAnchor = useCallback((wsId: string, firstId: string) => {
-    const el = messagesContainerRef.current;
-    if (el) anchorRef.current = { wsId, firstId, height: el.scrollHeight, top: el.scrollTop };
+  // Prepending a page shifts existing messages down; Safari has no
+  // overflow-anchor, so remember the previous first message's exact offset
+  // relative to the scroller (scrollHeight is integer-rounded and also grows
+  // from bottom streaming, which causes sub-pixel drift or jumps).
+  const anchorRef = useRef<{
+    wsId: string;
+    firstId: string;
+    height: number;
+    top: number;
+    firstOffset: number | null;
+  } | null>(null);
+  const measureAnchorOffset = useCallback((el: HTMLElement, firstId: string): number | null => {
+    const firstEl = document.getElementById(`msg-${firstId}`);
+    if (!firstEl || !el.contains(firstEl)) return null;
+    const rect = firstEl.getBoundingClientRect();
+    // jsdom has zero-sized layout rects; fall back to scrollHeight there.
+    if (rect.height === 0 && rect.width === 0) return null;
+    return rect.top - el.getBoundingClientRect().top;
   }, []);
+  const rememberHistoryAnchor = useCallback(
+    (wsId: string, firstId: string) => {
+      const el = messagesContainerRef.current;
+      if (el) {
+        anchorRef.current = {
+          wsId,
+          firstId,
+          height: el.scrollHeight,
+          top: el.scrollTop,
+          firstOffset: measureAnchorOffset(el, firstId),
+        };
+      }
+    },
+    [measureAnchorOffset],
+  );
   const onMessagesScroll = useCallback(() => {
     const el = messagesContainerRef.current;
     if (!el || !activeWs || activeWs.loadingOlder) return;
@@ -988,6 +1013,7 @@ export function App() {
       // Keep the reader's latest position if they scroll while a page is in flight.
       anchor.height = el.scrollHeight;
       anchor.top = el.scrollTop;
+      anchor.firstOffset = measureAnchorOffset(el, anchor.firstId);
     }
     // A jump is not a request to reattach to the bottom or load another page.
     const jumpTop = jumpScrollTopRef.current;
@@ -1001,7 +1027,7 @@ export function App() {
     }
     lastScrollTopRef.current = el.scrollTop;
     onMessagesScroll();
-  }, [onMessagesScroll]);
+  }, [measureAnchorOffset, onMessagesScroll]);
 
   // The composer growing (a long draft, the command list) takes the
   // transcript's room from below: a reader at the end stays there. Keyed on
@@ -1040,7 +1066,12 @@ export function App() {
     const el = messagesContainerRef.current;
     if (anchor && el && anchor.wsId === activeWs?.id && msgs[0]?.id !== anchor.firstId) {
       anchorRef.current = null;
-      el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+      const nowOffset = measureAnchorOffset(el, anchor.firstId);
+      const delta =
+        anchor.firstOffset !== null && nowOffset !== null
+          ? nowOffset - anchor.firstOffset
+          : el.scrollHeight - anchor.height;
+      el.scrollTop = anchor.top + delta;
       return;
     }
     if (prevCount === 0 && msgs.length > 0) {
@@ -1052,7 +1083,7 @@ export function App() {
     } else if (stuckToBottomRef.current && (streaming || wasStreaming)) {
       if (el) el.scrollTop = el.scrollHeight;
     }
-  }, [activeWs?.id, activeWs?.messages]);
+  }, [activeWs?.id, activeWs?.messages, measureAnchorOffset]);
 
   useEffect(() => {
     const jump = pendingJump;
