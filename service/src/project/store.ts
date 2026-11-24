@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { writeAtomicJson } from "./report-journal";
+import { writeAtomicJson } from "../storage/atomic-write";
 
 // A project: one repository (with any worktrees, on any disk) that a lead
 // agent looks after. Its external memory lives here, in the server's data

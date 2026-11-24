@@ -705,7 +705,7 @@ async function runDeterministicPiScenario() {
       expect(journal[0].boardState).toBe("applied");
       expect(journal[0].leadDelivery.state).toBe("settled");
     });
-    expect(fs.readFileSync(inbox, "utf8")).toContain("pi-e2e-worker-report");
+    expect(fs.readFileSync(inbox, "utf8")).not.toContain("pi-e2e-worker-report");
     expect(internal.projects.awaitsUser(workspace(lead))).toBe(false);
     expect(internal.projects.awaitsUser(workspace(worker))).toBe(false);
     console.log("Pi E2E: finish_task journal settled, review board updated and awaitsUser reset");

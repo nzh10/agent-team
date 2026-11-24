@@ -268,6 +268,67 @@ describe("ReportJournalStore", () => {
     expect(fs.statSync(path.join(projectDir, "inbox.json")).mode & 0o777).toBe(0o600);
   });
 
+  it("upgrades legacy sequence numbers and keeps a larger durable high-water mark", () => {
+    const projectDir = tmpDir();
+    const file = path.join(projectDir, "inbox.json");
+    const legacy = { ...reportInput("legacy", "old"), seq: 91, leadMessageId: "report-legacy" };
+    fs.writeFileSync(file, JSON.stringify([legacy]));
+    const store = new ReportJournalStore();
+    store.load(projectDir);
+    store.compact();
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ version: 1, nextSeq: 92 });
+    expect(store.append(reportInput("new", "new")).entry.seq).toBe(92);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, nextSeq: 400, entries: [legacy] }));
+    store.load(projectDir);
+    expect(store.append(reportInput("later", "later")).entry.seq).toBe(400);
+  });
+
+  it("compacts only fully settled reports and deduplicates old retries before and after compaction", () => {
+    const projectDir = tmpDir();
+    const file = path.join(projectDir, "inbox.json");
+    const large = "large report body\n".repeat(1000);
+    const rows = [
+      reportInput("settled", "old", {
+        payload: { text: large },
+        boardState: "applied",
+        leadDelivery: { state: "settled" },
+      }),
+      reportInput("board-pending", "board", { leadDelivery: { state: "settled" } }),
+      reportInput("unknown", "unknown", {
+        boardState: "applied",
+        leadDelivery: { state: "outcome_unknown" },
+      }),
+      reportInput("dispatching", "dispatching", {
+        boardState: "applied",
+        leadDelivery: { state: "dispatching" },
+      }),
+    ].map((row, index) => ({
+      ...row,
+      seq: index + 10,
+      leadMessageId: reportLeadMessageId(row.reportId),
+    }));
+    fs.writeFileSync(file, JSON.stringify(rows));
+    const store = new ReportJournalStore();
+    store.load(projectDir);
+    const retry = reportInput("different", "old");
+    expect(store.append(retry)).toMatchObject({
+      duplicate: true,
+      entry: { seq: 10, payload: { text: large } },
+    });
+    store.compact();
+    expect(store.list().slice(1)).toEqual(rows.slice(1));
+    const snapshot = fs.readFileSync(file, "utf8");
+    expect(snapshot).not.toContain("large report body");
+    store.load(projectDir);
+    expect(store.append(retry)).toMatchObject({
+      duplicate: true,
+      entry: { seq: 10, reportId: "settled", payload: {}, frozenPlan: null },
+    });
+    store.compact();
+    expect(fs.readFileSync(file, "utf8")).toBe(snapshot);
+    expect(store.append(reportInput("new", "new")).entry.seq).toBe(14);
+  });
+
   it("beforeRename failure leaves the old snapshot and memory untouched with no temp files", () => {
     const projectDir = tmpDir();
     const initial = new ReportJournalStore();

@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { writeAtomicText } from "../storage/atomic-write";
 
 export const NOTE_SLUG_PATTERN =
   /^(?!.*\.\.)(?!.*\.[mM][dD]$)[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}(?![\s\S])/;
@@ -195,24 +196,11 @@ export function writeNote(
   conflictIfNeeded(slug, before?.content ?? null, expectedVersion);
 
   const file = path.join(realDir, `${slug}.md`);
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
-  let fd: number | null = null;
-  try {
-    fd = fs.openSync(tmp, "wx", 0o600);
-    fs.writeFileSync(fd, content, "utf8");
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = null;
-
-    // Recheck both containment and the optimistic-lock version after the
-    // temporary file is complete, immediately before replacing the target.
+  writeAtomicText(file, content, () => {
+    // Recheck containment and version immediately before replacing the target.
     const current = existingContent(realDir, slug);
     conflictIfNeeded(slug, current?.content ?? null, expectedVersion);
-    fs.renameSync(tmp, file);
-  } finally {
-    if (fd !== null) fs.closeSync(fd);
-    fs.rmSync(tmp, { force: true });
-  }
+  });
 
   const written = inspectNote(realDir, slug);
   if (!written) throw new Error(`Note "${slug}" disappeared after it was written`);

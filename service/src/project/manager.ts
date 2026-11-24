@@ -956,6 +956,7 @@ export class ProjectManager {
     if (!journal) {
       journal = new ReportJournalStore();
       journal.load(this.store.projectDir(id));
+      journal.compact();
       this.journals.set(id, journal);
     }
     return journal;
