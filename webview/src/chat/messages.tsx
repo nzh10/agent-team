@@ -12,13 +12,14 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import type { Message, MessageOrigin, AgentInfo, StreamEvent } from "../state/useServer";
-import { timelineBlocks, type TimelineBlock } from "./events";
+import { isTerminalSubagent, timelineBlocks, type TimelineBlock } from "./events";
 import { toolNameOf, toolSummary } from "../state/stream";
 import { copySelectionAsMarkdown } from "./clipboard";
 import { CodeBlock, CopyButton, MdBlock, StreamingMdBlock } from "./markdown";
 import { DEFAULT_USER } from "../state/useServer";
 import { AgentAvatar, Avatar, isImageAvatar } from "../workspace/avatar";
-import { shortModel, formatTokens, formatDuration, formatRunTime } from "../format";
+import { formatTokens, formatDuration, formatRunTime } from "../format";
+import { shortModel } from "../workspace/models";
 
 function renderMentionContent(content: string, agents: AgentInfo[]) {
   const match = content.match(/^@(\S+)(\s+|$)/);
@@ -564,12 +565,7 @@ export const SubAgentItem = memo(function SubAgentItem({
   }, [open, needsLoad]);
   if (!sa) return null;
 
-  const isDone =
-    ev.kind === "subagent_done" ||
-    sa.status === "completed" ||
-    sa.status === "failed" ||
-    sa.status === "stopped";
-  const isRunning = !isDone;
+  const isRunning = !isTerminalSubagent(ev);
   const statusIcon = isRunning
     ? "↻"
     : sa.status === "completed"
@@ -617,7 +613,7 @@ export const SubAgentItem = memo(function SubAgentItem({
         </span>
         {sa.model && (
           <span className="subagent-model" title={sa.model}>
-            {sa.model}
+            {shortModel(sa.model)}
           </span>
         )}
         {sa.effort && (
@@ -662,24 +658,12 @@ export const SubAgentItem = memo(function SubAgentItem({
                     <EventItem key={`${bi}-${i}`} ev={ie} onLoadDetails={onLoadDetails} />
                   ));
                 }
-                if (block.kind === "banner")
-                  return <BannerItem key={`b${bi}`} ev={block.ev} onLoadDetails={onLoadDetails} />;
-                if (block.kind === "action") {
-                  return (
-                    <PanelActionItem
-                      key={`a${bi}`}
-                      ev={block.ev}
-                      action={block.action}
-                      onLoadDetails={onLoadDetails}
-                    />
-                  );
-                }
                 return (
-                  <SubAgentItem
-                    key={block.ev.subagent!.taskId}
-                    ev={block.ev}
+                  <TimelineBlockItem
+                    key={timelineBlockKey(block, bi)}
+                    block={block}
                     onLoadEvents={onLoadEvents}
-                    onCancel={onCancel}
+                    onCancelSubagent={onCancel}
                     onLoadDetails={onLoadDetails}
                   />
                 );
@@ -896,30 +880,49 @@ function StepTimeline({
             />
           );
         }
-        if (block.kind === "banner")
-          return <BannerItem key={`b${i}`} ev={block.ev} onLoadDetails={onLoadDetails} />;
-        if (block.kind === "action") {
-          return (
-            <PanelActionItem
-              key={`a${i}`}
-              ev={block.ev}
-              action={block.action}
-              onLoadDetails={onLoadDetails}
-            />
-          );
-        }
         return (
-          <SubAgentItem
-            key={block.ev.subagent!.taskId}
-            ev={block.ev}
+          <TimelineBlockItem
+            key={timelineBlockKey(block, i)}
+            block={block}
             onLoadEvents={onLoadEvents}
-            onCancel={onCancelSubagent}
+            onCancelSubagent={onCancelSubagent}
             onLoadDetails={onLoadDetails}
           />
         );
       })}
     </>
   );
+}
+
+type TimelineCard = Exclude<TimelineBlock, { kind: "steps" }>;
+
+function timelineBlockKey(block: TimelineCard, index: number): string {
+  return block.kind === "subagent" ? `task-${block.ev.subagent!.taskId}` : `${block.kind}-${index}`;
+}
+
+function TimelineBlockItem({
+  block,
+  onLoadEvents,
+  onCancelSubagent,
+  onLoadDetails,
+}: Pick<StepTimelineProps, "onLoadEvents" | "onCancelSubagent" | "onLoadDetails"> & {
+  block: TimelineCard;
+}) {
+  switch (block.kind) {
+    case "banner":
+      return <BannerItem ev={block.ev} onLoadDetails={onLoadDetails} />;
+    case "action":
+      return <PanelActionItem ev={block.ev} action={block.action} onLoadDetails={onLoadDetails} />;
+    case "subagent":
+      return (
+        <SubAgentItem
+          ev={block.ev}
+          onLoadEvents={onLoadEvents}
+          onCancel={onCancelSubagent}
+          onLoadDetails={onLoadDetails}
+        />
+      );
+  }
 }
 
 function LiveChip({ secs }: { secs: number }) {

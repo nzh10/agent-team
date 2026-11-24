@@ -24,17 +24,6 @@ export function formatUptime(seconds: number): string {
   return `${m}m`;
 }
 
-// Quota windows reset at a unix timestamp (seconds).
-export function formatResetTime(resetsAt: number, now = Date.now()): string {
-  const delta = resetsAt * 1000 - now;
-  if (delta <= 0) return "now";
-  const mins = Math.floor(delta / 60000);
-  if (mins < 60) return `${mins}m`;
-  const hours = Math.floor(mins / 60);
-  const remMins = mins % 60;
-  return remMins > 0 ? `${hours}h${remMins}m` : `${hours}h`;
-}
-
 // "3d ago", "2h ago", "just now" — for sidebar recency labels.
 export function formatRelative(ts: number, now = Date.now()): string {
   const delta = Math.max(0, now - ts);
@@ -50,8 +39,6 @@ export function formatRelative(ts: number, now = Date.now()): string {
   return `${Math.floor(months / 12)}y ago`;
 }
 
-// "claude-fable-5-1[1m]" → "fable 5.1 [1m]", "claude-opus-4-6" → "opus 4.6",
-// "claude-haiku-4-5-20251001" → "haiku 4.5", "gpt-5.6-sol" → "gpt 5.6 sol".
 // 84_000 → "84k", 1_200_000 → "1.2M".
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0)}M`;
@@ -74,9 +61,4 @@ export function formatRunTime(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : formatDuration(ms);
 }
 
-export function shortModel(model: string): string {
-  const m = model.match(/^(.*?)(\[1m\])?$/i);
-  let base = (m?.[1] ?? model).replace(/^(claude-|cursor\/|agy\/)/, "").replace(/-\d{8}$/, "");
-  base = base.replace(/-(\d+)-(\d+)(?=-|$)/, " $1.$2").replace(/-/g, " ");
-  return m?.[2] ? `${base} ${m[2]}` : base;
-}
+export { shortModel } from "./workspace/models";

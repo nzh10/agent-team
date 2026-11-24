@@ -9,6 +9,7 @@ import {
   toolSummary,
 } from "../src/state/stream";
 import { Message, StreamEvent } from "../src/state/useServer";
+import { splitEvents } from "../src/chat/events";
 
 const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
   kind,
@@ -34,6 +35,109 @@ const carrier = (taskId: string, inner: StreamEvent): StreamEvent =>
   });
 
 describe("applyEventsToMessage", () => {
+  it("keeps lifecycle metadata equivalent in live root, live nested, and timeline cards", () => {
+    const lifecycle = [
+      ev("subagent_start", {
+        subagent: { taskId: "child", description: "Audit", status: "running", eventCount: 5 },
+      }),
+      ev("subagent_progress", {
+        subagent: {
+          taskId: "child",
+          description: "",
+          model: "anthropic/claude-opus-4-6",
+          eventCount: 9,
+        },
+      }),
+      ev("subagent_progress", {
+        subagent: { taskId: "child", description: "", effort: "high", eventCount: 7 },
+      }),
+      ev("subagent_done", {
+        subagent: {
+          taskId: "child",
+          description: "",
+          status: "completed",
+          eventCount: 0,
+          summary: "Done",
+        },
+      }),
+    ];
+    const parent = ev("subagent_start", {
+      subagent: { taskId: "parent", description: "Parent", events: [] },
+    });
+    const expected = {
+      taskId: "child",
+      description: "Audit",
+      model: "anthropic/claude-opus-4-6",
+      effort: "high",
+      eventCount: 9,
+      status: "completed",
+      summary: "Done",
+    };
+    const run = (frames: StreamEvent[], initial = msg()) =>
+      frames.reduce((m, frame) => applyEventsToMessage(m, [frame]), initial);
+    const root = run(lifecycle).events!;
+    const nested = run(
+      lifecycle.map((frame) => carrier("parent", frame)),
+      msg({ events: [parent] }),
+    ).events![0].subagent!.events!;
+    for (const events of [root, nested]) {
+      expect(events[0].subagent).toMatchObject(expected);
+      expect(splitEvents(events).subagents[0].subagent).toMatchObject(expected);
+    }
+    expect(splitEvents(lifecycle).subagents[0].subagent).toMatchObject(expected);
+    expect(parent.subagent?.events).toEqual([]);
+  });
+
+  it.each([false, true])(
+    "keeps loaded progress metadata on completion (another update: %s)",
+    (anotherUpdate) => {
+      const start = ev("subagent_start", {
+        subagent: { taskId: "child", description: "Audit", status: "running" },
+      });
+      const progress = ev("subagent_progress", {
+        subagent: {
+          taskId: "child",
+          description: "",
+          model: "opus",
+          effort: "high",
+          lastTool: "Read",
+          eventCount: 9,
+        },
+      });
+      const done = ev("subagent_done", {
+        subagent: { taskId: "child", description: "", status: "completed", eventCount: 0 },
+      });
+      const loaded = [start, progress];
+      const parent = ev("subagent_start", {
+        subagent: { taskId: "parent", description: "Parent", events: loaded },
+      });
+      const updates = anotherUpdate
+        ? [ev("subagent_progress", { subagent: { taskId: "child", description: "" } }), done]
+        : [done];
+      const root = applyEventsToMessage(msg({ events: loaded }), updates).events!;
+      const nested = applyEventsToMessage(
+        msg({ events: [parent] }),
+        updates.map((update) => carrier("parent", update)),
+      ).events![0].subagent!.events!;
+      const expected = {
+        taskId: "child",
+        description: "Audit",
+        model: "opus",
+        effort: "high",
+        lastTool: "Read",
+        eventCount: 9,
+        status: "completed",
+      };
+      for (const result of [root, nested]) {
+        expect(result[0].subagent).toMatchObject(expected);
+        expect(splitEvents(result).subagents[0].subagent).toMatchObject(expected);
+      }
+      expect(loaded).toEqual([start, progress]);
+      expect(start.subagent).not.toHaveProperty("model");
+      expect(parent.subagent?.events).toBe(loaded);
+    },
+  );
+
   it.each([
     [12, 4, 12],
     [3, 19, 19],

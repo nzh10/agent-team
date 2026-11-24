@@ -341,7 +341,7 @@ describe("CreateWorkspaceDialog", () => {
 
   it("closes on Escape, the path's suggestions first", () => {
     const onClose = vi.fn();
-    const { getByPlaceholderText, container } = render(
+    const { getByPlaceholderText, baseElement } = render(
       <CreateWorkspaceDialog
         hosts={[]}
         onClose={onClose}
@@ -351,9 +351,9 @@ describe("CreateWorkspaceDialog", () => {
       />,
     );
     fireEvent.change(getByPlaceholderText("~/workspace/..."), { target: { value: "/repo/" } });
-    expect(container.querySelector(".dir-suggest")).not.toBeNull();
+    expect(baseElement.querySelector(".dir-suggest")).not.toBeNull();
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(container.querySelector(".dir-suggest")).toBeNull();
+    expect(baseElement.querySelector(".dir-suggest")).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);

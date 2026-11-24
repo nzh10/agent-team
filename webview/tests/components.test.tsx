@@ -26,7 +26,7 @@ describe("SubAgentItem", () => {
       />,
     );
     const header = container.querySelector(".subagent-header")!;
-    expect(header.textContent).toBe("▸✓explore the repoprovider/resolvedhigh3s");
+    expect(header.textContent).toBe("▸✓explore the reporesolvedhigh3s");
     expect(queryByRole("button", { name: "Collapse subagent trace" })).toBeNull();
     fireEvent.click(getByRole("button", { name: "Expand subagent: explore the repo" }));
     fireEvent.click(getByRole("button", { name: "Collapse subagent trace" }));
@@ -370,7 +370,7 @@ describe("CreateWorkspaceDialog", () => {
   });
 
   it("ignores stale suggestions for older input", () => {
-    const { pathInput, container, onCreate, onListDirs, rerender } = setup();
+    const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
     fireEvent.change(pathInput, { target: { value: "/tmp/x" } });
     rerender(
       <CreateWorkspaceDialog
@@ -381,7 +381,7 @@ describe("CreateWorkspaceDialog", () => {
         dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
       />,
     );
-    expect(container.querySelector(".dir-suggest")).toBeNull();
+    expect(baseElement.querySelector(".dir-suggest")).toBeNull();
   });
 
   it("submits name + path, defaulting the name to the folder basename", () => {
@@ -418,7 +418,7 @@ describe("CreateWorkspaceDialog", () => {
   it("closes the suggestion list when the path input loses focus (mobile has no Esc)", () => {
     vi.useFakeTimers();
     try {
-      const { pathInput, container, onCreate, onListDirs, rerender } = setup();
+      const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
       fireEvent.change(pathInput, { target: { value: "/home/ex" } });
       rerender(
         <CreateWorkspaceDialog
@@ -429,17 +429,17 @@ describe("CreateWorkspaceDialog", () => {
           dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
         />,
       );
-      expect(container.querySelector(".dir-suggest")).not.toBeNull();
+      expect(baseElement.querySelector(".dir-suggest")).not.toBeNull();
 
       fireEvent.blur(pathInput);
       act(() => {
         vi.advanceTimersByTime(200);
       });
-      expect(container.querySelector(".dir-suggest")).toBeNull();
+      expect(baseElement.querySelector(".dir-suggest")).toBeNull();
 
       // Refocusing brings it back before the user types anything.
       fireEvent.focus(pathInput);
-      expect(container.querySelector(".dir-suggest")).not.toBeNull();
+      expect(baseElement.querySelector(".dir-suggest")).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -448,7 +448,7 @@ describe("CreateWorkspaceDialog", () => {
   it("keeps the list open across a quick blur/focus (tapping a suggestion)", () => {
     vi.useFakeTimers();
     try {
-      const { pathInput, container, onCreate, onListDirs, rerender } = setup();
+      const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
       fireEvent.change(pathInput, { target: { value: "/home/ex" } });
       rerender(
         <CreateWorkspaceDialog
@@ -464,7 +464,7 @@ describe("CreateWorkspaceDialog", () => {
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      expect(container.querySelector(".dir-suggest")).not.toBeNull();
+      expect(baseElement.querySelector(".dir-suggest")).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }

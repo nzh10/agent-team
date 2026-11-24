@@ -4,7 +4,6 @@ import {
   formatDuration,
   formatRunTime,
   formatRelative,
-  formatResetTime,
   formatTokens,
   shortModel,
 } from "../src/format";
@@ -20,15 +19,6 @@ describe("formatRelative", () => {
     expect(formatRelative(NOW - 70 * 86_400_000, NOW)).toBe("2mo ago");
     expect(formatRelative(NOW - 400 * 86_400_000, NOW)).toBe("1y ago");
     expect(formatRelative(NOW + 60_000, NOW)).toBe("just now");
-  });
-});
-
-describe("formatResetTime", () => {
-  it("formats the remaining time until a unix-seconds reset", () => {
-    expect(formatResetTime(NOW / 1000 - 1, NOW)).toBe("now");
-    expect(formatResetTime(NOW / 1000 + 30 * 60, NOW)).toBe("30m");
-    expect(formatResetTime(NOW / 1000 + 90 * 60, NOW)).toBe("1h30m");
-    expect(formatResetTime(NOW / 1000 + 120 * 60, NOW)).toBe("2h");
   });
 });
 

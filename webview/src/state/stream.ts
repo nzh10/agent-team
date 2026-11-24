@@ -1,5 +1,14 @@
 import type { StreamEvent, Message, SubAgentInfo } from "./useServer";
-import { SUBAGENT_KINDS } from "../chat/events";
+import {
+  attachToolResult,
+  findSubagentEvent,
+  innerSubagentEvent,
+  isSubagentEvent,
+  isTerminalSubagent,
+  mergeSubagentInfo,
+  transcriptLength,
+  upsertSubagentProgress,
+} from "../chat/events";
 
 export interface PendingEvent {
   wsId: string;
@@ -75,20 +84,10 @@ export function applyEventsToMessage(m: Message, evts: StreamEvent[]): Message {
       events = events.filter((e) => e.kind !== "retry");
     }
     if (DELTA_KINDS.has(ev.kind)) continue;
-    if (ev.kind === "tool_result" && ev.toolUseId) {
-      const matchIdx = events.findIndex(
-        (e) => e.kind === "tool_use" && e.toolUseId === ev.toolUseId,
-      );
-      if (matchIdx >= 0) {
-        events[matchIdx] = {
-          ...events[matchIdx],
-          toolResult: ev.content,
-          ...(ev.isMarkdown && { toolResultIsMarkdown: true }),
-          ...(ev.isError && { toolResultIsError: true }),
-          ...(ev.durationMs != null && { durationMs: ev.durationMs }),
-        };
-        continue;
-      }
+    const attached = attachToolResult(events, ev);
+    if (attached) {
+      events[attached.index] = attached.event;
+      continue;
     }
     // Tokens of the latest thinking block (task.ts does the same).
     if (ev.kind === "thinking_tokens") {
@@ -107,66 +106,25 @@ export function applyEventsToMessage(m: Message, evts: StreamEvent[]): Message {
         continue;
       }
     }
-    if (ev.kind === "subagent_progress" && ev.subagent?.taskId) {
-      const innerEv = (ev.subagent as unknown as Record<string, unknown>)?._innerEvent as
-        StreamEvent | undefined;
-      if (innerEv) {
-        const startIdx = events.findIndex(
-          (e) => e.kind === "subagent_start" && e.subagent?.taskId === ev.subagent?.taskId,
-        );
-        if (startIdx >= 0) {
-          const sa = ownSubagent(startIdx);
-          // A card whose transcript was never loaded: the server holds it
-          // whole, a live tail here would pass for all of it.
-          if (sa.events) applyInnerEvent(sa, innerEv);
-          else sa.eventCount = (sa.eventCount ?? 0) + unloadedGrowth(sa, innerEv);
+    const taskId = ev.subagent?.taskId;
+    if (ev.kind === "subagent_progress" && taskId) {
+      const inner = innerSubagentEvent(ev);
+      const start = findSubagentEvent(events, "subagent_start", taskId);
+      if (inner) {
+        if (start >= 0) {
+          const sa = ownSubagent(start);
+          // A live tail must not pass for a transcript the client never loaded.
+          if (sa.events) applyInnerEvent(sa, inner);
+          else sa.eventCount = (sa.eventCount ?? 0) + unloadedGrowth(sa, inner);
         }
-        continue;
+      } else {
+        events = recordSubagentProgress(events, ev, taskId, start);
       }
-      const { model, effort } = ev.subagent;
-      if (model != null || effort != null) {
-        const startIdx = events.findIndex(
-          (e) => e.kind === "subagent_start" && e.subagent?.taskId === ev.subagent?.taskId,
-        );
-        if (startIdx >= 0) {
-          const start = ownSubagent(startIdx);
-          if (model != null) start.model = model;
-          if (effort != null) start.effort = effort;
-        }
-      }
-      const idx = events.findIndex(
-        (e) => e.kind === "subagent_progress" && e.subagent?.taskId === ev.subagent?.taskId,
-      );
-      if (idx >= 0) {
-        events[idx] = ev;
-        continue;
-      }
-    } else if (ev.kind === "subagent_done" && ev.subagent?.taskId) {
-      events = events.filter(
-        (e) => !(e.kind === "subagent_progress" && e.subagent?.taskId === ev.subagent?.taskId),
-      );
-      const startIdx = events.findIndex(
-        (e) => e.kind === "subagent_start" && e.subagent?.taskId === ev.subagent?.taskId,
-      );
-      if (startIdx >= 0 && ev.subagent) {
-        const start = events[startIdx].subagent!;
-        // The done event carries only terminal fields (status, summary,
-        // usage); an empty description there must not wipe the start's.
-        events[startIdx] = {
-          ...events[startIdx],
-          subagent: {
-            ...start,
-            ...ev.subagent,
-            description: start.description || ev.subagent.description,
-            agentType: ev.subagent.agentType ?? start.agentType,
-            model: ev.subagent.model ?? start.model,
-            effort: ev.subagent.effort ?? start.effort,
-            prompt: ev.subagent.prompt ?? start.prompt,
-            events: start.events,
-            eventCount: Math.max(start.eventCount ?? 0, ev.subagent.eventCount ?? 0) || undefined,
-          },
-        };
-      }
+      continue;
+    }
+    if (ev.kind === "subagent_done" && taskId) {
+      finishSubagent(events, ev, taskId);
+      continue;
     }
     events.push(ev);
   }
@@ -192,7 +150,7 @@ function liveThinkingAfter(m: Message, evts: StreamEvent[]): LiveTiming {
     if (e.waitingSince !== undefined) waitingSince = e.waitingSince ?? undefined;
     // A background task reporting on this message is not the main loop
     // moving on.
-    if (SUBAGENT_KINDS.has(e.kind)) continue;
+    if (isSubagentEvent(e)) continue;
     if (e.kind === "thinking_delta" && e.durationMs != null && e.thinkingFollows) {
       closing = since != null ? (text ?? "") : closing;
     } else {
@@ -244,7 +202,7 @@ function unloadedGrowth(sa: SubAgentInfo, innerEv: StreamEvent): number {
   const nid = innerEv.subagent?.taskId;
   if (innerEv.kind === "tool_result") return 0;
   if (innerEv.kind === "subagent_progress" && nid) {
-    if ((innerEv.subagent as unknown as Record<string, unknown>)._innerEvent) return 0;
+    if (innerSubagentEvent(innerEv)) return 0;
     if (sa.liveProgress?.includes(nid)) return 0;
     sa.liveProgress = [...(sa.liveProgress ?? []), nid];
     return 1;
@@ -256,79 +214,66 @@ function unloadedGrowth(sa: SubAgentInfo, innerEv: StreamEvent): number {
   return 1;
 }
 
+function mergeLifecycle(start: StreamEvent, update: StreamEvent): StreamEvent {
+  if (update.kind === "subagent_progress" && isTerminalSubagent(start)) return start;
+  return { ...start, subagent: mergeSubagentInfo(start.subagent, update.subagent!) };
+}
+
+function recordSubagentProgress(
+  events: StreamEvent[],
+  update: StreamEvent,
+  taskId: string,
+  start: number,
+): StreamEvent[] {
+  const next = upsertSubagentProgress(events, update, taskId);
+  if (start >= 0) {
+    const progress = findSubagentEvent(next, "subagent_progress", taskId);
+    next[start] = mergeLifecycle(next[start], next[progress]);
+  }
+  return next;
+}
+
+// Keep the terminal frame in wire order, and keep the original card's position.
+// Both callers own their event array before changing it.
+function finishSubagent(events: StreamEvent[], done: StreamEvent, taskId: string): void {
+  const progress = findSubagentEvent(events, "subagent_progress", taskId);
+  const fallback = progress >= 0 ? events.splice(progress, 1)[0] : undefined;
+  const start = findSubagentEvent(events, "subagent_start", taskId);
+  if (start >= 0) {
+    // A loaded transcript can hold metadata only on the progress event.
+    const base = fallback ? mergeLifecycle(events[start], fallback) : events[start];
+    events[start] = mergeLifecycle(base, done);
+  }
+  events.push(
+    start < 0 && fallback
+      ? { ...done, subagent: mergeSubagentInfo(fallback.subagent, done.subagent!) }
+      : done,
+  );
+}
+
 function applyInnerEvent(sa: SubAgentInfo, innerEv: StreamEvent): void {
-  if (!sa.events) sa.events = [];
-  if (innerEv.kind === "tool_result" && innerEv.toolUseId) {
-    const i = sa.events.findIndex(
-      (e) => e.kind === "tool_use" && e.toolUseId === innerEv.toolUseId,
-    );
-    if (i >= 0) {
-      sa.events[i] = {
-        ...sa.events[i],
-        toolResult: innerEv.content,
-        ...(innerEv.isMarkdown && { toolResultIsMarkdown: true }),
-        ...(innerEv.isError && { toolResultIsError: true }),
-        ...(innerEv.durationMs != null && { durationMs: innerEv.durationMs }),
-      };
-    } else {
-      sa.events.push(innerEv);
+  const events = (sa.events ??= []);
+  const attached = attachToolResult(events, innerEv);
+  if (attached) {
+    events[attached.index] = attached.event;
+    return;
+  }
+  const taskId = innerEv.subagent?.taskId;
+  if (innerEv.kind === "subagent_progress" && taskId) {
+    const inner = innerSubagentEvent(innerEv);
+    const start = findSubagentEvent(events, "subagent_start", taskId);
+    if (!inner) {
+      sa.events = recordSubagentProgress(events, innerEv, taskId, start);
+    } else if (start >= 0) {
+      const child = events[start].subagent!;
+      const subagent = { ...child, events: [...(child.events ?? [])] };
+      applyInnerEvent(subagent, inner);
+      events[start] = { ...events[start], subagent };
     }
-  } else if (innerEv.kind === "subagent_progress" && innerEv.subagent?.taskId) {
-    const nid = innerEv.subagent.taskId;
-    const nested = (innerEv.subagent as unknown as Record<string, unknown>)._innerEvent as
-      StreamEvent | undefined;
-    if (nested) {
-      // A carrier for a nested task: apply it inside that task's own card
-      // (mirrors task.ts). Without a start to hold it, it is dropped.
-      const si = sa.events.findIndex(
-        (e) => e.kind === "subagent_start" && e.subagent?.taskId === nid,
-      );
-      if (si >= 0) {
-        const child = {
-          ...sa.events[si],
-          subagent: {
-            ...sa.events[si].subagent!,
-            events: [...(sa.events[si].subagent!.events ?? [])],
-          },
-        };
-        applyInnerEvent(child.subagent, nested);
-        sa.events[si] = child;
-      }
-      return;
-    }
-    // Nested subagent progress replaces the previous progress entry for the
-    // same nested task (mirrors task.ts).
-    const pi = sa.events.findIndex(
-      (e) => e.kind === "subagent_progress" && e.subagent?.taskId === nid,
-    );
-    if (pi >= 0) sa.events[pi] = innerEv;
-    else sa.events.push(innerEv);
-  } else if (innerEv.kind === "subagent_done" && innerEv.subagent?.taskId) {
-    const nid = innerEv.subagent.taskId;
-    const pi = sa.events.findIndex(
-      (e) => e.kind === "subagent_progress" && e.subagent?.taskId === nid,
-    );
-    if (pi >= 0) sa.events.splice(pi, 1);
-    const si = sa.events.findIndex(
-      (e) => e.kind === "subagent_start" && e.subagent?.taskId === nid,
-    );
-    if (si >= 0) {
-      sa.events[si] = {
-        ...sa.events[si],
-        subagent: {
-          ...sa.events[si].subagent!,
-          status: innerEv.subagent.status,
-          model: innerEv.subagent.model ?? sa.events[si].subagent!.model,
-          effort: innerEv.subagent.effort ?? sa.events[si].subagent!.effort,
-          summary: innerEv.subagent.summary,
-          usage: innerEv.subagent.usage,
-          durationMs: innerEv.subagent.durationMs,
-        },
-      };
-    }
-    sa.events.push(innerEv);
+  } else if (innerEv.kind === "subagent_done" && taskId) {
+    finishSubagent(events, innerEv, taskId);
   } else {
-    sa.events.push(innerEv);
+    events.push(innerEv);
   }
 }
 
@@ -375,10 +320,6 @@ export function mergeDetailEvents(
     }
     return serverEv;
   });
-}
-
-function transcriptLength(sa: SubAgentInfo): number {
-  return sa.events?.length ?? sa.eventCount ?? 0;
 }
 
 // Reconcile a freshly fetched newest page with what the client already
@@ -464,6 +405,8 @@ function sameEvents(cur: StreamEvent[] = [], next: StreamEvent[] = []): boolean 
       if (!n.subagent) return true;
       return (
         !!c.subagent &&
+        c.subagent.taskId === n.subagent.taskId &&
+        c.subagent.description === n.subagent.description &&
         c.subagent.status === n.subagent.status &&
         c.subagent.model === n.subagent.model &&
         c.subagent.effort === n.subagent.effort &&

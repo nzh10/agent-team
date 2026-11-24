@@ -1,4 +1,4 @@
-import { StreamEvent } from "../state/useServer";
+import type { StreamEvent, SubAgentInfo } from "../state/useServer";
 
 export const SUBAGENT_KINDS = new Set(["subagent_start", "subagent_progress", "subagent_done"]);
 // One-line status banners that render inline rather than inside the
@@ -7,6 +7,79 @@ export const BANNER_KINDS = new Set(["compact", "notice", "retry", "error"]);
 
 export function isSubagentEvent(e: StreamEvent): boolean {
   return SUBAGENT_KINDS.has(e.kind);
+}
+
+export function innerSubagentEvent(e: StreamEvent): StreamEvent | undefined {
+  const subagent: (SubAgentInfo & { _innerEvent?: StreamEvent }) | undefined = e.subagent;
+  return subagent?._innerEvent;
+}
+
+export function findSubagentEvent(
+  events: readonly StreamEvent[],
+  kind: "subagent_start" | "subagent_progress",
+  taskId: string,
+): number {
+  return events.findIndex((e) => e.kind === kind && e.subagent?.taskId === taskId);
+}
+
+export function upsertSubagentProgress(
+  events: readonly StreamEvent[],
+  progress: StreamEvent,
+  taskId: string,
+): StreamEvent[] {
+  const next = [...events];
+  const i = findSubagentEvent(next, "subagent_progress", taskId);
+  if (i < 0) next.push(progress);
+  else next[i] = { ...progress, subagent: mergeSubagentInfo(next[i].subagent, progress.subagent!) };
+  return next;
+}
+
+export function mergeSubagentInfo(
+  prev: SubAgentInfo | undefined,
+  next: SubAgentInfo,
+): SubAgentInfo {
+  if (!prev) return next;
+  return {
+    ...prev,
+    ...next,
+    // Lifecycle frames are sparse, and a stripped terminal frame may say 0.
+    description: prev.description || next.description,
+    agentType: next.agentType ?? prev.agentType,
+    model: next.model ?? prev.model,
+    effort: next.effort ?? prev.effort,
+    taskType: next.taskType ?? prev.taskType,
+    prompt: next.prompt ?? prev.prompt,
+    hasPrompt: next.hasPrompt ?? prev.hasPrompt,
+    lastTool: next.lastTool ?? prev.lastTool,
+    events: prev.events ?? next.events,
+    eventCount: Math.max(prev.eventCount ?? 0, next.eventCount ?? 0) || undefined,
+  };
+}
+
+export function transcriptLength(sa: SubAgentInfo): number {
+  return sa.events?.length ?? sa.eventCount ?? 0;
+}
+
+export function isTerminalSubagent(e: StreamEvent): boolean {
+  return (
+    e.kind === "subagent_done" || (e.subagent?.status != null && e.subagent.status !== "running")
+  );
+}
+
+export function attachToolResult(events: readonly StreamEvent[], result: StreamEvent) {
+  if (result.kind !== "tool_result" || !result.toolUseId) return undefined;
+  const index = events.findIndex((e) => e.kind === "tool_use" && e.toolUseId === result.toolUseId);
+  if (index < 0) return undefined;
+  return {
+    index,
+    event: {
+      ...events[index],
+      toolResult: result.content,
+      ...(result.isMarkdown && { toolResultIsMarkdown: true }),
+      ...(result.isError && { toolResultIsError: true }),
+      ...(result.durationMs != null && { durationMs: result.durationMs }),
+    },
+  };
 }
 
 export function isBannerEvent(e: StreamEvent): boolean {
@@ -71,30 +144,9 @@ function foldTask(parts: StreamEvent[]): StreamEvent {
     if (
       !folded ||
       e.kind === "subagent_done" ||
-      (e.kind === "subagent_progress" && folded.kind === "subagent_start")
+      (e.kind === "subagent_progress" && !innerSubagentEvent(e) && !isTerminalSubagent(folded))
     ) {
-      const prev = folded?.subagent;
-      const next = e.subagent!;
-      folded = {
-        ...e,
-        subagent: {
-          ...(prev ?? {}),
-          ...next,
-          // Later lifecycle events carry only their own fields: keep what the
-          // start knew (description, type, prompt) and the real inner count —
-          // a summarised done event says 0, which would hide the transcript.
-          description: prev?.description || next.description,
-          agentType: next.agentType ?? prev?.agentType,
-          model: next.model ?? prev?.model,
-          effort: next.effort ?? prev?.effort,
-          taskType: next.taskType ?? prev?.taskType,
-          prompt: next.prompt ?? prev?.prompt,
-          hasPrompt: next.hasPrompt ?? prev?.hasPrompt,
-          lastTool: next.lastTool ?? prev?.lastTool,
-          events: prev?.events ?? next.events,
-          eventCount: Math.max(prev?.eventCount ?? 0, next.eventCount ?? 0) || undefined,
-        },
-      };
+      folded = { ...e, subagent: mergeSubagentInfo(folded?.subagent, e.subagent!) };
     }
   }
   foldCache.set(parts[0], { parts, folded: folded! });

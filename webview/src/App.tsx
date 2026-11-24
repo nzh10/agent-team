@@ -32,7 +32,8 @@ import {
   ConfirmDialog,
 } from "./workspace/dialogs";
 import { ExtensionUi } from "./workspace/ExtensionUi";
-import { UiDialogModal, uiDialogKey } from "./workspace/UiDialogModal";
+import { UiDialogModal } from "./workspace/UiDialogModal";
+import { selectUiDialogs, uiDialogKey } from "./state/uiDialogs";
 import { Sidebar } from "./sidebar/Sidebar";
 import { GitBar } from "./workspace/GitBar";
 import { ReportSwitch } from "./workspace/ReportSwitch";
@@ -1390,17 +1391,10 @@ export function App() {
     }
   };
 
-  const currentDialog = pendingDialogs
-    .filter((dialog) => dialog.workspaceId === activeWsId)
-    .sort((a, b) => a.createdAt - b.createdAt || a.requestId.localeCompare(b.requestId))[0];
-  const otherDialog = pendingDialogs
-    .filter((dialog) => dialog.workspaceId !== activeWsId)
-    .sort((a, b) => a.createdAt - b.createdAt || a.requestId.localeCompare(b.requestId))[0];
-  const otherDialogCount = new Set(
-    pendingDialogs
-      .filter((dialog) => dialog.workspaceId !== activeWsId)
-      .map((dialog) => dialog.workspaceId),
-  ).size;
+  const { currentDialog, otherDialog, otherDialogCount } = useMemo(
+    () => selectUiDialogs(pendingDialogs, activeWsId),
+    [pendingDialogs, activeWsId],
+  );
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const el = e.target;

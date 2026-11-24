@@ -7,10 +7,18 @@ import type {
   Workspace,
 } from "../state/useServer";
 import { AgentAvatar } from "../workspace/avatar";
-import { CODEX_SETUP_VALUE, ConfirmDialog } from "../workspace/dialogs";
+import { ConfirmDialog } from "../workspace/dialogs";
+import {
+  CODEX_SETUP_VALUE,
+  isCodexSetup,
+  modelLabels,
+  needsCodexSetup,
+  shortModel,
+  usableModels,
+} from "../workspace/models";
 import { EffortSelect, effortOf, selectableLevels } from "../workspace/EffortSelect";
 import { agentState, stateLabel } from "../workspace/agents";
-import { formatRelative, formatTokens, shortModel } from "../format";
+import { formatRelative, formatTokens } from "../format";
 import { DEFAULT_BRANCH, sessionName, sessionState, sessionWork } from "./scope";
 import { AgentTasks, hasWork, soon, workCount, type TaskActions } from "./SessionTasks";
 import { Icon } from "./Icon";
@@ -327,15 +335,13 @@ function AgentRow({
   const ctx = a.context;
   const pct = ctx && ctx.window ? Math.min(100, Math.round((ctx.tokens / ctx.window) * 100)) : null;
   const bg = a.backgroundTasks ?? [];
-  const codexLocked = codexAuth != null && !codexAuth.authenticated;
-  const { backend, allowOtherBackend, ids } = switchable(a, models, codexLocked);
+  const { backend, allowOtherBackend, ids } = switchable(a, models, codexAuth);
   const modelOptions = modelLabels(ids);
   const showCodexSetup =
     !archived &&
     !readOnly &&
     connected &&
-    !!codexAuth?.cliAvailable &&
-    !codexAuth.authenticated &&
+    needsCodexSetup(codexAuth) &&
     (allowOtherBackend || backend === "codex");
   const hasModelSelect =
     !archived &&
@@ -364,7 +370,7 @@ function AgentRow({
                   title="Switch model; the conversation carries over"
                   value={a.model}
                   onChange={(e) => {
-                    if (e.target.value === CODEX_SETUP_VALUE) {
+                    if (isCodexSetup(e.target.value)) {
                       onOpenCodexSetup?.();
                       return;
                     }
@@ -383,9 +389,9 @@ function AgentRow({
                   )}
                 </select>
               ) : hasControls ? (
-                <span className="ap-meta-model">{shortAgentModel(a.model)}</span>
+                <span className="ap-meta-model">{shortModel(a.model)}</span>
               ) : (
-                shortAgentModel(a.model)
+                shortModel(a.model)
               )}
               {effortLevels ? (
                 <>
@@ -467,79 +473,16 @@ function AgentRow({
   );
 }
 
-function parseModelParts(id: string): {
-  id: string;
-  provider: string;
-  date: string;
-  short: string;
-} {
-  const m = id.match(/^(.*?)(\[1m\])?$/i);
-  const raw = m?.[1] ?? id;
-  const suffix = m?.[2] ?? "";
-  const slash = raw.lastIndexOf("/");
-  const provider = slash >= 0 ? raw.slice(0, slash) : "";
-  const name = slash >= 0 ? raw.slice(slash + 1) : raw;
-  const dm = name.match(/^(.+?)-(\d{8})$/);
-  const baseName = dm ? dm[1] : name;
-  const date = dm ? dm[2] : "";
-  return {
-    id,
-    provider,
-    date,
-    short: shortModel(suffix ? `${baseName}${suffix}` : baseName),
-  };
-}
-
-function shortAgentModel(id: string): string {
-  return parseModelParts(id).short;
-}
-
-// Strip provider prefixes and snapshot dates locally for narrow selects, adding
-// back whichever part disambiguates colliding options while keeping full IDs
-// in `<option value>`.
-function modelLabels(ids: string[]): Array<{ id: string; label: string }> {
-  const parsed = ids.map(parseModelParts);
-  const byShort = new Map<string, typeof parsed>();
-
-  for (const item of parsed) {
-    const group = byShort.get(item.short);
-    if (group) group.push(item);
-    else byShort.set(item.short, [item]);
-  }
-
-  const resolved = parsed.map((item) => {
-    const group = byShort.get(item.short)!;
-    if (group.length === 1) return { id: item.id, label: item.short };
-
-    const providersDiffer = new Set(group.map((g) => g.provider)).size > 1;
-    const datesDiffer = new Set(group.map((g) => g.date)).size > 1;
-    const parts: string[] = [];
-
-    if (providersDiffer && item.provider) parts.push(item.provider);
-    if (datesDiffer && item.date) parts.push(item.date);
-
-    return {
-      id: item.id,
-      label: parts.length > 0 ? `${item.short} (${parts.join(", ")})` : item.short,
-    };
-  });
-
-  const labelCounts = new Map<string, number>();
-  for (const r of resolved) labelCounts.set(r.label, (labelCounts.get(r.label) ?? 0) + 1);
-
-  return resolved.map((r) => (labelCounts.get(r.label)! > 1 ? { id: r.id, label: r.id } : r));
-}
-
 // A conversation stays on its backend. The current model is always selectable.
 function switchable(
   a: AgentInfo,
   models: ModelOption[],
-  codexLocked = false,
+  codexAuth?: CodexAuthState | null,
 ): { backend: "pi" | "codex"; allowOtherBackend: boolean; ids: string[] } {
   const backend =
     models.find((m) => m.id === a.model)?.backend ?? (a.model.startsWith("gpt-") ? "codex" : "pi");
   const allowOtherBackend = !!(a.canSwitchBackend && !a.busy && agentState(a) === "idle");
-  const usable = codexLocked ? models.filter((m) => m.backend !== "codex") : models;
+  const usable = usableModels(models, codexAuth);
   const ids = usable.filter((m) => allowOtherBackend || m.backend === backend).map((m) => m.id);
   return {
     backend,

@@ -1,11 +1,11 @@
-import { useState, useRef, useEffect, useMemo, type RefObject } from "react";
-import { createPortal } from "react-dom";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { EffortSelect, effortOf } from "./EffortSelect";
 import type { AgentPreset, CodexAuthState, ModelOption, HostInfo } from "../state/useServer";
 import { isImageAvatar } from "./avatar";
+import { DialogFrame } from "./DialogFrame";
 import { copyText } from "../chat/clipboard";
 
-export const CODEX_SETUP_VALUE = "__codex_setup__";
+import { CODEX_SETUP_VALUE, isCodexSetup, needsCodexSetup, usableModels } from "./models";
 export const CODEX_LOGIN_COMMAND = "npx codex login";
 
 // Small modal confirmation used for destructive actions (purging archived
@@ -25,68 +25,32 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  const initialFocus = useRef<HTMLButtonElement>(null);
-  useDialogKeys(initialFocus, onClose);
-  return createPortal(
-    <div
-      className="dialog-overlay"
-      onClick={(e) => {
-        e.stopPropagation();
-        onClose();
-      }}
-    >
-      <div className="dialog dialog-confirm" onClick={(e) => e.stopPropagation()}>
-        <div className="dialog-title">{title}</div>
-        <p className="dialog-body">{body}</p>
-        <div className="dialog-actions">
-          <button
-            ref={danger ? initialFocus : undefined}
-            type="button"
-            className="btn-secondary"
-            onClick={onClose}
-          >
-            Cancel
-          </button>
-          <button
-            ref={danger ? undefined : initialFocus}
-            type="button"
-            className={danger ? "btn-danger" : "btn-primary"}
-            onClick={() => {
-              onConfirm();
-              onClose();
-            }}
-          >
-            {confirmLabel}
-          </button>
-        </div>
+  return (
+    <DialogFrame title={title} className="dialog-confirm" onClose={onClose}>
+      <p className="dialog-body">{body}</p>
+      <div className="dialog-actions">
+        <button
+          data-dialog-focus={danger ? "" : undefined}
+          type="button"
+          className="btn-secondary"
+          onClick={onClose}
+        >
+          Cancel
+        </button>
+        <button
+          data-dialog-focus={danger ? undefined : ""}
+          type="button"
+          className={danger ? "btn-danger" : "btn-primary"}
+          onClick={() => {
+            onConfirm();
+            onClose();
+          }}
+        >
+          {confirmLabel}
+        </button>
       </div>
-    </div>,
-    document.body,
+    </DialogFrame>
   );
-}
-
-// Focus moves into the dialog, and Escape closes it. Parents pass fresh
-// closures on every render (each stream frame); re-running the effect would
-// pull focus back. Capture phase, and marked handled: what is behind the
-// dialog (the board, a side panel) must not take the same Escape as its own.
-function useDialogKeys(
-  focus: RefObject<HTMLElement | null>,
-  onClose: () => void,
-  active = true,
-): void {
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  useEffect(() => {
-    if (!active) return;
-    focus.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.preventDefault();
-      onCloseRef.current();
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [focus, active]);
 }
 
 const BACKEND_GROUPS: Array<[ModelOption["backend"], string]> = [
@@ -127,12 +91,8 @@ export function AddAgentDialog({
   onClose: () => void;
   onAdd: (name: string, model: string, avatar: string, color: string, effort?: string) => void;
 }) {
-  const codexLocked = codexAuth != null && !codexAuth.authenticated;
-  const showCodexHint = !!codexAuth && codexAuth.cliAvailable && !codexAuth.authenticated;
-  const selectableModels = useMemo(
-    () => (codexLocked ? models.filter((m) => m.backend !== "codex") : models),
-    [codexLocked, models],
-  );
+  const showCodexHint = needsCodexSetup(codexAuth);
+  const selectableModels = useMemo(() => usableModels(models, codexAuth), [codexAuth, models]);
 
   const [selectedPreset, setSelectedPreset] = useState(0);
   const initial = defaultAddSelection(selectableModels, presets[0], selectableModels[0]?.id ?? "");
@@ -153,7 +113,7 @@ export function AddAgentDialog({
   }, [selectableModels, model, presets, selectedPreset]);
 
   const chooseModel = (next: string) => {
-    if (next === CODEX_SETUP_VALUE) {
+    if (isCodexSetup(next)) {
       onOpenCodexSetup?.();
       return;
     }
@@ -164,143 +124,137 @@ export function AddAgentDialog({
 
   const preset = presets[selectedPreset];
   const finalName = customName || preset?.name || "Agent";
-  const nameRef = useRef<HTMLInputElement>(null);
-  useDialogKeys(nameRef, onClose, !suspended);
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
-      <div className="dialog" onClick={(e) => e.stopPropagation()}>
-        <div className="dialog-title">Add Agent</div>
-
-        <div className="preset-grid">
-          {presets.map((p, i) => (
-            <div
-              key={p.name}
-              className={`preset-item ${i === selectedPreset ? "selected" : ""}`}
-              onClick={() => {
-                setSelectedPreset(i);
-                if (p.model || p.effort) {
-                  const next = defaultAddSelection(selectableModels, p, model);
-                  setModel(next.model);
-                  setEffort(next.effort);
-                }
-                setCustomName("");
-              }}
-            >
-              <div
-                className="agent-avatar"
-                style={{
-                  width: 36,
-                  height: 36,
-                  background: isImageAvatar(p.avatar) ? "transparent" : p.color,
-                  fontSize: 18,
-                }}
-              >
-                {isImageAvatar(p.avatar) ? (
-                  <img
-                    src={p.avatar}
-                    alt={p.name}
-                    style={{ width: 36, height: 36, borderRadius: "50%", objectFit: "cover" }}
-                  />
-                ) : (
-                  p.avatar
-                )}
-              </div>
-              <span>{p.name}</span>
-            </div>
-          ))}
-        </div>
-
-        <label className="dialog-field">
-          <span>Name (or use preset)</span>
-          <input
-            ref={nameRef}
-            value={customName}
-            onChange={(e) => setCustomName(e.target.value)}
-            placeholder={preset?.name}
-          />
-        </label>
-
-        <div className="dialog-field">
-          <label className="dialog-field-label" htmlFor="add-agent-model">
-            Model
-          </label>
-          <select id="add-agent-model" value={model} onChange={(e) => chooseModel(e.target.value)}>
-            {selectableModels.length === 0 && (
-              <option value="" disabled>
-                No models available
-              </option>
-            )}
-            {BACKEND_GROUPS.map(([backend, label]) => {
-              const group = selectableModels.filter((m) => m.backend === backend);
-              if (group.length > 0) {
-                return (
-                  <optgroup key={backend} label={label}>
-                    {group.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                );
-              }
-              if (backend === "codex" && showCodexHint) {
-                return (
-                  <optgroup key={backend} label={label}>
-                    <option value={CODEX_SETUP_VALUE} className="codex-unauth-option">
-                      Codex (not signed in)
-                    </option>
-                  </optgroup>
-                );
-              }
-              return null;
-            })}
-          </select>
-          {showCodexHint && onOpenCodexSetup && (
-            <button type="button" className="codex-auth-hint" onClick={onOpenCodexSetup}>
-              Sign in to Codex…
-            </button>
-          )}
-        </div>
-
-        {effortOf(selectableModels, model).levels.length > 0 && (
-          <label className="dialog-field">
-            <span>Effort</span>
-            <EffortSelect
-              {...effortOf(selectableModels, model)}
-              value={effort}
-              onChange={setEffort}
-              label="Reasoning effort"
-              fresh
-            />
-          </label>
-        )}
-
-        <div className="dialog-actions">
-          <button type="button" className="btn-secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={!model}
+    <DialogFrame title="Add Agent" onClose={onClose} suspended={suspended}>
+      <div className="preset-grid">
+        {presets.map((p, i) => (
+          <div
+            key={p.name}
+            className={`preset-item ${i === selectedPreset ? "selected" : ""}`}
             onClick={() => {
-              if (!model) return;
-              onAdd(
-                finalName,
-                model,
-                preset?.avatar ?? "🤖",
-                preset?.color ?? "#888",
-                effort || undefined,
-              );
-              onClose();
+              setSelectedPreset(i);
+              if (p.model || p.effort) {
+                const next = defaultAddSelection(selectableModels, p, model);
+                setModel(next.model);
+                setEffort(next.effort);
+              }
+              setCustomName("");
             }}
           >
-            Add
-          </button>
-        </div>
+            <div
+              className="agent-avatar"
+              style={{
+                width: 36,
+                height: 36,
+                background: isImageAvatar(p.avatar) ? "transparent" : p.color,
+                fontSize: 18,
+              }}
+            >
+              {isImageAvatar(p.avatar) ? (
+                <img
+                  src={p.avatar}
+                  alt={p.name}
+                  style={{ width: 36, height: 36, borderRadius: "50%", objectFit: "cover" }}
+                />
+              ) : (
+                p.avatar
+              )}
+            </div>
+            <span>{p.name}</span>
+          </div>
+        ))}
       </div>
-    </div>
+
+      <label className="dialog-field">
+        <span>Name (or use preset)</span>
+        <input
+          data-dialog-focus
+          value={customName}
+          onChange={(e) => setCustomName(e.target.value)}
+          placeholder={preset?.name}
+        />
+      </label>
+
+      <div className="dialog-field">
+        <label className="dialog-field-label" htmlFor="add-agent-model">
+          Model
+        </label>
+        <select id="add-agent-model" value={model} onChange={(e) => chooseModel(e.target.value)}>
+          {selectableModels.length === 0 && (
+            <option value="" disabled>
+              No models available
+            </option>
+          )}
+          {BACKEND_GROUPS.map(([backend, label]) => {
+            const group = selectableModels.filter((m) => m.backend === backend);
+            if (group.length > 0) {
+              return (
+                <optgroup key={backend} label={label}>
+                  {group.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            }
+            if (backend === "codex" && showCodexHint) {
+              return (
+                <optgroup key={backend} label={label}>
+                  <option value={CODEX_SETUP_VALUE} className="codex-unauth-option">
+                    Codex (not signed in)
+                  </option>
+                </optgroup>
+              );
+            }
+            return null;
+          })}
+        </select>
+        {showCodexHint && onOpenCodexSetup && (
+          <button type="button" className="codex-auth-hint" onClick={onOpenCodexSetup}>
+            Sign in to Codex…
+          </button>
+        )}
+      </div>
+
+      {effortOf(selectableModels, model).levels.length > 0 && (
+        <label className="dialog-field">
+          <span>Effort</span>
+          <EffortSelect
+            {...effortOf(selectableModels, model)}
+            value={effort}
+            onChange={setEffort}
+            label="Reasoning effort"
+            fresh
+          />
+        </label>
+      )}
+
+      <div className="dialog-actions">
+        <button type="button" className="btn-secondary" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={!model}
+          onClick={() => {
+            if (!model) return;
+            onAdd(
+              finalName,
+              model,
+              preset?.avatar ?? "🤖",
+              preset?.color ?? "#888",
+              effort || undefined,
+            );
+            onClose();
+          }}
+        >
+          Add
+        </button>
+      </div>
+    </DialogFrame>
   );
 }
 
@@ -317,11 +271,8 @@ export function CodexSetupDialog({
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [checkRequested, setCheckRequested] = useState(false);
-  const recheckRef = useRef<HTMLButtonElement>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const sawRecheckingRef = useRef(false);
-
-  useDialogKeys(recheckRef, onClose);
 
   useEffect(() => {
     return () => clearTimeout(copyTimerRef.current);
@@ -364,55 +315,50 @@ export function CodexSetupDialog({
   })();
 
   return (
-    <div className="dialog-overlay dialog-codex-setup-overlay" onClick={onClose}>
-      <div
-        className="dialog dialog-codex-setup"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="codex-setup-title"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div id="codex-setup-title" className="dialog-title">
-          Sign in to Codex
-        </div>
-        <p className="dialog-body">
-          Run this command in your terminal to sign in with your Codex account, then re-check to
-          unlock Codex models and quota:
-        </p>
-        <div className="codex-cmd-box">
-          <code className="codex-cmd-code">{CODEX_LOGIN_COMMAND}</code>
-          <button
-            type="button"
-            className="btn-secondary codex-copy-btn"
-            onClick={() => void handleCopy()}
-          >
-            {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy"}
-          </button>
-        </div>
-        {statusNote && (
-          <p
-            className={`codex-auth-status${codexAuth?.authenticated ? " authenticated" : ""}`}
-            role="status"
-          >
-            {statusNote}
-          </p>
-        )}
-        <div className="dialog-actions">
-          <button type="button" className="btn-secondary" onClick={onClose}>
-            Close
-          </button>
-          <button
-            ref={recheckRef}
-            type="button"
-            className="btn-primary"
-            disabled={rechecking}
-            onClick={handleRecheck}
-          >
-            {rechecking ? "Checking…" : "Re-check"}
-          </button>
-        </div>
+    <DialogFrame
+      title="Sign in to Codex"
+      className="dialog-codex-setup"
+      overlayClass="dialog-codex-setup-overlay"
+      priority={1}
+      onClose={onClose}
+    >
+      <p className="dialog-body">
+        Run this command in your terminal to sign in with your Codex account, then re-check to
+        unlock Codex models and quota:
+      </p>
+      <div className="codex-cmd-box">
+        <code className="codex-cmd-code">{CODEX_LOGIN_COMMAND}</code>
+        <button
+          type="button"
+          className="btn-secondary codex-copy-btn"
+          onClick={() => void handleCopy()}
+        >
+          {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy"}
+        </button>
       </div>
-    </div>
+      {statusNote && (
+        <p
+          className={`codex-auth-status${codexAuth?.authenticated ? " authenticated" : ""}`}
+          role="status"
+        >
+          {statusNote}
+        </p>
+      )}
+      <div className="dialog-actions">
+        <button type="button" className="btn-secondary" onClick={onClose}>
+          Close
+        </button>
+        <button
+          data-dialog-focus
+          type="button"
+          className="btn-primary"
+          disabled={rechecking}
+          onClick={handleRecheck}
+        >
+          {rechecking ? "Checking…" : "Re-check"}
+        </button>
+      </div>
+    </DialogFrame>
   );
 }
 
@@ -430,7 +376,6 @@ export function CreateProjectDialog({
 } & DirectorySource) {
   const [name, setName] = useState("");
   const [withoutGit, setWithoutGit] = useState(false);
-  const nameRef = useRef<HTMLInputElement>(null);
   const local = hosts.find((host) => host.type === "local");
   const {
     path: root,
@@ -443,54 +388,52 @@ export function CreateProjectDialog({
     label: "Repository path",
     placeholder: withoutGit ? "No repository" : "/path/to/repository",
   });
-  useDialogKeys(nameRef, () => {
+  const onEscape = () => {
     if (!dismiss()) onClose();
-  });
+  };
   const canSubmit = name.trim().length > 0 && (withoutGit || root.trim().length > 0);
   return (
-    <div className="dialog-overlay" onClick={onClose}>
-      <form
-        className="dialog"
-        onClick={(e) => e.stopPropagation()}
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (!canSubmit) return;
-          onCreate(name.trim(), withoutGit ? null : root.trim());
-          onClose();
-        }}
-      >
-        <div className="dialog-title">New Project</div>
-        <label className="dialog-field">
-          <span>Name</span>
-          <input
-            ref={nameRef}
-            value={name}
-            placeholder="Project name…"
-            onChange={(e) => setName(e.target.value)}
-          />
-        </label>
-        {field}
-        <label className="dialog-checkbox">
-          <input
-            type="checkbox"
-            checked={withoutGit}
-            onChange={(e) => setWithoutGit(e.target.checked)}
-          />
-          <span>Create without a Git repository</span>
-        </label>
-        <p className="dialog-help">
-          A project without Git still has objectives, issues, notes and a lead session.
-        </p>
-        <div className="dialog-actions">
-          <button type="button" className="btn-secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="btn-primary" disabled={!canSubmit}>
-            Create project
-          </button>
-        </div>
-      </form>
-    </div>
+    <DialogFrame
+      title="New Project"
+      onClose={onClose}
+      onEscape={onEscape}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!canSubmit) return;
+        onCreate(name.trim(), withoutGit ? null : root.trim());
+        onClose();
+      }}
+    >
+      <label className="dialog-field">
+        <span>Name</span>
+        <input
+          data-dialog-focus
+          value={name}
+          placeholder="Project name…"
+          onChange={(e) => setName(e.target.value)}
+        />
+      </label>
+      {field}
+      <label className="dialog-checkbox">
+        <input
+          type="checkbox"
+          checked={withoutGit}
+          onChange={(e) => setWithoutGit(e.target.checked)}
+        />
+        <span>Create without a Git repository</span>
+      </label>
+      <p className="dialog-help">
+        A project without Git still has objectives, issues, notes and a lead session.
+      </p>
+      <div className="dialog-actions">
+        <button type="button" className="btn-secondary" onClick={onClose}>
+          Cancel
+        </button>
+        <button type="submit" className="btn-primary" disabled={!canSubmit}>
+          Create project
+        </button>
+      </div>
+    </DialogFrame>
   );
 }
 
@@ -644,7 +587,6 @@ export function CreateWorkspaceDialog({
   const [name, setName] = useState("");
   const [projectName, setProjectName] = useState("");
   const [hostId, setHostId] = useState(hosts[0]?.id ?? "local");
-  const nameRef = useRef<HTMLInputElement>(null);
   const {
     path: dirPath,
     field,
@@ -656,9 +598,9 @@ export function CreateWorkspaceDialog({
     label: "Directory path",
     placeholder: "~/workspace/...",
   });
-  useDialogKeys(nameRef, () => {
+  const onEscape = () => {
     if (!dismiss()) onClose();
-  });
+  };
 
   const canSubmit = dirPath.trim().length > 0;
   const defaultName = dirPath.split("/").filter(Boolean).pop() ?? "";
@@ -678,50 +620,47 @@ export function CreateWorkspaceDialog({
   };
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
-      <form className="dialog" onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <div className="dialog-title">New Session</div>
+    <DialogFrame title="New Session" onClose={onClose} onEscape={onEscape} onSubmit={handleSubmit}>
+      <label className="dialog-field">
+        <span>Name</span>
+        <input
+          data-dialog-focus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={defaultName || "Session name…"}
+        />
+      </label>
+      {field}
+      {newProject && (
         <label className="dialog-field">
-          <span>Name</span>
+          <span>Project</span>
           <input
-            ref={nameRef}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder={defaultName || "Session name…"}
+            value={projectName}
+            onChange={(e) => setProjectName(e.target.value)}
+            placeholder={defaultName}
           />
         </label>
-        {field}
-        {newProject && (
-          <label className="dialog-field">
-            <span>Project</span>
-            <input
-              value={projectName}
-              onChange={(e) => setProjectName(e.target.value)}
-              placeholder={defaultName}
-            />
-          </label>
-        )}
-        {hosts.length > 1 && (
-          <label className="dialog-field">
-            <span>Host</span>
-            <select value={hostId} onChange={(e) => setHostId(e.target.value)}>
-              {hosts.map((h) => (
-                <option key={h.id} value={h.id}>
-                  {h.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        <div className="dialog-actions">
-          <button type="button" className="btn-secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="btn-primary" disabled={!canSubmit}>
-            Create session
-          </button>
-        </div>
-      </form>
-    </div>
+      )}
+      {hosts.length > 1 && (
+        <label className="dialog-field">
+          <span>Host</span>
+          <select value={hostId} onChange={(e) => setHostId(e.target.value)}>
+            {hosts.map((h) => (
+              <option key={h.id} value={h.id}>
+                {h.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <div className="dialog-actions">
+        <button type="button" className="btn-secondary" onClick={onClose}>
+          Cancel
+        </button>
+        <button type="submit" className="btn-primary" disabled={!canSubmit}>
+          Create session
+        </button>
+      </div>
+    </DialogFrame>
   );
 }

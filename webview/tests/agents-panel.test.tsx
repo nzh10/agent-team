@@ -9,7 +9,7 @@ import {
   stateSummary,
 } from "../src/panels/scope";
 import { App } from "../src/App";
-import { CODEX_SETUP_VALUE } from "../src/workspace/dialogs";
+import { CODEX_SETUP_VALUE } from "../src/workspace/models";
 import type {
   AgentInfo,
   CodexAuthState,

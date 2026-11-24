@@ -74,7 +74,8 @@ it.each([320, 1200])(
       </div>,
     );
     const header = get(container, ".subagent-header");
-    expect(header.textContent).toBe(`▸✓Reviewer${model}high3s`);
+    const compactModel = "long model identifier ".repeat(12);
+    expect(header.textContent).toBe(`▸✓Reviewer${compactModel}high3s`);
     for (const selector of [
       ".subagent-desc",
       ".subagent-model",

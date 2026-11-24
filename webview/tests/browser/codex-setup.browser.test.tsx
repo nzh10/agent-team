@@ -3,12 +3,8 @@ import { useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import {
-  AddAgentDialog,
-  CodexSetupDialog,
-  CODEX_LOGIN_COMMAND,
-  CODEX_SETUP_VALUE,
-} from "../../src/workspace/dialogs";
+import { AddAgentDialog, CodexSetupDialog, CODEX_LOGIN_COMMAND } from "../../src/workspace/dialogs";
+import { CODEX_SETUP_VALUE } from "../../src/workspace/models";
 import type { CodexAuthState, ModelOption } from "../../src/state/useServer";
 import "../../src/styles.css";
 

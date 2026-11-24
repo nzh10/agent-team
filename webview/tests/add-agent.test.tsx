@@ -1,12 +1,8 @@
 // A new agent: its model, and the reasoning effort the model takes.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, fireEvent, act } from "@testing-library/react";
-import {
-  AddAgentDialog,
-  CodexSetupDialog,
-  CODEX_LOGIN_COMMAND,
-  CODEX_SETUP_VALUE,
-} from "../src/workspace/dialogs";
+import { AddAgentDialog, CodexSetupDialog, CODEX_LOGIN_COMMAND } from "../src/workspace/dialogs";
+import { CODEX_SETUP_VALUE } from "../src/workspace/models";
 import type { AgentPreset, CodexAuthState, ModelOption } from "../src/state/useServer";
 
 const models: ModelOption[] = [
