@@ -72,6 +72,68 @@ describe("math in the source", () => {
     expect(text("\\[\nE = mc^2\n\\]")).toBe("$$\nE = mc^2\n$$");
   });
 
+  it("distinguishes escaped regex groups and quoted syntax from inline TeX", () => {
+    for (const s of [
+      String.raw`Key\(word\) and id_\(x\)`,
+      String.raw`\s*\(x\)`,
+      String.raw`\(([^)]+)\) and \([x)\)`,
+      String.raw`\(a_{1\) and \((x\)`,
+      String.raw`\((?:a|b)\) and \([-\d.]\)`,
+      String.raw`\(\d\) \(\D\) \(\s\) \(\S\) \(\w\) \(\W\)`,
+      String.raw`write "\(x\)" or “\(x\)” or use /\(x\)/`,
+      String.raw`Use /\(x\)+/g or /\(x\){2,5}?/g`,
+      String.raw`\s*\(x\)*`,
+      String.raw`\(中文\) and \(\(x`,
+    ])
+      unchanged(s);
+    for (const [src, expected] of [
+      [String.raw`长度为\(n\)`, "长度为$$n$$"],
+      [String.raw`\(a_1 + b_2\)`, "$$a_1 + b_2$$"],
+      [String.raw`\(O(n \log n)\)`, String.raw`$$O(n \log n)$$`],
+      [String.raw`\(\text{中文}\)`, String.raw`$$\text{中文}$$`],
+      [String.raw`**\(x = 1\) holds**`, "**$$x = 1$$ holds**"],
+      [String.raw`_\(x = 1\) holds_`, "_$$x = 1$$ holds_"],
+      [String.raw`区间为\(\left[0,1\right)\)`, String.raw`区间为$$\left[0,1\right)$$`],
+      [String.raw`\(x \in (0,1]\)`, String.raw`$$x \in (0,1]$$`],
+      [String.raw`\(x \in ]0,1[\)`, String.raw`$$x \in ]0,1[$$`],
+      [
+        String.raw`\(\begin{matrix}a\\d\end{matrix}\)`,
+        String.raw`$$\begin{matrix}a\\d\end{matrix}$$`,
+      ],
+      [
+        String.raw`\(\begin{matrix}a\\(b)\end{matrix}\)`,
+        String.raw`$$\begin{matrix}a\\(b)\end{matrix}$$`,
+      ],
+      [
+        String.raw`\(\begin{matrix}(a\\)b\end{matrix}\)`,
+        String.raw`$$\begin{matrix}(a\\)b\end{matrix}$$`,
+      ],
+      [String.raw`\(\text{中文 \textbf{a_b}}\)`, String.raw`$$\text{中文 \textbf{a\_b}}$$`],
+      [String.raw`\(\sqrt{x} + \sin x\)`, String.raw`$$\sqrt{x} + \sin x$$`],
+    ])
+      expect(prepareSource(src), src).toEqual({ text: expected, hasMath: true });
+  });
+
+  it("keeps subscripts inside a text argument's embedded math", () => {
+    for (const formula of [
+      String.raw`\text{first_item \(x_{i}\) last_item}`,
+      String.raw`\text{first_item $x_{i}$ last_item}`,
+    ]) {
+      expect(text(`$$${formula}$$`)).toBe(
+        `$$\n${formula.replaceAll("_item", String.raw`\_item`)}\n$$`,
+      );
+    }
+  });
+
+  it("keeps literal double-dollar ellipses as prose, not math", () => {
+    expect(prepareSource("write $$...$$ or $$…$$ then $x$")).toEqual({
+      text: String.raw`write \$\$...\$\$ or \$\$…\$\$ then $$x$$`,
+      hasMath: true,
+    });
+    expect(prepareSource("$$\n...\n$$").hasMath).toBe(false);
+    expect(prepareSource(String.raw`$$\ldots$$`).hasMath).toBe(true);
+  });
+
   it("puts display fences on lines of their own", () => {
     expect(text("$$x^2$$")).toBe("$$\nx^2\n$$");
     expect(text("$$\\begin{aligned}\na &= b\n\\end{aligned}$$\n\nAfter.")).toBe(
@@ -166,6 +228,9 @@ describe("cost", () => {
   it("stays linear on adversarial text", () => {
     for (const md of [
       "\\(a ".repeat(20_000),
+      "\\(a ".repeat(20_000) + "[^x]\\)",
+      String.raw`\(\text{中文 ${"{".repeat(10_000)}x${"}".repeat(10_000)}}\)`,
+      String.raw`\(${String.raw`\\(x\\)`.repeat(10_000)}\)`,
       "$a ".repeat(12_000),
       "$$x$$\n".repeat(20_000),
       "``a ```b ````c ".repeat(20_000),

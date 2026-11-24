@@ -406,14 +406,14 @@ const mdComponents = { pre: CodeBlock, table: ScrollTable, a: Link, code: Inline
 // CommonMark opens **…** only where the ** is not stuck between a letter
 // and punctuation: in Chinese prose ("状态是**“done”**。") it stayed literal.
 const mdRemarkPlugins: Options["remarkPlugins"] = [
-  remarkGfm,
+  [remarkGfm, { singleTilde: false }],
   remarkCjkFriendly,
   remarkHtmlBreaks,
   remarkDetails,
 ];
 // A row of text has no blocks to fold.
 const inlineRemarkPlugins: Options["remarkPlugins"] = [
-  remarkGfm,
+  [remarkGfm, { singleTilde: false }],
   remarkCjkFriendly,
   remarkHtmlBreaks,
 ];
