@@ -31,6 +31,7 @@ import {
   type Transport,
   type TurnError,
 } from "./codex-rpc";
+import { applyNonInteractiveGitEnv } from "./git-env";
 import type { PanelToolset } from "../project/tools";
 import {
   codexContextWindow,
@@ -82,7 +83,7 @@ export class CodexSession extends EventEmitter {
   // Replaced by the tests: the connection a session opens (a recording
   // played back, an in-memory server) instead of a real app-server.
   static hooks: {
-    transport?: (session: CodexSession) => Transport;
+    transport?: (session: CodexSession, env: NodeJS.ProcessEnv) => Transport;
     capacityRetryDelaysMs?: number[];
   } | null = null;
 
@@ -193,10 +194,13 @@ export class CodexSession extends EventEmitter {
 
   // What of the provider env is codex's: the server's carries other
   // backends' credentials too (a Claude login token), which neither belong
-  // in codex's commands nor restart it when they change.
+  // in codex's commands nor restart it when they change. Also allow the
+  // shared session Git prompt override.
   private codexEnv(): Record<string, string> {
     return Object.fromEntries(
-      Object.entries(this.config.providerEnv ?? {}).filter(([k]) => /^(OPENAI|CODEX)_/.test(k)),
+      Object.entries(this.config.providerEnv ?? {}).filter(
+        ([k]) => k === "GIT_TERMINAL_PROMPT" || /^(OPENAI|CODEX)_/.test(k),
+      ),
     );
   }
 
@@ -210,7 +214,7 @@ export class CodexSession extends EventEmitter {
   }
 
   private env(): NodeJS.ProcessEnv {
-    return codexProcessEnv(this.codexEnv());
+    return applyNonInteractiveGitEnv(codexProcessEnv(this.codexEnv()));
   }
 
   private connect(): Promise<AppServerClient> {
@@ -231,9 +235,9 @@ export class CodexSession extends EventEmitter {
 
   private async open(): Promise<AppServerClient> {
     const key = this.launchKey();
+    const env = this.env();
     const transport =
-      CodexSession.hooks?.transport?.(this) ??
-      spawnAppServer({ cwd: this.config.cwd, env: this.env() });
+      CodexSession.hooks?.transport?.(this, env) ?? spawnAppServer({ cwd: this.config.cwd, env });
     const client: AppServerClient = new AppServerClient(transport, {
       notification: (method, params) => {
         if (client === this.client) this.onNotification(method, params);

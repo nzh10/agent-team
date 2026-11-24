@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import type { PanelToolset } from "../project/tools";
 import { ACP_PREPARE_STEP, inspectAcpRuntime } from "./acp-readiness";
+import { applyNonInteractiveGitEnv } from "./git-env";
 import type { BoundarySteer, HostSessionHandle } from "./host";
 import { PanelHttpServer, type PanelHttpAddress } from "./panel-http";
 import { discoverLocalPiPackages, prepareControlledPiAgentHome } from "./pi-agent-home";
@@ -814,11 +815,11 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     });
     this.registered = true;
     try {
-      const env: NodeJS.ProcessEnv = {
+      const env = applyNonInteractiveGitEnv({
         ...process.env,
         ...this.config.providerEnv,
         ...this.home?.env,
-      };
+      });
       // A Hub session is a top-level Pi, even when Hub itself was started from a child shell.
       for (const name of [
         "PI_SUBAGENT_CHILD",

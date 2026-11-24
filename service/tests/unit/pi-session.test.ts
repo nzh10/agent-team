@@ -731,6 +731,29 @@ describe("PiSession ACP readiness", () => {
   );
 });
 
+describe("PiSession Git environment", () => {
+  it.each([
+    { catalogOnly: false, expected: "0" },
+    { catalogOnly: true, expected: "0" },
+    { inherited: "1", expected: "1" },
+    { inherited: "", expected: "" },
+    { inherited: "0", provider: "1", expected: "1" },
+    { inherited: "1", provider: "", expected: "" },
+  ])("passes the Git prompt setting to the RPC child: %j", async (test) => {
+    vi.stubEnv("GIT_TERMINAL_PROMPT", test.inherited);
+    const h = harness({
+      config: {
+        providerEnv:
+          test.provider === undefined ? undefined : { GIT_TERMINAL_PROMPT: test.provider },
+      },
+      options: { catalogOnly: test.catalogOnly },
+    });
+    await h.session.ensureStarted();
+    expect(h.factory.mock.calls[0][0].env?.GIT_TERMINAL_PROMPT).toBe(test.expected);
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe(test.inherited);
+  });
+});
+
 describe("PiSession dispatch and stream state", () => {
   it("allows a slow quota command to finish without retiring Pi", async () => {
     const h = harness({ delayedQuota: true, disposition: "handled" });

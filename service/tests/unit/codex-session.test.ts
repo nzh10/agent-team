@@ -139,6 +139,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   CodexSession.hooks = null;
 });
 
@@ -162,6 +163,26 @@ const echoTools = (handler: (args: Record<string, unknown>) => Promise<string>):
 });
 
 describe("codex app-server session", () => {
+  it.each([
+    { expected: "0" },
+    { inherited: "1", expected: "1" },
+    { inherited: "", expected: "" },
+    { inherited: "0", provider: "1", expected: "1" },
+    { inherited: "1", provider: "", expected: "" },
+  ])("passes the Git prompt setting to the app-server: %j", async (test) => {
+    vi.stubEnv("GIT_TERMINAL_PROMPT", test.inherited);
+    const transport = vi.fn((_session: CodexSession, _env: NodeJS.ProcessEnv) =>
+      server.transport(),
+    );
+    CodexSession.hooks = { transport };
+    const { session } = makeSession({
+      providerEnv: test.provider === undefined ? undefined : { GIT_TERMINAL_PROMPT: test.provider },
+    });
+    await session.send("first");
+    expect(transport.mock.calls[0][1].GIT_TERMINAL_PROMPT).toBe(test.expected);
+    expect(process.env.GIT_TERMINAL_PROMPT).toBe(test.inherited);
+  });
+
   it.each([false, true])(
     "distinguishes RPC rejection from a lost turn/start response (lost=%s)",
     async (lost) => {
