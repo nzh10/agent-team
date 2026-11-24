@@ -240,6 +240,50 @@ describe("static files", () => {
     }
   });
 
+  it.each(["win32", "freebsd"] as const)(
+    "serves avatars on %s without /proc/self/fd while still rejecting symlinks",
+    async (platform) => {
+      const headers = { cookie: await login() };
+      const temp = fs.mkdtempSync(path.join(base, `avatar-${platform}-`));
+      const webDir = path.join(temp, "web");
+      const baseDir = path.join(temp, "base");
+      fs.mkdirSync(path.join(webDir, "avatars"), { recursive: true });
+      fs.mkdirSync(path.join(baseDir, "avatars"), { recursive: true });
+      fs.writeFileSync(path.join(webDir, "avatars", "default.jpg"), "bundled-jpg");
+      fs.writeFileSync(path.join(webDir, "avatars", "override.jpg"), "bundled-old");
+      fs.writeFileSync(path.join(baseDir, "avatars", "override.jpg"), "local-new");
+      fs.writeFileSync(path.join(temp, "secret.txt"), "secret");
+      fs.symlinkSync(path.join(temp, "secret.txt"), path.join(baseDir, "avatars", "linked.jpg"));
+
+      fs.writeFileSync(path.join(webDir, "outside.jpg"), "escaped");
+
+      const symlinkBase = path.join(temp, "symlink-base");
+      fs.mkdirSync(symlinkBase);
+      fs.symlinkSync(webDir, path.join(symlinkBase, "avatars"));
+
+      const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+      const original = handler;
+      try {
+        handler = new HttpHandler(new Auth(() => authConfig), webDir, uploads, baseDir);
+        const bundled = await request("/avatars/default.jpg", { headers });
+        expect(bundled.status).toBe(200);
+        expect(bundled.body.toString()).toBe("bundled-jpg");
+
+        const override = await request("/avatars/override.jpg", { headers });
+        expect(override.status).toBe(200);
+        expect(override.body.toString()).toBe("local-new");
+
+        expect((await request("/avatars/linked.jpg", { headers })).status).toBe(404);
+
+        handler = new HttpHandler(new Auth(() => authConfig), webDir, uploads, symlinkBase);
+        expect((await request("/avatars/outside.jpg", { headers })).status).toBe(404);
+      } finally {
+        handler = original;
+        platformSpy.mockRestore();
+      }
+    },
+  );
+
   it("gzip text assets for clients that accept it, and re-compress after a rebuild", async () => {
     const cookie = await login();
     const file = path.join(web, "assets", "app.js");

@@ -203,14 +203,29 @@ export class HttpHandler {
   }
 
   private serveAvatar(name: string, res: http.ServerResponse): void {
+    const platform = process.platform;
     for (const base of [this.baseDir, this.webDir]) {
-      const file = path.join(fs.realpathSync(base), "avatars", name);
+      let realBase: string;
+      try {
+        realBase = fs.realpathSync(base);
+      } catch (e) {
+        if (["ENOENT", "ENOTDIR"].includes((e as NodeJS.ErrnoException).code ?? "")) continue;
+        throw e;
+      }
+      const file = path.join(realBase, "avatars", name);
       if (!fs.lstatSync(file, { throwIfNoEntry: false })?.isFile()) continue;
       let fd: number;
       try {
         // Darwin's O_NOFOLLOW_ANY rejects symlinks in parent components too.
-        const noLinks = process.platform === "darwin" ? 0x20000000 : fs.constants.O_NOFOLLOW;
-        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | noLinks);
+        const flags =
+          platform === "darwin"
+            ? fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | 0x20000000
+            : platform === "win32"
+              ? fs.constants.O_RDONLY
+              : fs.constants.O_RDONLY |
+                (fs.constants.O_NONBLOCK ?? 0) |
+                (fs.constants.O_NOFOLLOW ?? 0);
+        fd = fs.openSync(file, flags);
       } catch (e) {
         if (
           ["ENOENT", "ENOTDIR", "ELOOP", "ENXIO", "EMLINK"].includes(
@@ -220,17 +235,16 @@ export class HttpHandler {
           continue;
         throw e;
       }
+      let confined = false;
       try {
-        if (
-          !fs.fstatSync(fd).isFile() ||
-          (process.platform !== "darwin" && fs.readlinkSync(`/proc/self/fd/${fd}`) !== file)
-        ) {
-          fs.closeSync(fd);
-          continue;
-        }
+        confined = isConfinedAvatar(fd, file, platform);
       } catch (e) {
         fs.closeSync(fd);
         throw e;
+      }
+      if (!confined) {
+        fs.closeSync(fd);
+        continue;
       }
       res.setHeader(
         "Content-Type",
@@ -543,4 +557,25 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
   res.end(JSON.stringify(body));
+}
+
+function isConfinedAvatar(fd: number, file: string, platform: NodeJS.Platform): boolean {
+  const fdStat = fs.fstatSync(fd, { bigint: true });
+  if (!fdStat.isFile()) return false;
+  if (platform === "darwin") return true;
+  if (platform === "linux") return fs.readlinkSync(`/proc/self/fd/${fd}`) === file;
+  let realFile: string;
+  try {
+    realFile = fs.realpathSync(file);
+  } catch (e) {
+    if (["ENOENT", "ENOTDIR", "ELOOP"].includes((e as NodeJS.ErrnoException).code ?? "")) {
+      return false;
+    }
+    throw e;
+  }
+  const samePath =
+    platform === "win32" ? realFile.toLowerCase() === file.toLowerCase() : realFile === file;
+  if (!samePath) return false;
+  const pathStat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  return Boolean(pathStat?.isFile() && pathStat.dev === fdStat.dev && pathStat.ino === fdStat.ino);
 }
