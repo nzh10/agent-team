@@ -595,9 +595,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   }
   get optionsPending(): boolean {
     return (
-      [this.model, this.effort].some(
-        ({ desired, applied }) => desired !== undefined && desired !== applied,
-      ) || this.panelTools !== this.appliedPanelTools
+      (this.model.desired !== undefined &&
+        this.canonicalModel(this.model.desired) !== this.model.applied) ||
+      (this.effort.desired !== undefined && this.effort.desired !== this.effort.applied) ||
+      this.panelTools !== this.appliedPanelTools
     );
   }
   get interruptPending(): boolean {
@@ -623,7 +624,9 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     return this.models.slice();
   }
   getAvailableThinkingLevels(model = this.model.applied): string[] | undefined {
-    return this.rpc && model === this.model.applied ? this.levels?.slice() : undefined;
+    return this.rpc && this.canonicalModel(model) === this.model.applied
+      ? this.levels?.slice()
+      : undefined;
   }
   getCommands(): CommandInfo[] {
     return [
@@ -1005,6 +1008,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     return matches.length === 1 ? matches[0] : undefined;
   }
 
+  private canonicalModel(model?: string): string | undefined {
+    return model ? (this.resolveModel(model)?.id ?? model) : undefined;
+  }
+
   private acpPromptError(input: string, compact: boolean): string | undefined {
     const runtimeError = () =>
       this.home?.piAcpProfileError ??
@@ -1253,37 +1260,47 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     if (!this.current(generation, rpc)) return;
     const work = async () => {
       const timeout = { timeoutMs: this.readyTimeoutMs };
-      const apply = async (setting: Setting, setter: (desired: string) => Promise<void>) => {
+      const apply = async (
+        setting: Setting,
+        setter: (desired: string) => Promise<void>,
+        target = setting.desired,
+      ) => {
         const desired = setting.desired;
-        if (!desired || desired === setting.applied || !this.current(generation, rpc)) return;
+        if (!desired || !target || target === setting.applied || !this.current(generation, rpc))
+          return;
         try {
           await setter(desired);
           if (!this.current(generation, rpc)) return;
-          setting.applied = desired;
+          setting.applied = target;
           setting.lastError = undefined;
         } catch (error) {
           if (this.current(generation, rpc)) setting.lastError = message(error);
         }
       };
       const previousModel = this.model.applied;
-      await apply(this.model, async (desired) => {
-        const model = this.resolveModel(desired);
-        const slash = desired.indexOf("/");
-        if (!model && slash <= 0) throw new Error(`Ambiguous or unavailable Pi model: ${desired}`);
-        await rpc.setModel(
-          model?.provider ?? desired.slice(0, slash),
-          model?.modelId ?? desired.slice(slash + 1),
-          timeout,
-        );
-        const [{ levels }, state] = await Promise.all([
-          rpc.getAvailableThinkingLevels(timeout),
-          rpc.getState(timeout),
-        ]);
-        if (this.current(generation, rpc)) {
-          this.levels = levels;
-          this.effort.applied = state.thinkingLevel;
-        }
-      });
+      await apply(
+        this.model,
+        async (desired) => {
+          const model = this.resolveModel(desired);
+          const slash = desired.indexOf("/");
+          if (!model && slash <= 0)
+            throw new Error(`Ambiguous or unavailable Pi model: ${desired}`);
+          await rpc.setModel(
+            model?.provider ?? desired.slice(0, slash),
+            model?.modelId ?? desired.slice(slash + 1),
+            timeout,
+          );
+          const [{ levels }, state] = await Promise.all([
+            rpc.getAvailableThinkingLevels(timeout),
+            rpc.getState(timeout),
+          ]);
+          if (this.current(generation, rpc)) {
+            this.levels = levels;
+            this.effort.applied = state.thinkingLevel;
+          }
+        },
+        this.canonicalModel(this.model.desired),
+      );
       if (!this.current(generation, rpc)) return;
       const desired = this.effort.desired;
       const levels = this.getAvailableThinkingLevels(this.model.desired);
@@ -1653,7 +1670,9 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
         this.emit("usage", this.usage);
       })
       .catch(() => undefined);
-    const window = this.models.find((model) => model.id === this.model.applied)?.contextWindow;
+    const window = this.model.applied
+      ? this.resolveModel(this.model.applied)?.contextWindow
+      : undefined;
     this.finish(
       turn,
       turn.error && !this.interrupting

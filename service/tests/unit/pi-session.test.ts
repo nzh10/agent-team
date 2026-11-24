@@ -68,6 +68,7 @@ function harness(
     models?: Array<{
       provider: string;
       id: string;
+      contextWindow?: number;
       reasoning?: boolean;
       thinkingLevelMap?: Partial<Record<string, string | null>>;
     }>;
@@ -1078,6 +1079,46 @@ describe("PiSession dispatch and stream state", () => {
     expect(h.session.getAvailableThinkingLevels("mock/extended")).toBeUndefined();
     expect(h.clients[0].wire.filter((f) => f.type === "set_thinking_level")).toEqual([]);
     expect(h.events.filter((e) => e.level === "warning")).toEqual([]);
+  });
+
+  it("canonicalizes bare model IDs so context window, thinking levels, and optionsPending stay accurate", async () => {
+    const h = harness({
+      config: { model: "mock/large" },
+      startupModel: { provider: "mock", id: "large" },
+      models: [
+        { provider: "mock", id: "large", contextWindow: 500_000 },
+        { provider: "mock", id: "small", contextWindow: 272_000 },
+      ],
+    });
+    await h.session.ensureStarted();
+    // Matching startup model by bare ID should not trigger a redundant set_model RPC.
+    h.session.setModel("large");
+    expect(h.session.optionsPending).toBe(false);
+    expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toEqual([]);
+
+    // Switching to another model by bare ID resolves and stores its canonical provider/id.
+    h.session.setModel("small");
+    await vi.waitFor(() =>
+      expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toEqual([
+        expect.objectContaining({ provider: "mock", modelId: "small" }),
+      ]),
+    );
+    await vi.waitFor(() => expect(h.session.optionsPending).toBe(false));
+    expect(h.session.getAvailableThinkingLevels("small")).toEqual(["low", "high"]);
+    expect(h.session.getAvailableThinkingLevels("mock/small")).toEqual(["low", "high"]);
+    expect(h.session.getAvailableThinkingLevels("mock/large")).toBeUndefined();
+
+    // Next turn emits the switched model's contextWindow without re-sending set_model.
+    await h.session.send("check context");
+    expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toHaveLength(1);
+    const { event } = h.clients[0];
+    event({ type: "agent_start" });
+    event(piFrame("message_end", { role: "assistant" }));
+    event(piFrame("agent_settled"));
+    expect(h.events.at(-1)).toMatchObject({
+      kind: "result",
+      context: { tokens: 412, window: 272_000 },
+    });
   });
 
   it.each(["startup", "idle"])(
