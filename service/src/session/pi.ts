@@ -2572,7 +2572,6 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       this.pendingOptions ||
       this.compactingRpc ||
       this.reconciliation ||
-      this.anchorProbe ||
       this.dialogs.size ||
       this.activeAsyncRuns.length ||
       this.pendingDeployNotices.size ||
