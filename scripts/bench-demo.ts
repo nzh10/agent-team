@@ -324,7 +324,9 @@ export async function runDemoBrowserSuite(
 
     // ---- Journey 1: Initial hydration, sidebar tree, git indicators, archives, search ----
     const tHydrate = performance.now();
-    await page.goto(`http://127.0.0.1:${port}/?demoPace=raf`, { waitUntil: "domcontentloaded" });
+    await page.goto(`http://127.0.0.1:${port}/?debug=1&demoPace=raf`, {
+      waitUntil: "domcontentloaded",
+    });
     await page.locator(".ws-group-project .ws-group-label", { hasText: "agent-team" }).waitFor({
       state: "visible",
       timeout: 15_000,
