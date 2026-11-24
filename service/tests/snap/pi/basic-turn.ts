@@ -7,7 +7,7 @@ export default fixture({
   verify(r) {
     const thinking = r.events.filter((e) => e.kind === "thinking_delta");
     expect(thinking[0]).toMatchObject({ content: "", startedAt: expect.any(Number) as unknown });
-    expect(thinking.at(-1)).toMatchObject({ content: "", durationMs: 2630 });
+    expect(thinking.at(-1)).toMatchObject({ content: "", durationMs: 2630, thinkingFollows: true });
     expect(agentMessages(r)[0]).toMatchObject({
       status: "done",
       content: "xxxxx",

@@ -1174,8 +1174,9 @@ button {
 .turn-activity {
   color: var(--accent);
 }
-.live-thinking {
-  margin: 4px 0;
+/* Reserve the chip row the completed thinking item will show. */
+.live-thinking > .event-row {
+  height: 18px;
 }
 .chip-live {
   display: inline-flex;
@@ -1453,6 +1454,12 @@ span.katex-display {
   user-select: none;
   padding: 2px 0;
   min-width: 0;
+  /* Also hold a full line between the closing delta and its persisted step. */
+  min-height: 22px;
+}
+.step-header .chip-live {
+  justify-self: start;
+  font-variant-numeric: tabular-nums;
 }
 .step-header .trace-header-toggle,
 .subagent-header .trace-header-toggle {

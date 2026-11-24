@@ -30,9 +30,13 @@ const CJK =
 const TEXISH = /[\\^_{}=]/;
 const TEX_MARKUP = /[\\^_]/;
 const NEVER_MATH = new RegExp(`${CJK.source}|["\`]`);
-const TEXT_ARG = /\\(?:text(?:rm|bf|it|tt|sf|normal)?|mbox|mathrm|operatorname)\s*\{[^{}]*\}/g;
-const TEXT_MODE_ARG = /\\(?:text(?:rm|bf|it|tt|sf|normal)?|mbox)\s*\{[^{}]*\}/g;
+const TEXT_ARG = /\\(?:text(?:rm|bf|it|tt|sf|normal)?|mbox|mathrm|operatorname)\s*\{/y;
+const TEXT_MODE_ARG = /\\(?:text(?:rm|bf|it|tt|sf|normal)?|mbox)\s*\{/y;
+const SIZED_DELIMITER = /\\(left|right)\s*(?:\\(?:[A-Za-z]+|[^\n])|[()[\].<>|/])/y;
+const REGEX_LITERAL_END = /(?:[*+?]|\{\d+(?:,\d*)?\})?\??\//y;
 const ALNUM = /[A-Za-z0-9]/;
+const REGEX_ESCAPE = /\\(?:[dDsSwW](?![A-Za-z])|[1-9])/y;
+const LITERAL_ELLIPSIS = /^(?:\.{3,}|…+)$/;
 const URL_START = /^(?:https?:\/\/|www\.)/i;
 const URL_END = /[\s<>]/;
 const QUICK = /[$\\]|https?:\/\/|www\.|^[ \t>]*(`{3,}|~{3,})[ \t]*math/im;
@@ -97,13 +101,19 @@ class Lines {
 
 // Next occurrence of `needle` at or after a position; cached, so increasing
 // queries scan the text once.
-function finder(md: string, needle: string) {
+function finder(md: string, needle: string, skipEscaped = false) {
   let from = Infinity;
   let found = Infinity;
   return (pos: number): number => {
     if (from <= pos && found >= pos) return found;
     from = pos;
-    const at = md.indexOf(needle, pos);
+    let at = md.indexOf(needle, pos);
+    while (skipEscaped && at >= 0) {
+      let start = at;
+      while (md[start - 1] === "\\") start--;
+      if ((at - start) % 2 === 0) break;
+      at = md.indexOf(needle, at + needle.length);
+    }
     found = at < 0 ? Infinity : at;
     return found;
   };
@@ -113,7 +123,8 @@ export function prepareSource(md: string): PreparedSource {
   if (!QUICK.test(md)) return { text: md, hasMath: false };
   const n = md.length;
   const lines = new Lines(md);
-  const nextParen = finder(md, "\\)");
+  const nextParen = finder(md, "\\)", true);
+  const nextParenOpen = finder(md, "\\(", true);
   const nextBracket = finder(md, "\\]");
   const nextDouble = finder(md, "$$");
   const runFinders = new Map<number, (pos: number) => number>();
@@ -187,8 +198,11 @@ export function prepareSource(md: string): PreparedSource {
       if (next === "(" || next === "[") {
         const end = next === "(" ? nextParen(i + 2) : nextBracket(i + 2);
         const limit = next === "(" ? lines.end(lines.of(i)) : lines.paragraphEnd(i);
-        const body = end < limit ? md.slice(i + 2, end) : "";
-        if (body.trim() && (next === "(" || TEXISH.test(body))) {
+        // A nested opener is not inline TeX. Stop before slicing so a run
+        // of rejected openers cannot repeatedly validate the same suffix.
+        const body =
+          end < limit && (next === "[" || end < nextParenOpen(i + 2)) ? md.slice(i + 2, end) : "";
+        if (body.trim() && (next === "(" ? parenMath(md, i, end, body) : TEXISH.test(body))) {
           const after = end + 2;
           const indent = next === "[" ? lines.indentBefore(i) : null;
           if (indent !== null && lines.blankFrom(after)) {
@@ -213,14 +227,25 @@ export function prepareSource(md: string): PreparedSource {
     if (ch === "$" && md[i + 1] === "$") {
       const indent = lines.indentBefore(i);
       const close = indent !== null ? displayClose(i) : -1;
-      if (close >= 0 && md.slice(i + 2, close).trim()) {
+      const displayBody = close < 0 ? "" : md.slice(i + 2, close).trim();
+      if (LITERAL_ELLIPSIS.test(displayBody)) {
+        out += `\\$\\$${md.slice(i + 2, close)}\\$\\$`;
+        i = close + 2;
+        continue;
+      }
+      if (displayBody) {
         hasMath = true;
-        out += display(md.slice(i + 2, close), indent!);
+        out += display(displayBody, indent!);
         i = close + 2;
         continue;
       }
       const end = nextDouble(i + 2);
       const body = end < lines.paragraphEnd(i) ? md.slice(i + 2, end) : "";
+      if (LITERAL_ELLIPSIS.test(body.trim())) {
+        out += `\\$\\$${body}\\$\\$`;
+        i = end + 2;
+        continue;
+      }
       if (body.trim() && !neverMath(body)) {
         hasMath = true;
         out += `$$${textMode(body)}$$`;
@@ -310,6 +335,65 @@ function inlineClose(md: string, open: number): number {
   return j;
 }
 
+// ASCII identifiers and regex quantifiers can be glued to an escaped group;
+// CJK prose can be glued to real math. Allow Markdown emphasis around math.
+function parenMath(md: string, open: number, close: number, body: string): boolean {
+  const before = md[open - 1] ?? "";
+  const after = md[close + 2] ?? "";
+  if (
+    (before === after && (before === "'" || before === '"')) ||
+    (before === "“" && after === "”") ||
+    (before === "‘" && after === "’")
+  )
+    return false;
+  if (before === "/") {
+    REGEX_LITERAL_END.lastIndex = close + 2;
+    if (REGEX_LITERAL_END.test(md)) return false;
+  }
+  const left = md[open - 2] ?? "";
+  if (ALNUM.test(before) || (before === "_" && ALNUM.test(left))) return false;
+  if (/[*+?]/.test(before) && /[\w.)\]}]/.test(left)) return false;
+  if (!balancedBraces(body) || neverMath(body)) return false;
+
+  // Ignore text arguments and escaped glyphs; only math delimiters must pair.
+  const math = mapTextArgs(body, TEXT_MODE_ARG, () => "");
+  const stack: { kind: string; comma?: boolean }[] = [];
+  for (let k = 0; k < math.length; k++) {
+    const ch = math[k];
+    if (ch === "\\") {
+      REGEX_ESCAPE.lastIndex = k;
+      if (REGEX_ESCAPE.test(math)) return false;
+      SIZED_DELIMITER.lastIndex = k;
+      const sized = SIZED_DELIMITER.exec(math);
+      if (!sized) k++;
+      else {
+        if (sized[1] === "left") stack.push({ kind: "left" });
+        else if (stack.pop()?.kind !== "left") return false;
+        k = SIZED_DELIMITER.lastIndex - 1;
+      }
+    } else if (ch === "(" && math[k + 1] === "?" && /[:=!<]/.test(math[k + 2] ?? "")) {
+      return false;
+    } else if (ch === "[" && math[k + 1] === "^") {
+      return false;
+    } else if (ch === "(" || ch === "[" || ch === ")" || ch === "]" || ch === ",") {
+      const top = stack[stack.length - 1];
+      if (ch === ",") {
+        if (top) top.comma = true;
+      } else if (ch === "[" && top?.kind === "]" && top.comma) {
+        // Reversed brackets also denote an open interval: ]a,b[.
+        stack.pop();
+      } else if (ch === "(" || ch === "[" || (ch === "]" && (!top || top.kind === "left"))) {
+        stack.push({ kind: ch });
+      } else {
+        if (!top || top.kind === "left" || (!top.comma && top.kind !== (ch === ")" ? "(" : "[")))
+          return false;
+        stack.pop();
+      }
+    }
+  }
+  return stack.length === 0;
+}
+
 function balancedBraces(body: string): boolean {
   let depth = 0;
   for (let k = 0; k < body.length; k++) {
@@ -337,13 +421,86 @@ function attachedTex(body: string, before: string): boolean {
 
 function neverMath(body: string): boolean {
   if (!NEVER_MATH.test(body)) return false;
-  const rest = body.replace(TEXT_ARG, "");
-  return rest === body || NEVER_MATH.test(rest);
+  return NEVER_MATH.test(mapTextArgs(body, TEXT_ARG, () => ""));
 }
 
 function textMode(body: string): string {
   if (!body.includes("_")) return body;
-  return body.replace(TEXT_MODE_ARG, (arg) => arg.replace(/(?<!\\)_/g, "\\_"));
+  return mapTextArgs(body, TEXT_MODE_ARG, escapeTextUnderscores);
+}
+
+// Text can embed math, which can in turn take text arguments. Track mode
+// changes in one pass so only text underscores are escaped, never subscripts.
+function escapeTextUnderscores(arg: string): string {
+  const modes: ("$" | "\\)" | number)[] = []; // Text frames close at their brace depth.
+  let depth = 0;
+  let out = "";
+  let last = 0;
+  for (let i = 0; i < arg.length; i++) {
+    const mode = modes[modes.length - 1];
+    const inMath = typeof mode === "string";
+    const ch = arg[i];
+    if (ch === "\\") {
+      const next = arg[i + 1];
+      if (mode === "\\)" && next === ")") modes.pop();
+      else if (!inMath && next === "(") modes.push("\\)");
+      else if (inMath) {
+        TEXT_MODE_ARG.lastIndex = i;
+        if (TEXT_MODE_ARG.test(arg)) {
+          modes.push(++depth);
+          i = TEXT_MODE_ARG.lastIndex - 1;
+          continue;
+        }
+      }
+      i++;
+    } else if (ch === "%") i = texCommentEnd(arg, i);
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      if (mode === depth) modes.pop();
+      depth--;
+    } else if (ch === "$") {
+      if (mode === "$") modes.pop();
+      else if (!inMath) modes.push("$");
+    } else if (ch === "_" && !inMath) {
+      out += arg.slice(last, i) + "\\_";
+      last = i + 1;
+    }
+  }
+  return out + arg.slice(last);
+}
+
+function texCommentEnd(body: string, from: number): number {
+  const newline = body.indexOf("\n", from);
+  return newline < 0 ? body.length : newline;
+}
+
+// Text-mode arguments can contain subgroups and nested commands. Walk each
+// argument once and leave an incomplete argument alone while it is streaming.
+function mapTextArgs(body: string, command: RegExp, replace: (arg: string) => string): string {
+  let out = "";
+  let last = 0;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "%") i = texCommentEnd(body, i);
+    if (body[i] !== "\\") continue;
+    command.lastIndex = i;
+    if (!command.test(body)) {
+      i++;
+      continue;
+    }
+    let depth = 1;
+    let j = command.lastIndex;
+    for (; j < body.length && depth; j++) {
+      if (body[j] === "\\") j++;
+      else if (body[j] === "%") j = texCommentEnd(body, j);
+      else if (body[j] === "{") depth++;
+      else if (body[j] === "}") depth--;
+    }
+    if (depth) break;
+    out += body.slice(last, i) + replace(body.slice(i, j));
+    last = j;
+    i = j - 1;
+  }
+  return out + body.slice(last);
 }
 
 // GFM's trailing-punctuation rule, re-applied after the cut: "a.，" → "a".

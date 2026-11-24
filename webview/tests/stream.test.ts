@@ -157,7 +157,13 @@ describe("applyEventsToMessage", () => {
         subagent: {
           taskId: "task",
           description: "",
-          _innerEvent: ev("tool_result", { toolUseId: "i1", content: "body" }),
+          _innerEvent: ev("tool_result", {
+            toolUseId: "i1",
+            content: "body",
+            isMarkdown: true,
+            isError: true,
+            durationMs: 17,
+          }),
         } as unknown as StreamEvent["subagent"],
       }),
       ev("subagent_done", {
@@ -167,7 +173,14 @@ describe("applyEventsToMessage", () => {
     expect(input.events![0].subagent!.events).toEqual([]);
     const sa = out.events![0].subagent!;
     expect(sa.events).toHaveLength(1);
-    expect(sa.events![0]).toMatchObject({ kind: "tool_use", toolResult: "body" });
+    expect(sa.events![0]).toMatchObject({
+      kind: "tool_use",
+      toolUseId: "i1",
+      toolResult: "body",
+      toolResultIsMarkdown: true,
+      toolResultIsError: true,
+      durationMs: 17,
+    });
     expect(sa.status).toBe("completed");
     expect(sa.summary).toBe("ok");
     expect(out.events!.map((e) => e.kind)).toEqual(["subagent_start", "subagent_done"]);

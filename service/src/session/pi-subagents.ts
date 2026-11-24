@@ -228,7 +228,28 @@ function projectToolResult(
     ...(typeof message.toolCallId === "string" ? { toolUseId: message.toolCallId } : {}),
     ...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
     ...(message.isError === true ? { isError: true } : {}),
+    ...(message.isMarkdown === true ? { isMarkdown: true } : {}),
+    ...(typeof message.durationMs === "number" ? { durationMs: message.durationMs } : {}),
   };
+}
+
+function foldChildToolResults(events: StreamEvent[]): StreamEvent[] {
+  const calls = new Map<string, StreamEvent>();
+  // Only earlier calls can own a result, as in the live transcript.
+  return events.filter((event) => {
+    const id = event.toolUseId;
+    if (!id) return true;
+    if (event.kind === "tool_use" && !calls.has(id)) calls.set(id, event);
+    if (event.kind !== "tool_result") return true;
+    const call = calls.get(id);
+    if (!call) return true;
+    call.toolResult = event.content;
+    // Artifacts can report failure in tool_end but omit it in toolResult.
+    if (event.isError || call.isError) call.toolResultIsError = true;
+    if (event.isMarkdown) call.toolResultIsMarkdown = true;
+    if (event.durationMs != null) call.durationMs = event.durationMs;
+    return false;
+  });
 }
 
 /** Decode the active branch of a native Pi Session v3 JSONL tree. */
@@ -296,7 +317,12 @@ export function decodePiSessionV3Tree(
     }
   }
   const { model, effort } = execution ?? {};
-  return { ok: true, events, ...(model && { model }), ...(effort && { effort }) };
+  return {
+    ok: true,
+    events: foldChildToolResults(events),
+    ...(model && { model }),
+    ...(effort && { effort }),
+  };
 }
 
 export interface ChildTranscriptMeta {
@@ -412,7 +438,7 @@ export function decodeChildTranscriptArtifact(
     }
   }
   events.push(...warnings);
-  return { events, ...execution };
+  return { events: foldChildToolResults(events), ...execution };
 }
 
 export function reconstructSubagentChild(

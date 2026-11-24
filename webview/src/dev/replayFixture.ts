@@ -693,7 +693,10 @@ function appendLayoutTurn(frames: Frame[], now: number) {
   event({ kind: "thinking_delta", startedAt, content: "", waitingSince: null }, 6_000);
   event({ kind: "thinking_delta", startedAt, content: reasoning, waitingSince: null }, 800);
   const durationMs = at - startedAt;
-  event({ kind: "thinking_delta", content: "", durationMs, waitingSince: at }, 0);
+  event(
+    { kind: "thinking_delta", content: "", durationMs, waitingSince: at, thinkingFollows: true },
+    0,
+  );
   event({
     kind: "thinking",
     content: reasoning,

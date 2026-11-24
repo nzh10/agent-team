@@ -256,29 +256,30 @@ describe("Synthetic Pi corpus privacy", () => {
       "thinking",
       "text",
       "tool_use",
-      "tool_result",
       "thinking",
       "text",
       "tool_use",
-      "tool_result",
     ]);
     expect(decoded.events.map((event) => event.content)).toContain("active-branch-start");
     expect(decoded.events.map((event) => event.content)).toContain("active-after-compaction");
     expect(JSON.stringify(decoded.events)).not.toContain("inactive-branch");
     expect(JSON.stringify(decoded.events)).not.toContain("must-not-leak");
 
-    const resultIndex = decoded.events.findIndex(
-      (event) => event.kind === "tool_result" && event.content.includes("active-inner-output"),
-    );
-    expect(resultIndex).toBeGreaterThanOrEqual(0);
-    expect(decoded.events[resultIndex].isError).toBe(true);
-    expect(decoded.events[resultIndex].content.length).toBeGreaterThan(1_000);
-    const summarized = summarizeMessages([message("branching", decoded.events)]);
-    expect(summarized[0].events![resultIndex]).toMatchObject({
-      kind: "tool_result",
-      content: "",
-      contentLength: decoded.events[resultIndex].content.length,
+    const call = decoded.events[2];
+    expect(call).toMatchObject({ toolUseId: "call-active", toolResultIsError: true });
+    expect(call.toolResult).toContain("active-inner-output");
+    expect(call.toolResult!.length).toBeGreaterThan(1_000);
+    expect(decoded.events[5]).toMatchObject({
+      toolUseId: "call-after",
+      toolResult: "active-command-output",
     });
+    const summarized = summarizeMessages([message("branching", decoded.events)]);
+    expect(summarized[0].events![2]).toMatchObject({
+      kind: "tool_use",
+      toolResultIsError: true,
+      resultLength: call.toolResult!.length,
+    });
+    expect(summarized[0].events![2]).not.toHaveProperty("toolResult");
   });
 
   it("decodes notify, Session v3, and truncated child protocols with exact sibling ownership", () => {
@@ -308,8 +309,14 @@ describe("Synthetic Pi corpus privacy", () => {
       undefined,
       betaMeta,
     );
-    expect(beta.filter((event) => event.kind === "tool_use")).toHaveLength(1);
-    expect(beta.find((event) => event.kind === "tool_use")?.isError).toBe(true);
+    expect(beta.filter((event) => event.kind === "tool_use")).toEqual([
+      expect.objectContaining({
+        isError: true,
+        toolResult: "sibling-beta-output-v8n2\ninner beta output",
+        toolResultIsError: true,
+      }),
+    ]);
+    expect(beta.some((event) => event.kind === "tool_result")).toBe(false);
     const notices = beta.filter((event) => event.kind === "notice");
     expect(notices.length).toBeGreaterThanOrEqual(3);
     expect(notices.map((event) => event.content).join("\n")).toContain(

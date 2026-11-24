@@ -391,7 +391,7 @@ describe("subagent-notify wire decoder", () => {
 });
 
 describe("native Pi Session v3 decoder", () => {
-  it("walks only the active branch and projects content in order without fabricated durations", () => {
+  it("projects the active branch in order, folding only results with earlier calls", () => {
     const directory = temporaryDirectory();
     const sessionFile = path.join(directory, "session.jsonl");
     writeJsonl(sessionFile, [
@@ -423,8 +423,19 @@ describe("native Pi Session v3 decoder", () => {
       },
       {
         type: "message",
-        id: "active",
+        id: "early-result",
         parentId: "effort",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: "before the call",
+        },
+      },
+      {
+        type: "message",
+        id: "active",
+        parentId: "early-result",
         message: {
           role: "assistant",
           provider: "resolved-provider",
@@ -438,6 +449,7 @@ describe("native Pi Session v3 decoder", () => {
               name: "read",
               arguments: { path: "a.ts", offset: 2 },
             },
+            { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
           ],
         },
       },
@@ -453,9 +465,15 @@ describe("native Pi Session v3 decoder", () => {
         },
       },
       {
+        type: "message",
+        id: "orphan-result",
+        parentId: "result",
+        message: { role: "tool_result", toolName: "read", content: "no call id" },
+      },
+      {
         type: "model_change",
         id: "unused-model",
-        parentId: "result",
+        parentId: "orphan-result",
         provider: "p",
         modelId: "unused",
       },
@@ -474,15 +492,26 @@ describe("native Pi Session v3 decoder", () => {
     });
     expect(decoded.events.map((event) => event.kind)).toEqual([
       "text",
+      "tool_result",
       "thinking",
       "text",
       "tool_use",
+      "tool_use",
       "tool_result",
     ]);
-    expect(decoded.events.map((event) => event.content)).not.toContain("inactive branch");
-    expect(decoded.events[3].content).toBe("**Read** `a.ts` · offset 2");
-    expect(decoded.events[3].toolInput).toEqual({ tool: "Read", file_path: "a.ts" });
-    expect(decoded.events[4]).toMatchObject({ toolUseId: "call-1", content: "file body" });
+    expect(decoded.events[1]).toMatchObject({ toolUseId: "call-1", content: "before the call" });
+    expect(decoded.events[4]).toMatchObject({
+      toolUseId: "call-1",
+      content: "**Read** `a.ts` · offset 2",
+      toolInput: { tool: "Read", file_path: "a.ts" },
+      toolResult: "file body",
+    });
+    expect(decoded.events[5]).not.toHaveProperty("toolResult");
+    expect(decoded.events[6]).toEqual({
+      kind: "tool_result",
+      toolName: "read",
+      content: "no call id",
+    });
     expect(decoded.events.every((event) => event.durationMs === undefined)).toBe(true);
   });
 
@@ -499,7 +528,7 @@ describe("native Pi Session v3 decoder", () => {
 });
 
 describe("child transcript artifact decoder and reconstruction", () => {
-  it("decodes message/tool records once and appends an explicit truncation notice", () => {
+  it("folds matched result records, preserves orphans, and appends truncation notices", () => {
     const directory = temporaryDirectory();
     const transcript = path.join(directory, "child.jsonl");
     writeJsonl(transcript, [
@@ -524,7 +553,7 @@ describe("child transcript artifact decoder and reconstruction", () => {
         toolName: "read",
         argsPayload: JSON.stringify({ path: "real.ts", limit: 5 }),
       },
-      { recordType: "tool_end", toolCallId: "call-1", toolName: "read", isError: false },
+      { recordType: "tool_end", toolCallId: "call-1", toolName: "read", isError: true },
       {
         recordType: "message",
         role: "toolResult",
@@ -533,8 +562,20 @@ describe("child transcript artifact decoder and reconstruction", () => {
           role: "toolResult",
           toolCallId: "call-1",
           toolName: "read",
-          content: [{ type: "text", text: "result body" }],
+          content: [{ type: "text", text: "fallback result body" }],
+          isMarkdown: true,
+          durationMs: 17,
         },
+      },
+      {
+        recordType: "message",
+        role: "toolResult",
+        message: { toolCallId: "unknown", toolName: "read", content: "unmatched call id" },
+      },
+      {
+        recordType: "message",
+        role: "tool_result",
+        message: { toolName: "read", content: "no call id" },
       },
       { recordType: "truncated", message: "byte limit reached" },
     ]);
@@ -548,13 +589,21 @@ describe("child transcript artifact decoder and reconstruction", () => {
       "text",
       "tool_use",
       "tool_result",
+      "tool_result",
       "notice",
     ]);
-    expect(events.filter((event) => event.kind === "tool_use")).toHaveLength(1);
-    expect(events[2].content).toBe("**Read** `real.ts` · limit 5");
-    expect(events[3].content).toBe("result body");
-    expect(events[4]).toMatchObject({ level: "warning", content: "byte limit reached" });
-    expect(events.every((event) => event.durationMs === undefined)).toBe(true);
+    expect(events[2]).toMatchObject({
+      toolUseId: "call-1",
+      content: "**Read** `real.ts` · limit 5",
+      toolResult: "result body",
+      toolResultIsError: true,
+      toolResultIsMarkdown: true,
+      durationMs: 17,
+    });
+    expect(events[3]).toMatchObject({ toolUseId: "unknown", content: "unmatched call id" });
+    expect(events[4]).toEqual({ kind: "tool_result", toolName: "read", content: "no call id" });
+    expect(events[5]).toMatchObject({ level: "warning", content: "byte limit reached" });
+    expect(events.filter((event) => event.durationMs != null)).toEqual([events[2]]);
   });
 
   it("emits warnings for missing files and metadata-reported gaps", () => {

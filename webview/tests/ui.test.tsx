@@ -398,7 +398,11 @@ describe("streaming turn footer", () => {
     const { container, rerender } = render(view({ waitingSince: since }));
     const node = footer(container)!;
     expect(node.textContent).toBe("Waiting for the model · 45s");
-    const thinking = { liveThinkingSince: since, waitingSince: since };
+    const thinking = {
+      events: [{ ...read, toolResult: "ok" }],
+      liveThinkingSince: since,
+      waitingSince: since,
+    };
     rerender(view(thinking));
     expect(node.textContent).toBe("Thinking · 45s");
     expect(container.textContent.match(/Thinking · 45s/g)).toHaveLength(1);
@@ -996,7 +1000,8 @@ describe("live thinking", () => {
     const header = boxes()[0].querySelector(".step-header")!;
     const footer = container.querySelector(".turn-footer")!;
     expect(boxes()).toHaveLength(1);
-    expect(header.textContent).toContain("▸1 thinking · 1 tool call");
+    expect(header.textContent).toContain("▸1 tool call");
+    expect(header.querySelector(".step-summary")!.textContent).toBe("1 tool call");
     expect(panel()).toBeNull();
     expect(footer.textContent).toBe("Thinking · 0s");
 
@@ -1048,9 +1053,15 @@ describe("live thinking", () => {
     const box = () => container.querySelector(".step-group")!;
     const original = box();
     expect(box().querySelector(".live-thinking")).toBeNull();
-    expect(box().querySelector(".step-header")!.textContent).toBe("▸1 thinking");
-    fireEvent.click(box().querySelector(".step-header")!);
+    const header = box().querySelector(".step-header")!;
+    const footer = container.querySelector(".turn-footer")!;
+    expect(header.textContent).toBe("▸Thinking · 0s");
+    expect(footer.textContent).toBe("");
+    fireEvent.click(header);
     expect(box().querySelector(".live-thinking")!.textContent).toBe("Let me see.");
+    void act(() => vi.advanceTimersByTime(1_000));
+    expect(header.textContent).toBe("▾Thinking · 1s");
+    expect(container.textContent.match(/Thinking · 1s/g)).toHaveLength(1);
     fireEvent.click(box().querySelector(".step-header")!);
     expect(box().querySelector(".live-thinking")).toBeNull();
     rerender(
@@ -1072,22 +1083,51 @@ describe("live thinking", () => {
     expect(box().querySelector(".step-header")!.textContent).toBe("▸1 thinking");
   });
 
-  it("remembers an open first-thinking box across separately flushed closing events", () => {
-    const view = (msg: Message) => <MessageItem msg={msg} agents={[agent]} />;
-    const { container, rerender } = render(view(live()));
-    let msg = applyEventsToMessage(live(), [ev("thinking_delta", { startedAt: Date.now() })]);
-    rerender(view(msg));
-    fireEvent.click(container.querySelector(".step-header")!);
-    expect(container.querySelector(".step-group.open")).not.toBeNull();
+  it.each([false, true])(
+    "keeps the first-thinking box across the closing flush (open: %s)",
+    (open) => {
+      const view = (msg: Message) => <MessageItem msg={msg} agents={[agent]} />;
+      const { container, rerender } = render(view(live()));
+      let msg = applyEventsToMessage(live(), [
+        ev("thinking_delta", { startedAt: Date.now(), content: "Reasoned." }),
+      ]);
+      rerender(view(msg));
+      const box = container.querySelector(".step-group")!;
+      const toggle = box.querySelector("button")!;
+      if (open) fireEvent.click(toggle);
 
-    msg = applyEventsToMessage(msg, [ev("thinking_delta", { durationMs: 6_000 })]);
-    rerender(view(msg));
-    expect(container.querySelector(".turn-footer")!.textContent).toBe("");
-    msg = applyEventsToMessage(msg, [ev("thinking", { content: "Reasoned.", durationMs: 6_000 })]);
-    rerender(view(msg));
-    expect(container.querySelector(".step-group.open .event-content")?.textContent).toBe(
-      "Reasoned.",
-    );
+      msg = applyEventsToMessage(msg, [
+        ev("thinking_delta", { durationMs: 6_000, thinkingFollows: true }),
+      ]);
+      rerender(view(msg));
+      expect(container.querySelector(".step-group")).toBe(box);
+      expect(box.querySelector("button")).toBe(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe(String(open));
+      expect(box.querySelector(".chip-live, .step-summary")).toBeNull();
+      expect(box.querySelector(".live-thinking")?.textContent).toBe(open ? "Reasoned." : undefined);
+      expect(container.querySelector(".turn-footer")!.textContent).toBe("");
+      msg = applyEventsToMessage(msg, [
+        ev("thinking", { content: "Reasoned.", durationMs: 6_000 }),
+      ]);
+      rerender(view(msg));
+      expect(container.querySelector(".step-group")).toBe(box);
+      expect(toggle.getAttribute("aria-expanded")).toBe(String(open));
+      expect(box.querySelector(".step-summary")!.textContent).toBe("1 thinking");
+      expect(box.querySelector(".event-content")?.textContent).toBe(open ? "Reasoned." : undefined);
+    },
+  );
+
+  it("drops the open draft when a duration-only close has no persisted thinking", () => {
+    const initial = applyEventsToMessage(live(), [
+      ev("thinking_delta", { startedAt: Date.now(), content: "Discarded draft." }),
+    ]);
+    const view = (msg: Message) => <MessageItem msg={msg} agents={[agent]} />;
+    const { container, rerender } = render(view(initial));
+    fireEvent.click(container.querySelector(".step-header")!);
+    expect(container.querySelector(".live-thinking")?.textContent).toBe("Discarded draft.");
+    rerender(view(applyEventsToMessage(initial, [ev("thinking_delta", { durationMs: 1_000 })])));
+    expect(container.querySelector(".step-group")).toBeNull();
+    expect(container.textContent).not.toContain("Discarded draft.");
   });
 
   it("keeps the folded box that follows text when its thinking ends", () => {
@@ -1104,7 +1144,8 @@ describe("live thinking", () => {
     const before = items();
     expect(before.map((e) => e.tagName)).toEqual(["DIV", "P", "DIV"]);
     expect(before[1].textContent).toBe("Found it.");
-    expect(before[2].textContent).toBe("▸1 thinking");
+    expect(before[2].textContent).toMatch(/^▸Thinking · \d+s$/);
+    expect(container.querySelector(".turn-footer")!.textContent).toBe("");
     rerender(
       <MessageItem
         msg={live({

@@ -406,14 +406,14 @@ const mdComponents = { pre: CodeBlock, table: ScrollTable, a: Link, code: Inline
 // CommonMark opens **…** only where the ** is not stuck between a letter
 // and punctuation: in Chinese prose ("状态是**“done”**。") it stayed literal.
 const mdRemarkPlugins: Options["remarkPlugins"] = [
-  remarkGfm,
+  [remarkGfm, { singleTilde: false }],
   remarkCjkFriendly,
   remarkHtmlBreaks,
   remarkDetails,
 ];
 // A row of text has no blocks to fold.
 const inlineRemarkPlugins: Options["remarkPlugins"] = [
-  remarkGfm,
+  [remarkGfm, { singleTilde: false }],
   remarkCjkFriendly,
   remarkHtmlBreaks,
 ];
@@ -579,7 +579,7 @@ const CONTINUES = /^(\s|[-*+](\s|$)|\d{1,9}[.)](\s|$))/;
 // any of these is parsed whole.
 const WHOLE_ONLY = new RegExp(
   [
-    /^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*\[[^\]]+\]:/.source,
+    /^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*\[(?:\\.|[^\]\\])+\]:/.source,
     /^ {0,3}(?:<(?:script|pre|style|textarea)(?:\s|>|$)|<!--|<\?|<![A-Za-z]|<!\[CDATA\[)/.source,
     /^ {0,3}(?:>[ \t]?)*<details[\s>]/.source,
   ].join("|"),

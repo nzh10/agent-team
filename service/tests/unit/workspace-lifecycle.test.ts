@@ -3,7 +3,13 @@ import { summarizeMessage } from "../../src/workspace/summary";
 import { EventEmitter } from "events";
 import { Workspace, WorkspaceCallbacks } from "../../src/workspace/workspace";
 import { HostRegistry, Host, HostSessionHandle, HostInfo, LocalHost } from "../../src/session/host";
-import { PromptEnvelope, SessionConfig, SessionState, UsageStats } from "../../src/session/types";
+import {
+  PromptEnvelope,
+  SessionConfig,
+  SessionState,
+  StreamEvent,
+  UsageStats,
+} from "../../src/session/types";
 
 const emptyUsage: UsageStats = {
   input_tokens: 0,
@@ -137,6 +143,66 @@ describe("Workspace teardown", () => {
     expect(ws.isIdle).toBe(true);
     expect(ws.removeAgent(agent.id)).toBeNull();
   });
+});
+
+describe("Tool result aggregation invariant", () => {
+  it.each(["turn", "subagent"])(
+    "folds matched %s tool results without leaving standalone rows",
+    async (scope) => {
+      const { ws, session } = makeWorkspace();
+      try {
+        await ws.sendMessage("go");
+        const reply = ws.messages.find((m) => m.kind === "agent")!;
+        if (scope === "subagent") {
+          session.emit("event", {
+            kind: "subagent_start",
+            content: "",
+            subagent: { taskId: "child", status: "running", events: [] },
+          });
+        }
+        const emit = (event: StreamEvent) =>
+          session.emit(
+            "event",
+            scope === "turn"
+              ? event
+              : {
+                  kind: "subagent_progress",
+                  content: "",
+                  subagent: { taskId: "child", _innerEvent: event },
+                },
+          );
+        for (const id of ["first", "second"]) {
+          emit({ kind: "tool_use", content: "**Read** `file.ts`", toolUseId: id });
+        }
+        for (const id of ["second", "first"]) {
+          emit({
+            kind: "tool_result",
+            content: id,
+            toolUseId: id,
+            isError: true,
+            isMarkdown: true,
+            durationMs: 17,
+          });
+        }
+        const events =
+          scope === "turn"
+            ? reply.events
+            : reply.events?.find((e) => e.kind === "subagent_start")?.subagent?.events;
+        expect(events).toMatchObject(
+          ["first", "second"].map((id) => ({
+            kind: "tool_use",
+            toolUseId: id,
+            toolResult: id,
+            toolResultIsError: true,
+            toolResultIsMarkdown: true,
+            durationMs: 17,
+          })),
+        );
+      } finally {
+        await ws.dispose();
+      }
+    },
+  );
 });
 
 describe("Streaming timers", () => {

@@ -101,6 +101,13 @@ describe("streaming markdown blocks", () => {
     expect(markdownBlocks("a\n\n<pre>\nx\n\ny\n</pre>\n\nb")).toHaveLength(1);
   });
 
+  it("resolves references with escaped closing brackets in their label", () => {
+    const text = "See [docs][a\\]b].\n\n[a\\]b]: https://example.com";
+    const whole = renderToStaticMarkup(<MdBlock>{text}</MdBlock>);
+    expect(whole).toContain('href="https://example.com"');
+    expect(renderToStaticMarkup(<StreamingMdBlock>{text}</StreamingMdBlock>)).toBe(whole);
+  });
+
   it("matches one parse around HTML comments and inline triple backticks", () => {
     const same = (text: string) =>
       expect(renderToStaticMarkup(<StreamingMdBlock>{text}</StreamingMdBlock>)).toBe(
@@ -228,6 +235,24 @@ describe("math", () => {
     expect(container.textContent).not.toContain("$");
   });
 
+  it("renders text inside embedded math without losing subscripts", async () => {
+    await loadMath();
+    const source = String.raw`$$\text{first_item $x_i=\text{foo_bar}$ last_item}$$`;
+    const { container } = render(<MdBlock>{source}</MdBlock>);
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container.querySelector(".katex math msub > mi")?.textContent).toBe("x");
+    expect(container.querySelector(".katex math mtext")?.textContent).toContain("first_item");
+    expect(container.querySelector(".katex math")?.textContent).toContain("foo_bar");
+  });
+
+  it("ignores TeX comments when tracking text and math modes", async () => {
+    await loadMath();
+    const source = ["$$", String.raw`\text{Label $x % \text{`, "_i", "% }", "$}", "$$"].join("\n");
+    const { container } = render(<MdBlock>{source}</MdBlock>);
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container.querySelector(".katex math msub")?.textContent).toBe("xi");
+  });
+
   it("leaves prices and code alone", async () => {
     await loadMath();
     const { container } = render(<MdBlock>{"costs $5 and $10, run `echo $a$`"}</MdBlock>);
@@ -275,6 +300,16 @@ describe("math loading", () => {
     const plugins = await load();
     expect(Array.isArray(plugins.remark)).toBe(true);
     vi.doUnmock("../src/chat/mathPlugins");
+  });
+});
+
+describe("GFM strikethrough", () => {
+  it.each([MdBlock, InlineMd])("requires two tildes in %s", (Markdown) => {
+    const { container } = render(<Markdown>{"~/a ~/b; ~1s to ~10s; ~~obsolete~~"}</Markdown>);
+    expect([...container.querySelectorAll("del")].map((node) => node.textContent)).toEqual([
+      "obsolete",
+    ]);
+    expect(container.textContent).toContain("~/a ~/b; ~1s to ~10s");
   });
 });
 

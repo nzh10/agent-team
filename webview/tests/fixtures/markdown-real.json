@@ -1,0 +1,88 @@
+[
+  {
+    "id": "home-paths",
+    "chunks": ["ls -la ~/.config/agent/sessions/ ~/.cache/sample-app-home/sessions/"]
+  },
+  {
+    "id": "multiline-home-paths",
+    "chunks": [
+      "ver=$(cat ~/.config/sample/install/current-version)\nnm=~/.config/sample/install/releases/$ver/node_modules"
+    ]
+  },
+  {
+    "id": "numeric-range",
+    "chunks": ["the required latency is ~60 (70-10) — the f(gap) model with gap~210"]
+  },
+  {
+    "id": "approximate-seconds",
+    "chunks": ["about ~1s to ~10s"]
+  },
+  {
+    "id": "approximate-lines",
+    "chunks": ["connect at ~1200, handle ends ~1210."]
+  },
+  {
+    "id": "promql-matchers",
+    "chunks": [
+      "node_network_receive_bytes_total{host=\\\\\\\"node-a\\\\\\\",device=~\\\\\\\"eth0|eth1\\\\\\\"}\\\", \\\"node_network_transmit_bytes_total{host=\\\\\\\"node-a\\\\\\\",device=~\\\\\\\"eth0|eth1\\\\\\\"}"
+    ]
+  },
+  {
+    "id": "key-regex",
+    "chunks": ["Key\\(([^,]+),([^)]+)\\)"]
+  },
+  {
+    "id": "space-regex",
+    "chunks": ["r\"\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)\""]
+  },
+  {
+    "id": "latency-regex",
+    "chunks": [
+      "r\"total_delay:([-\\d.]+) = \\(pre_delay:([-\\d.]+) \\+ send_delay:([-\\d.]+) \\+ queue_delay:([-\\d.]+) \\+ round_trip:([-\\d.]+) \\+ payload_cost:([-\\d.]+)\\) = \""
+    ]
+  },
+  {
+    "id": "literal-ellipsis",
+    "chunks": ["Simple regex for $$...$$ in the output"]
+  },
+  {
+    "id": "strike-example",
+    "chunks": ["~~删除线~~"]
+  },
+  {
+    "id": "paren-example",
+    "chunks": ["\\(\\text{中文}\\)"]
+  },
+  {
+    "id": "nested-paren-example",
+    "chunks": ["\\(O", "(n \\log n)\\)"]
+  },
+  {
+    "id": "inline-math",
+    "chunks": [
+      "- *Mathematical Correction*: For $L_1$ interval distance $f(\\theta) = \\sum_k \\text{dist}(\\theta, [L_k, U_k])$,"
+    ]
+  },
+  {
+    "id": "display-cjk",
+    "chunks": [
+      "$$\\text{budget} = \\begin{cases} 1, & S \\le 2 \\\\ \\max\\left(2,\\ \\left\\lceil S / 3 \\right\\rceil\\right), & S \\ge 3 \\end{cases}, \\qquad \\text{触发条件：} N > \\text{budget} \\ \\text{或}\\ M > 2$$"
+    ]
+  },
+  {
+    "id": "inline-escaped-underscores",
+    "chunks": ["$\\text{delay\\_shift} = \\text{local\\_delay} - \\text{global\\_delay}$"]
+  },
+  {
+    "id": "streamed-display",
+    "chunks": [
+      "### 二、为什么同事会觉得是“带宽问题” + 两点客观修正\n\n1. **两种",
+      "“带宽”在宏观上长得几乎一模一样**\n   - **物理链路带宽**（实际能力）：`host`/`no",
+      "de` 波内和单行实测都在 **100–400 Mbps**，余量很大；\n   - **协议",
+      "窗口决定的有效吞吐上限（BDP 天花板）**：\n     $$\\text{Throughput}_{\\max} \\approx \\",
+      "frac{120 \\times 1200\\text{ B}}{20.4\\text{–",
+      "}22.6\\text{ ms}} \\approx 51\\text{–}56\\text",
+      "{ Mbps}$$"
+    ]
+  }
+]

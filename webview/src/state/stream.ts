@@ -45,6 +45,7 @@ export function applyEventsToMessage(m: Message, evts: StreamEvent[]): Message {
   const live = liveThinkingAfter(m, evts);
   const liveChanged =
     live.liveThinking !== m.liveThinking ||
+    live.closingThinking !== m.closingThinking ||
     live.liveThinkingSince !== m.liveThinkingSince ||
     live.waitingSince !== m.waitingSince;
   if (regular.length === 0) {
@@ -172,7 +173,10 @@ export function applyEventsToMessage(m: Message, evts: StreamEvent[]): Message {
   return { ...withoutLiveTiming(m), content, events, ...live };
 }
 
-type LiveTiming = Pick<Message, "liveThinking" | "liveThinkingSince" | "waitingSince">;
+type LiveTiming = Pick<
+  Message,
+  "liveThinking" | "closingThinking" | "liveThinkingSince" | "waitingSince"
+>;
 
 // The thinking block streaming in, in batch order: an empty delta opens a
 // block, the next ones extend it, and the main loop moving on ends it — its
@@ -181,6 +185,7 @@ type LiveTiming = Pick<Message, "liveThinking" | "liveThinkingSince" | "waitingS
 function liveThinkingAfter(m: Message, evts: StreamEvent[]): LiveTiming {
   if (m.status !== "streaming") return {};
   let text = m.liveThinking;
+  let closing = m.closingThinking;
   let since = m.liveThinkingSince;
   let waitingSince = m.waitingSince;
   for (const e of evts) {
@@ -188,6 +193,11 @@ function liveThinkingAfter(m: Message, evts: StreamEvent[]): LiveTiming {
     // A background task reporting on this message is not the main loop
     // moving on.
     if (SUBAGENT_KINDS.has(e.kind)) continue;
+    if (e.kind === "thinking_delta" && e.durationMs != null && e.thinkingFollows) {
+      closing = since != null ? (text ?? "") : closing;
+    } else {
+      closing = undefined;
+    }
     if (e.kind !== "thinking_delta" || e.durationMs != null) {
       text = undefined;
       since = undefined;
@@ -203,14 +213,27 @@ function liveThinkingAfter(m: Message, evts: StreamEvent[]): LiveTiming {
   }
   return {
     ...(text != null && { liveThinking: text }),
+    ...(closing != null && { closingThinking: closing }),
     ...(since != null && { liveThinkingSince: since }),
     ...(waitingSince != null && { waitingSince }),
   };
 }
 
 export function withoutLiveTiming(m: Message): Message {
-  if (m.liveThinking == null && m.liveThinkingSince == null && m.waitingSince == null) return m;
-  const { liveThinking: _text, liveThinkingSince: _thinking, waitingSince: _waiting, ...rest } = m;
+  if (
+    m.liveThinking == null &&
+    m.closingThinking == null &&
+    m.liveThinkingSince == null &&
+    m.waitingSince == null
+  )
+    return m;
+  const {
+    liveThinking: _text,
+    closingThinking: _closing,
+    liveThinkingSince: _thinking,
+    waitingSince: _waiting,
+    ...rest
+  } = m;
   return rest;
 }
 
@@ -243,6 +266,7 @@ function applyInnerEvent(sa: SubAgentInfo, innerEv: StreamEvent): void {
       sa.events[i] = {
         ...sa.events[i],
         toolResult: innerEv.content,
+        ...(innerEv.isMarkdown && { toolResultIsMarkdown: true }),
         ...(innerEv.isError && { toolResultIsError: true }),
         ...(innerEv.durationMs != null && { durationMs: innerEv.durationMs }),
       };

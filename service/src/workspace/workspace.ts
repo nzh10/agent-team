@@ -340,6 +340,7 @@ function applyInnerEvent(saEvents: StreamEvent[], innerEvent: StreamEvent): void
     );
     if (i >= 0) {
       saEvents[i].toolResult = innerEvent.content;
+      if (innerEvent.isMarkdown) saEvents[i].toolResultIsMarkdown = true;
       if (innerEvent.isError) saEvents[i].toolResultIsError = true;
       if (innerEvent.durationMs != null) saEvents[i].durationMs = innerEvent.durationMs;
       return;
