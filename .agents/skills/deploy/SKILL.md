@@ -10,7 +10,7 @@ Production uses `scripts/start-server.sh` (default port `9800`), run by:
 - **macOS:** `launchd` agent `com.yaat.server` in `gui/$(id -u)` (managed via `scripts/yaat-service.sh`)
 - **Linux:** `agent-team-server.service` (`systemd --user`, managed via `scripts/yaat-service.sh`), or `~/.local/bin/agent-team-service supervise` on machines without a systemd user bus
 
-A restart can cut off active sessions, including the one requesting it. Use safe deferred deploy on Linux systemd; other managers need an explicitly authorized maintenance procedure.
+A restart can cut off active sessions, including the one requesting it. Use safe deferred deploy on Linux systemd or macOS launchd; other managers need an explicitly authorized maintenance procedure.
 
 ## Confirm who you are
 
@@ -42,7 +42,7 @@ Only when the user asked for a restart in this turn. Finish all edits, run `npm 
 ./scripts/yaat-service.sh deploy-deferred --when-idle --timeout 600
 ```
 
-Run from the installed checkout, with the matching label, base dir and port. The running server must already support the control socket. The command schedules a detached systemd user job, prints its ID, and returns. Finish your turn; it is a blocker until it settles. A timeout or cancellation before cutover does not restart the service. Older servers or other service managers require an explicitly authorized maintenance window. Do not substitute the legacy fixed-delay command for a rejected safe deploy.
+Run from the installed checkout, with the matching label, base dir and port. The running server must already support the control socket. The command schedules a detached systemd user job or separate one-shot LaunchAgent (macOS build logs: `.agent-team/releases/jobs/<id>/controller.log`), prints its ID, and returns. Finish your turn; it is a blocker until it settles. A timeout or cancellation before cutover does not restart the service. Older servers or other service managers require an explicitly authorized maintenance window. Do not substitute the legacy fixed-delay command for a rejected safe deploy.
 
 If the user said "先别重启" (don't restart yet), commit and stop; schedule nothing.
 
@@ -54,7 +54,7 @@ If the user said "先别重启" (don't restart yet), commit and stop; schedule n
 ./scripts/yaat-service.sh status
 ```
 
-`queued` means the controller has not yet started. `succeeded` means the candidate boot identity and static assets were verified; `rolled_back` means the prior generation was verified instead. Use `deploy-cancel <id>` only before cutover. If `recoveryRequired` is true, inspect the installed checkout's `.agent-team/releases/transaction.json` and active unit before taking any action. See [deployment operations](../../../docs/DEPLOY.md#safe-deferred-deployment-linux-systemd).
+`queued` means the controller has not yet started. `succeeded` means the candidate boot identity and static assets were verified; `rolled_back` means the prior generation was verified instead. Use `deploy-cancel <id>` only before cutover. If `recoveryRequired` is true, inspect the installed checkout's `.agent-team/releases/transaction.json` and active unit before taking any action. See [deployment operations](../../../docs/DEPLOY.md#safe-deferred-deployment).
 
 ## Testing a build without touching production
 

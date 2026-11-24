@@ -261,9 +261,9 @@ full details, including `launchd` `Aqua` Keychain behaviour and dev instances.
 If you expose it beyond localhost, put it behind TLS and keep `[auth]` on —
 agents here run with full filesystem access to the folders you give them.
 
-On Linux systemd, run `scripts/yaat-service.sh deploy-deferred --when-idle --timeout 600`
+On Linux systemd or macOS launchd, run `scripts/yaat-service.sh deploy-deferred --when-idle --timeout 600`
 from the installed checkout. The detached job stages a release and waits for all
-work to finish, including the session that requested it. See [deployment](docs/DEPLOY.md#safe-deferred-deployment-linux-systemd)
+work to finish, including the session that requested it. See [deployment](docs/DEPLOY.md#safe-deferred-deployment)
 for prerequisites, job status, and cancellation.
 
 ## Layout

@@ -340,7 +340,7 @@ function writeSession(
 }
 
 function anchored(cfg: SessionConfig): SessionState {
-  const file = path.join(cfg.cwd, "anchored.jsonl");
+  const file = path.join(fs.realpathSync.native(cfg.cwd), "anchored.jsonl");
   writeSession(file, "saved", cfg.cwd, [conversationEntry("input", null, "user", "first")]);
   return {
     ...saved(cfg),

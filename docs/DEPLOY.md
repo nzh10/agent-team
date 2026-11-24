@@ -101,7 +101,7 @@ git pull
 
 `deploy --verify` runs `npm run check && npm test`, builds `dist/`, restarts the service, and waits up to 15 seconds for `http://127.0.0.1:9800/manifest.webmanifest` to return HTTP 200.
 
-### Safe deferred deployment (Linux systemd)
+### Safe deferred deployment
 
 Run these commands from the **installed checkout**, not a worktree. Use one installed service per checkout; use a separate checkout for a second instance. The installed launcher and the running server must already support deploy control. Upgrading an older installation requires one explicitly authorized maintenance build and restart; `--when-idle` refuses an old server without a control socket.
 
@@ -112,13 +112,13 @@ npm run check && npm test
 ./scripts/yaat-service.sh deploy-cancel <id>
 ```
 
-Pass the installed `--base-dir`, `--label`, and `--port` when they are not inherited. `systemd-run --user` starts a separate controller; the command returns the job ID before building. If you schedule from a session, finish your turn rather than polling in it. Your own active turn, background runs, queued work, and scheduled retries prevent cutover. Timeout includes the build and idle wait. Timeout and cancellation before commit do not change either live release pointer or restart the service.
+Pass the installed `--base-dir`, `--label`, and `--port` when they are not inherited. On Linux, `systemd-run --user` starts a separate controller. On macOS, `launchctl bootstrap` starts a one-shot LaunchAgent in the same GUI domain but with its own label and process group. Restarting the server therefore does not kill the controller. Its build output and errors go to the private (0600) `.agent-team/releases/jobs/<id>/controller.log` in the installed checkout. On both platforms, the command returns the job ID before building. If you schedule from a session, finish your turn rather than polling in it. Your own active turn, background runs, queued work, and scheduled retries prevent cutover. Timeout includes the build and idle wait. Timeout and cancellation before commit do not change either live release pointer or restart the service.
 
 The job builds into `.agent-team/releases/<generation>` using the installed runtime pins. The first staged deploy snapshots the legacy `dist/` as its rollback generation. Do not edit staged releases or change shared `node_modules` while deploying. The running launcher resolves `current` once, so an old process never loads assets from the replacement. After sealing admission, the controller records the prior generation, switches the symlink atomically, and verifies the new process identity and public static assets. If verification fails, it restores and verifies the prior generation. This rolls back release files, not application data; use maintenance for incompatible data or dependency changes.
 
 `deploy-status` shows the job phase and aggregate blockers. The transient service journal contains build output. Job state and the rollback journal are under `.agent-team/releases/`. If `recoveryRequired` is true, inspect `transaction.json`, `current`, and the target unit before taking manual action. A boot from an unfinished transaction does not admit work; clear the journal only after you verify the intended release and unit are healthy. No staged release is automatically deleted.
 
-macOS, custom supervisors, and Linux without a systemd user bus do not support `--when-idle` in this phase. The legacy `deploy` and `deploy-deferred [sec]` commands are disruptive and are only available before a release is staged. They do not provide the idle or rollback guarantees.
+Custom supervisors and Linux without a systemd user bus do not support `--when-idle`. The legacy `deploy` and `deploy-deferred [sec]` commands are disruptive and are only available before a release is staged. They do not provide the idle or rollback guarantees.
 
 ---
 
@@ -148,7 +148,7 @@ To register a separate background service for dev, pass distinct `--label`, `--p
 | `logs`                                        | Tail logs (`-n <lines>`, `--no-follow`)                                                                   |
 | `health`                                      | Probe `http://127.0.0.1:<port>/manifest.webmanifest` (`--wait <sec>`)                                     |
 | `deploy`                                      | Optional `--verify`, build (unless `--no-build`), restart, `health --wait 15`                             |
-| `deploy-deferred --when-idle --timeout <sec>` | Stage and deploy at quiescence (Linux systemd)                                                            |
+| `deploy-deferred --when-idle --timeout <sec>` | Stage and deploy at quiescence (Linux systemd / macOS launchd)                                            |
 | `deploy-status <id>` / `deploy-cancel <id>`   | Inspect or cancel a deferred job before cutover                                                           |
 | `deploy-deferred [sec]`                       | Legacy disruptive deployment for an unstaged service                                                      |
 | `uninstall`                                   | Unload and remove service file; preserves `~/.yaat` data                                                  |

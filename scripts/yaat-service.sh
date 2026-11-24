@@ -4,6 +4,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 source "$REPO_DIR/scripts/runtime-paths.sh"
+source "$REPO_DIR/scripts/deploy-lock.sh"
 runtime_init_path
 OS_NAME="${YAAT_SERVICE_OS:-$(uname -s)}"
 UID_VAL="${YAAT_UID:-$(id -u)}"
@@ -51,7 +52,7 @@ Commands:
   logs                      View service logs (-n <lines>, --no-follow)
   health                    Check http://127.0.0.1:<port>/manifest.webmanifest
   deploy                    Build, restart, and wait for health (--verify)
-  deploy-deferred --when-idle --timeout <sec>  Stage and schedule a safe deploy (Linux systemd)
+  deploy-deferred --when-idle --timeout <sec>  Stage and schedule a safe deploy (systemd or launchd)
   deploy-status <id>        Show deferred deployment state
   deploy-cancel <id>        Cancel before cutover
   deploy-deferred [delay]   Legacy disruptive deploy for an unstaged instance
@@ -911,10 +912,8 @@ prepare_deploy_runtime() {
 }
 
 cmd_deploy() {
-  if [ "$DRY_RUN" -eq 0 ] && [ "$OS_NAME" = Linux ]; then
-    mkdir -p "$REPO_DIR/.agent-team"
-    exec 9>>"$REPO_DIR/.agent-team/deploy.lock"
-    flock -n 9 || die 'Another deploy holds the release lock'
+  if [ "$DRY_RUN" -eq 0 ]; then
+    deploy_lock || die 'Another deploy holds the release lock'
   fi
   if [ -L "$REPO_DIR/.agent-team/releases/current" ] || [ -e "$REPO_DIR/.agent-team/releases/transaction.json" ]; then
     die 'Use deploy-deferred --when-idle --timeout <seconds> for staged releases'
@@ -954,8 +953,41 @@ enqueue_linux_deploy() {
   return 1
 }
 
+# Bootstrap a separate, one-shot LaunchAgent. Unlike a background child of the
+# server it has its own launchd process group throughout kickstart and rollback.
+enqueue_darwin_deploy() (
+  umask 077
+  local dir="$REPO_DIR/.agent-team/releases/jobs/$DEPLOY_JOB_ID" name arg
+  local plist="$dir/controller.plist" log="$dir/controller.log" label="com.yaat.deploy.$DEPLOY_JOB_ID"
+  : >"$log" || return 1
+  {
+    printf '%s\n' '<plist version="1.0"><dict>' "<key>Label</key><string>$label</string>" \
+      '<key>RunAtLoad</key><true/><key>LaunchOnlyOnce</key><true/>' \
+      '<key>ProgramArguments</key><array>'
+    for arg in /bin/bash -c '
+      repo=$1 job=$2; shift 2
+      "$@" || "$YAAT_NODE_BIN" "$repo/scripts/deploy-controller.mjs" controller-failed "$repo" "$job"
+      exec "$YAAT_LAUNCHCTL_BIN" bootout "$YAAT_JOB_TARGET"
+    ' deploy "$REPO_DIR" "$DEPLOY_JOB_ID" "$@"; do
+      printf '<string>%s</string>\n' "$(xml_escape "$arg")"
+    done
+    printf '%s\n' '</array><key>EnvironmentVariables</key><dict>'
+    for name in AGENT_TEAM_PORT AGENT_TEAM_BASE_DIR YAAT_SERVICE_LABEL YAAT_PLIST_DIR YAAT_SERVICE_OS YAAT_UID YAAT_LAUNCHCTL_BIN YAAT_NODE_BIN YAAT_NPM_BIN YAAT_PI_BIN PATH; do
+      printf '<key>%s</key><string>%s</string>\n' "$name" "$(xml_escape "${!name:-}")"
+    done
+    printf '<key>YAAT_JOB_TARGET</key><string>%s</string></dict>\n' "$(xml_escape "gui/$UID_VAL/$label")"
+    printf '<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string></dict></plist>\n' "$(xml_escape "$log")" "$(xml_escape "$log")"
+  } >"$plist" || return 1
+  "$LAUNCHCTL_BIN" bootstrap "gui/$UID_VAL" "$plist"
+)
+
 cmd_deploy_safe() {
-  [ "$OS_NAME" = Linux ] && [ "$(uname -s)" = Linux ] && command -v flock >/dev/null || die 'Safe deployment requires Linux systemd and flock'
+  local enqueue
+  case "$OS_NAME" in
+    Linux) [ "$(uname -s)" = Linux ] && command -v flock >/dev/null || die 'Safe deployment requires Linux systemd and flock'; enqueue=enqueue_linux_deploy ;;
+    Darwin) enqueue=enqueue_darwin_deploy ;;
+    *) die 'Unsupported service manager' ;;
+  esac
   [[ "$DEPLOY_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$DEPLOY_TIMEOUT" -le 86400 ] || die 'Timeout must be 1–86400 seconds'
   [ -z "$EXTRA_ARGS" ] && [ "$NO_BUILD" -eq 0 ] && [ "$VERIFY" -eq 0 ] || die 'Safe deployment takes no delay, --verify, or --no-build'
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -969,9 +1001,10 @@ cmd_deploy_safe() {
   "$YAAT_NODE_BIN" "$controller" prepare "$REPO_DIR" "$job"
   export AGENT_TEAM_PORT="$PORT" AGENT_TEAM_BASE_DIR="$BASE_DIR" YAAT_SERVICE_LABEL="$LABEL"
   export YAAT_SYSTEMCTL_BIN="$SYSTEMCTL_BIN"
-  if ! DEPLOY_JOB_ID="$job" enqueue_linux_deploy "$REPO_DIR/scripts/deploy-deferred.sh" --when-idle --timeout "$DEPLOY_TIMEOUT" --job "$job"; then
+  export YAAT_LAUNCHCTL_BIN="$LAUNCHCTL_BIN" YAAT_UID="$UID_VAL" YAAT_SERVICE_OS="$OS_NAME" YAAT_PLIST_DIR="$PLIST_DIR"
+  if ! DEPLOY_JOB_ID="$job" "$enqueue" "$REPO_DIR/scripts/deploy-deferred.sh" --when-idle --timeout "$DEPLOY_TIMEOUT" --job "$job"; then
     "$YAAT_NODE_BIN" "$controller" launch-failed "$REPO_DIR" "$job"
-    die "Could not schedule safe deploy $job via systemd-run; no fallback"
+    die "Could not schedule safe deploy $job via $enqueue; no fallback"
   fi
   printf 'Scheduled safe deploy %s. Check with deploy-status %s.\n' "$job" "$job"
 }

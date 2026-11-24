@@ -138,6 +138,56 @@ async function health(state, releaseDir) {
   }
 }
 
+export function serviceManager(label, repo, env = process.env) {
+  switch ((env.YAAT_SERVICE_OS || process.platform).toLowerCase()) {
+    case "linux":
+      return linuxManager(label, repo, env.YAAT_SYSTEMCTL_BIN || "systemctl");
+    case "darwin":
+      return darwinManager(
+        label,
+        repo,
+        env.YAAT_LAUNCHCTL_BIN || "launchctl",
+        env.YAAT_UID || process.getuid(),
+      );
+    default:
+      throw new Error("Unsupported service manager");
+  }
+}
+
+function darwinManager(label, repo, bin, uid) {
+  const target = `gui/${uid}/${label}`;
+  const launcher = path.join(repo, "scripts/start-server.sh");
+  const inspect = async () => {
+    const { stdout } = await exec(bin, ["print", target], { timeout: 1500 });
+    // launchctl indents nested dictionaries with additional tabs. Only trust
+    // top-level fields, never a matching substring inside the environment.
+    const fields = (key) =>
+      [...stdout.matchAll(new RegExp(`^\\t${key} = (.*)$`, "gm"))].map((m) => m[1]);
+    const programs = fields("program");
+    if (
+      !stdout.startsWith(`${target} = {\n`) ||
+      programs.length !== 1 ||
+      !(
+        programs[0] === launcher ||
+        (programs[0] === "/bin/bash" &&
+          fields("arguments").length === 1 &&
+          stdout.includes(`\n\targuments = {\n\t\t/bin/bash\n\t\t${launcher}\n\t}\n`))
+      )
+    )
+      throw new Error("Service manager launcher does not match the installed checkout");
+    return fields("pid");
+  };
+  return {
+    verifyLauncher: inspect,
+    async verify(pid) {
+      const pids = await inspect();
+      if (pids.length !== 1 || !/^[1-9][0-9]*$/.test(pids[0]) || pids[0] !== String(pid))
+        throw new Error("Service manager PID does not match the running server");
+    },
+    restart: () => exec(bin, ["kickstart", "-k", target], { timeout: 30_000 }),
+  };
+}
+
 function linuxManager(label, repo, bin) {
   const unit = `${label}.service`;
   const show = async (prop) =>
@@ -422,7 +472,14 @@ async function main() {
     fs.writeFileSync(path.join(job, "decision"), "cancel\n", { flag: "wx", mode: 0o600 });
     return console.log(`Cancellation requested: ${id}`);
   }
-  if (cmd === "lock-failed" || cmd === "launch-failed")
+  // The launchd wrapper also catches failures before deploy() starts. Never
+  // overwrite a controller's diagnostics or its post-cutover recovery state.
+  if (
+    cmd === "controller-failed" &&
+    JSON.parse(fs.readFileSync(path.join(job, "status.json"))).phase !== "queued"
+  )
+    return;
+  if (cmd === "lock-failed" || cmd === "launch-failed" || cmd === "controller-failed")
     return atomicJson(path.join(job, "status.json"), { id, phase: "failed", error: cmd });
   if (cmd !== "run" || !/^[1-9][0-9]*$/.test(seconds) || Number(seconds) > 86400)
     throw new Error("Invalid deploy command or timeout");
@@ -453,7 +510,7 @@ async function main() {
     id,
     target,
     timeoutMs: Number(seconds) * 1000,
-    manager: linuxManager(label, repo, process.env.YAAT_SYSTEMCTL_BIN || "systemctl"),
+    manager: serviceManager(label, repo),
     stage: (dir, signal) => build(repo, dir, npm, signal),
   });
 }

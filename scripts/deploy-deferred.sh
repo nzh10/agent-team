@@ -7,11 +7,11 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 source "$REPO_DIR/scripts/runtime-paths.sh"
+source "$REPO_DIR/scripts/deploy-lock.sh"
 runtime_init_path
 
 if [ "${1:-}" = --when-idle ]; then
   [ "$#" -eq 5 ] && [ "$2" = --timeout ] && [ "$4" = --job ] || exit 2
-  [ "$(uname -s)" = Linux ] && command -v flock >/dev/null || exit 2
   BASE_DIR="${AGENT_TEAM_BASE_DIR:?Missing deploy target base dir}"
   runtime_load_pins "$BASE_DIR"
   runtime_require_node
@@ -20,8 +20,7 @@ if [ "${1:-}" = --when-idle ]; then
   runtime_use_paths
   CONTROLLER="$REPO_DIR/scripts/deploy-controller.mjs"
   umask 077
-  exec 9>>"$REPO_DIR/.agent-team/deploy.lock"
-  if ! flock -n 9; then
+  if ! deploy_lock; then
     "$YAAT_NODE_BIN" "$CONTROLLER" lock-failed "$REPO_DIR" "$5"
     exit 1
   fi
@@ -34,11 +33,7 @@ sleep "$DELAY"
 
 cd "$REPO_DIR" || exit 1
 BASE_DIR="${AGENT_TEAM_BASE_DIR:-$HOME/.yaat}"
-if [ "$(uname -s)" = Linux ]; then
-  mkdir -p "$REPO_DIR/.agent-team"
-  exec 9>>"$REPO_DIR/.agent-team/deploy.lock"
-  flock -n 9 || { echo 'Another deploy holds the release lock' >&2; exit 1; }
-fi
+deploy_lock || { echo 'Another deploy holds the release lock' >&2; exit 1; }
 if [ -L "$REPO_DIR/.agent-team/releases/current" ] || [ -e "$REPO_DIR/.agent-team/releases/transaction.json" ]; then
   echo 'Use deploy-deferred --when-idle --timeout <seconds> for staged releases' >&2
   exit 1

@@ -8,6 +8,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -22,6 +23,7 @@ const scriptNames = [
   "start-server",
   "yaat-service",
   "deploy-deferred",
+  "deploy-lock",
 ];
 const tools = [
   "basename",
@@ -30,7 +32,7 @@ const tools = [
   "date",
   "dirname",
   "env",
-  "flock",
+  ...(process.platform === "linux" ? ["flock"] : []),
   "grep",
   "id",
   "mkdir",
@@ -87,6 +89,7 @@ beforeEach(() => {
   for (const name of scriptNames) {
     cpSync(join(scripts, `${name}.sh`), join(root, "scripts", `${name}.sh`));
   }
+  cpSync(join(scripts, "deploy-controller.mjs"), join(root, "scripts/deploy-controller.mjs"));
   for (const tool of ["bash", ...tools]) {
     const source = ["/bin", "/usr/bin"].map((dir) => join(dir, tool)).find(existsSync);
     if (!source) throw new Error(`test requires ${tool}`);
@@ -133,6 +136,78 @@ function ok(script: string, args: string[], extraEnv?: NodeJS.ProcessEnv, cwd?: 
   expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
   return result.stdout;
 }
+
+it.each([true, false])(
+  "schedules a separate launchd controller (bootstrap succeeds: %s)",
+  (success) => {
+    const darwin = { YAAT_SERVICE_OS: "Darwin" };
+    const args = ["deploy-deferred", "--when-idle", "--timeout", "600"];
+    ok("yaat-service", [...args, "--dry-run"], darwin);
+    const jobs = join(root, ".agent-team/releases/jobs");
+    expect(existsSync(jobs)).toBe(false);
+    executable(bin, "launchctl", `printf '%s\\n' "$@" > "$TRACE"; exit ${success ? 0 : 1}`);
+    const result = run("yaat-service", args, darwin);
+    expect(result.status, result.stderr).toBe(success ? 0 : 1);
+    const [id] = readdirSync(jobs);
+    const job = join(jobs, id);
+    expect(readFileSync(trace, "utf8").trim().split("\n")).toEqual([
+      "bootstrap",
+      "gui/1000",
+      join(job, "controller.plist"),
+    ]);
+    const plist = readFileSync(join(job, "controller.plist"), "utf8");
+    for (const field of [
+      `com.yaat.deploy.${id}`,
+      join(job, "controller.log"),
+      join(bin, "launchctl"),
+      "--when-idle",
+      base,
+    ])
+      expect(plist).toContain(field);
+    expect(statSync(join(job, "controller.log")).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(job, "status.json"), "utf8")).toContain(
+      success ? "queued" : "launch-failed",
+    );
+  },
+);
+
+it.skipIf(process.platform !== "darwin")(
+  "records an early controller failure before unloading the LaunchAgent",
+  () => {
+    executable(bin, "launchctl", `printf '%s\\n' "$@" >> ${shellQuote(trace)}`);
+    ok("yaat-service", ["deploy-deferred", "--when-idle", "--timeout", "10"], {
+      YAAT_SERVICE_OS: "Darwin",
+    });
+    const jobs = join(root, ".agent-team/releases/jobs");
+    const [id] = readdirSync(jobs);
+    const job = join(jobs, id);
+    const plist = spawnSync(
+      "/usr/bin/plutil",
+      ["-convert", "json", "-o", "-", join(job, "controller.plist")],
+      { encoding: "utf8" },
+    );
+    const {
+      ProgramArguments: [cmd, ...args],
+      EnvironmentVariables,
+    } = JSON.parse(plist.stdout) as {
+      ProgramArguments: [string, ...string[]];
+      EnvironmentVariables: Record<string, string>;
+    };
+    expect(existsSync(base)).toBe(false);
+    const result = spawnSync(cmd, args, {
+      env: { HOME: home, ...EnvironmentVariables },
+      encoding: "utf8",
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const calls = readFileSync(trace, "utf8");
+    expect(calls).toContain(`bootout\ngui/1000/com.yaat.deploy.${id}`);
+    expect(calls).not.toContain("kickstart");
+    expect(JSON.parse(readFileSync(join(job, "status.json"), "utf8"))).toMatchObject({
+      phase: "failed",
+      error: "controller-failed",
+    });
+  },
+);
 
 function install(os = "Linux") {
   ok("yaat-service", ["install", "--no-start", "--no-build", "--no-auth"], { YAAT_SERVICE_OS: os });
