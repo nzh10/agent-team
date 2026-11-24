@@ -316,6 +316,7 @@ describe("report delivery reconciliation", () => {
   it("maps every MessageStatus to its delivery phase", () => {
     const expected: Record<MessageStatus, ReportLeadDeliveryState> = {
       queued: "enqueued",
+      starting: "enqueued",
       dispatching: "dispatching",
       streaming: "dispatching",
       done: "sent_to_pi",

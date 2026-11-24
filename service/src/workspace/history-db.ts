@@ -40,10 +40,12 @@ export class HistoryDb {
     `);
   }
 
-  hasDispatching(session: string): boolean {
+  hasUnfinishedDispatch(session: string): boolean {
     return (
       this.db
-        .prepare("select 1 from messages where session = ? and status = 'dispatching' limit 1")
+        .prepare(
+          "select 1 from messages where session = ? and status in ('starting', 'dispatching') limit 1",
+        )
         .get(session) !== undefined
     );
   }

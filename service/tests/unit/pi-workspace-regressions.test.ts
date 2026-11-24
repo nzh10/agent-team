@@ -114,7 +114,8 @@ function makeWorkspace(overrides: Partial<WorkspaceCallbacks> = {}) {
   };
   const ws = new Workspace("ws-1", "Lead", "proj", "local", dir, registry, cb);
   const agent = ws.addAgent("A", "mock/model", "🤖", "#000", { backend: "pi" });
-  return { ws, agent, session, newMsgs, removed, dir };
+  const agentMsgs = () => ws.messages.filter((msg) => msg.kind === "agent");
+  return { ws, agent, session, newMsgs, removed, dir, registry, agentMsgs };
 }
 
 describe("Pi workspace lifecycle regressions", () => {
@@ -150,13 +151,241 @@ describe("Pi workspace lifecycle regressions", () => {
     expect(ws.findMessage("rep-msg-1")?.status).toBe("queued");
   });
 
-  it("settles orphaned streaming reply when Pi returns disposition handled", async () => {
-    const { ws, session, removed } = makeWorkspace();
-    session.sendImpl = () => Promise.resolve({ disposition: "handled" });
-    await ws.sendMessage("/extension-cmd");
+  function deferSend(session: StubSession) {
+    let resolve!: (receipt: SendReceipt) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<SendReceipt>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    let beforeWrite: (() => void) | undefined;
+    session.sendImpl = (input, hooks) => {
+      const envelope = input as PromptEnvelope;
+      beforeWrite = () =>
+        hooks?.onBeforeWrite?.({
+          inputId: envelope.inputId,
+          reportId: envelope.reportId,
+          generation: 0,
+          beforeLeafId: null,
+          beforeEntryCount: 0,
+          startedAt: Date.now(),
+        });
+      return promise;
+    };
+    return { promise, resolve, reject, write: () => beforeWrite!() };
+  }
+
+  it.each(["acceptance", "first stream event"])(
+    "opens one cold-start reply at %s",
+    async (opensAt) => {
+      const { ws, agent, session, agentMsgs, registry } = makeWorkspace();
+      const turn = deferSend(session);
+      const unseen = ws.unseen;
+      const sending = ws.sendMessage("cold start");
+      const input = ws.messages.find((m) => m.kind === "user")!;
+      expect(input.status).toBe("starting");
+      expect(input.dispatchAttempt).toBeUndefined();
+      expect(ws.cancelQueued(input.id)).toBe(false);
+      expect(ws.unseen).toBe(unseen + 1);
+      expect(agentMsgs()).toHaveLength(0);
+      const restoredStatus = () => {
+        const restored = Workspace.fromState(structuredClone(ws.getState()), registry);
+        restored.settleStartingOnRestore();
+        restored.settlePlainDispatchingOnRestore();
+        return restored.findMessage(input.id)!.status;
+      };
+      expect(restoredStatus()).toBe("error");
+
+      turn.write();
+      expect(input.status).toBe("dispatching");
+      expect(input.dispatchAttempt?.inputId).toBe(input.id);
+      expect(agentMsgs()).toHaveLength(0);
+      expect(restoredStatus()).toBe("outcome_unknown");
+
+      session.isRunning = true;
+      const text = () => session.emit("event", { kind: "text_delta", content: "answer" });
+      const accept = () => session.emit("user_message_accepted", { inputId: input.id });
+      if (opensAt === "acceptance") accept();
+      else text();
+      expect(agentMsgs()).toHaveLength(1);
+      if (opensAt === "acceptance") text();
+      else accept();
+      turn.resolve({ disposition: "started" });
+      await sending;
+      expect(input.status).toBe("done");
+      expect(agentMsgs()).toHaveLength(1);
+      expect(ws.unseen).toBe(unseen + 2);
+      expect(ws.agents.get(agent.id)?.input?.replies).toEqual([agentMsgs()[0].id]);
+      expect(agentMsgs()[0].content).toBe("answer");
+    },
+  );
+
+  it.each(["handled", "rejected", "retryable"] as const)(
+    "never opens an empty reply when Pi returns %s",
+    async (kind) => {
+      const { ws, session, removed, agentMsgs } = makeWorkspace();
+      const turn = deferSend(session);
+      const sending = ws.sendMessage("/extension-cmd");
+      turn.write();
+      turn.resolve(
+        kind === "handled"
+          ? { disposition: "handled" }
+          : {
+              disposition: "rejected",
+              retryable: kind === "retryable",
+              error: "Not accepted",
+            },
+      );
+      await sending;
+      expect(removed).toHaveLength(0);
+      if (kind === "rejected") {
+        expect(agentMsgs()).toHaveLength(1);
+        expect(agentMsgs()[0]).toMatchObject({
+          status: "error",
+          events: [{ kind: "error", content: "[send failed] Not accepted" }],
+        });
+      } else {
+        expect(agentMsgs()).toHaveLength(0);
+      }
+      const input = ws.messages.find((m) => m.kind === "user")!;
+      expect(input.status).toBe(
+        kind === "handled" ? "done" : kind === "rejected" ? "error" : "queued",
+      );
+      if (kind === "retryable") expect(ws.cancelQueued(input.id)).toBe(true);
+      expect(ws.isIdle).toBe(true);
+    },
+  );
+
+  it.each([false, true])(
+    "settles send failure without crossing the write boundary (written=%s)",
+    async (written) => {
+      const { ws, session, agentMsgs } = makeWorkspace();
+      const turn = deferSend(session);
+      const sending = ws.sendMessage("send fails");
+      if (written) turn.write();
+      turn.reject(new Error("transport closed"));
+      await sending;
+      expect(ws.messages.find((m) => m.kind === "user")?.status).toBe(
+        written ? "outcome_unknown" : "error",
+      );
+      expect(agentMsgs()).toHaveLength(written ? 0 : 1);
+    },
+  );
+
+  it.each(["interrupt", "abort", "remove"] as const)(
+    "retires a deferred dispatch on %s without making a reply",
+    async (action) => {
+      const { ws, agent, session, agentMsgs } = makeWorkspace();
+      const turn = deferSend(session);
+      const sending = ws.sendMessage("deferred");
+      const input = ws.messages.find((m) => m.kind === "user")!;
+      session.isRunning = true;
+      if (action === "abort") turn.write();
+      if (action === "interrupt") await ws.interruptAll();
+      else if (action === "abort") ws.abortAll();
+      else ws.removeAgent(agent.id);
+      expect(input.status).toBe(action === "abort" ? "outcome_unknown" : "error");
+      expect(ws.isIdle).toBe(true);
+      expect(() => turn.write()).toThrow("Prompt dispatch cancelled");
+      turn.reject(new Error("late failure"));
+      await sending;
+      expect(agentMsgs()).toHaveLength(0);
+    },
+  );
+
+  it("stops a retry before writing even though it has no new user message", async () => {
+    const { ws, agent, session, agentMsgs } = makeWorkspace();
+    const first = deferSend(session);
+    const sending = ws.sendMessage("retry me");
+    first.write();
+    session.isRunning = true;
+    session.emit("user_message_accepted", {
+      inputId: ws.messages.find((m) => m.kind === "user")!.id,
+    });
+    first.resolve({ disposition: "started" });
+    await sending;
+    session.isRunning = false;
+    session.emit("event", { kind: "result", content: "" });
+    ws.pauseAgent(agent.id, Date.now(), true);
+    const retry = deferSend(session);
+    expect(ws.retryLast(agent.id)).toBe(true);
+    session.isRunning = true;
+    await ws.interruptAll();
     expect(ws.isIdle).toBe(true);
-    expect(removed).toHaveLength(1);
-    expect(ws.getMessages().some((m) => m.status === "streaming")).toBe(false);
+    expect(() => retry.write()).toThrow("Prompt dispatch cancelled");
+    retry.reject(new Error("late failure"));
+    await retry.promise.catch(() => undefined);
+    expect(agentMsgs()).toHaveLength(1);
+  });
+
+  it("keeps pre-write configuration warnings out of a handled command's reply", async () => {
+    const { ws, session, agentMsgs } = makeWorkspace();
+    const turn = deferSend(session);
+    const sending = ws.sendMessage("/extension-cmd");
+    session.isRunning = true;
+    session.emit("event", { kind: "notice", level: "warning", content: "Effort reset" });
+    expect(agentMsgs()).toHaveLength(0);
+    expect(ws.messages.at(-1)).toMatchObject({ kind: "system", content: "Effort reset" });
+    turn.write();
+    session.isRunning = false;
+    turn.resolve({ disposition: "handled" });
+    await sending;
+    expect(agentMsgs()).toHaveLength(0);
+    expect(ws.isIdle).toBe(true);
+  });
+
+  it("cancels a waiting report and promotes the next queued input before creating a reply", async () => {
+    const delivery = vi.fn();
+    const onMessageDone = vi.fn();
+    const { ws, agent, session, agentMsgs } = makeWorkspace({
+      onReportDeliveryState: delivery,
+      onMessageDone,
+    });
+    const first = deferSend(session);
+    const sending = ws.sendMessage("first");
+    first.write();
+    session.isRunning = true;
+    session.emit("user_message_accepted", {
+      inputId: ws.messages.find((m) => m.kind === "user")!.id,
+    });
+    first.resolve({ disposition: "started" });
+    await sending;
+    const report = ws.ensureReportQueued(
+      "report",
+      agent.id,
+      { inputId: "report", text: "report", reportId: "r1" },
+      { workspaceId: "worker", name: "Worker", role: "worker" },
+      "report",
+    );
+    expect(report.status).toBe("queued");
+    expect(ws.cancelQueued(report.id)).toBe(true);
+    expect(ws.findMessage(report.id)).toBeUndefined();
+    expect(delivery).toHaveBeenCalledWith("r1", "error", { errorMessage: "Cancelled by user" });
+    await ws.sendMessage("next");
+    const next = ws.messages.find((m) => m.content === "next")!;
+    expect(next.status).toBe("queued");
+
+    const second = deferSend(session);
+    session.isRunning = false;
+    session.emit("event", { kind: "result", content: "" });
+    ws.dequeueNext(agent.id);
+    expect(next.status).toBe("starting");
+    expect(onMessageDone).toHaveBeenCalledWith(
+      ws.id,
+      next.id,
+      "starting",
+      "next",
+      undefined,
+      undefined,
+    );
+    expect(ws.cancelQueued(next.id)).toBe(false);
+    expect(agentMsgs()).toHaveLength(1);
+    second.write();
+    expect(agentMsgs()).toHaveLength(1);
+    second.resolve({ disposition: "handled" });
+    await second.promise;
+    expect(next.status).toBe("done");
+    expect(agentMsgs()).toHaveLength(1);
   });
 
   it("does not abort a newly started next turn when an older interrupt times out", async () => {

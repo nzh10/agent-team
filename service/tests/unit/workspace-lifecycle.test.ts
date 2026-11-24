@@ -297,7 +297,7 @@ describe("Workspace model switching", () => {
     await Promise.all([sending, switching]);
     expect(session.sent).toEqual(["first prompt"]);
     expect(host.sessions.get(agent.id)).toBe(session);
-    expect(ws.messages.at(-1)?.content).toContain("cannot move");
+    expect(ws.messages.find((msg) => msg.localCommand)?.content).toContain("cannot move");
   });
 
   it.each([

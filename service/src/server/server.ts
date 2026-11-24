@@ -1344,9 +1344,12 @@ export class Server {
       if (tools) for (const a of workspace.agents.values()) a.session.setPanelTools?.(tools);
     }
     for (const workspace of this.workspaces.values()) {
-      if (!workspace.messagesLoaded && !historyOf(this.baseDir).hasDispatching(workspace.id))
+      if (!workspace.messagesLoaded && !historyOf(this.baseDir).hasUnfinishedDispatch(workspace.id))
         continue;
-      if (this.ensureLoaded(workspace)) workspace.settlePlainDispatchingOnRestore();
+      if (this.ensureLoaded(workspace)) {
+        workspace.settleStartingOnRestore();
+        workspace.settlePlainDispatchingOnRestore();
+      }
       if (workspace.isArchived) workspace.unloadMessages();
     }
     await Promise.all([this.refreshPiCatalog(), this.recheckCodexAuth(false)]);
@@ -1612,7 +1615,8 @@ export class Server {
     const entry = ws?.agents.get(agentId);
     if (!ws || !entry) return;
     const agentName = entry.info.name;
-    if (!entry.currentMsg && !entry.retryPending) entry.lastEnvelope = undefined;
+    if (!entry.currentMsg && !entry.openingPrompt && !entry.retryPending)
+      entry.lastEnvelope = undefined;
 
     const now = Date.now();
     if (entry.retryPending && (entry.pausedUntil ?? 0) > now) return;

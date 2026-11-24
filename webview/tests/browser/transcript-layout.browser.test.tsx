@@ -338,6 +338,51 @@ it("keeps attached images unstretched and gives queue cancellation a larger targ
   expect(rect(cancel).width - glyph.getBoundingClientRect().width).toBeGreaterThanOrEqual(10);
 });
 
+it("offers real queue cancellation but no cancel action before or during a write", () => {
+  const cancelled: string[] = [];
+  const input: Message = {
+    ...message,
+    id: "input",
+    kind: "user",
+    agentId: null,
+    content: "Please start",
+    queuedFor: agent.id,
+  };
+  const view = (status: Message["status"], replies: Message[] = []) => (
+    <div className="messages">
+      <MessageItem
+        msg={{ ...input, status }}
+        agents={[agent]}
+        onCancelQueued={(id) => cancelled.push(id)}
+      />
+      {replies.map((reply) => (
+        <MessageItem key={reply.id} msg={reply} agents={[agent]} />
+      ))}
+    </div>
+  );
+  const { container, getByRole, rerender } = render(view("starting"));
+  expect(getByRole("status").textContent).toContain("Starting the agent");
+  expect(container.querySelector(".queued-badge")).toBeNull();
+  expect(container.querySelectorAll(".message-agent")).toHaveLength(0);
+
+  rerender(view("dispatching"));
+  expect(getByRole("status").textContent).toContain("Sending to the agent");
+  expect(container.querySelector(".queued-cancel")).toBeNull();
+  expect(container.querySelectorAll(".message-agent")).toHaveLength(0);
+
+  rerender(view("done", [{ ...message, status: "streaming" }]));
+  expect(container.querySelectorAll(".message-agent")).toHaveLength(1);
+
+  const first = { ...message, status: "done" as const };
+  rerender(view("queued", [first]));
+  fireEvent.click(get(container, ".queued-cancel"));
+  expect(cancelled).toEqual([input.id]);
+  rerender(view("starting", [first]));
+  expect(getByRole("status").textContent).toContain("Starting the agent");
+  expect(container.querySelector(".queued-cancel")).toBeNull();
+  expect(container.querySelectorAll(".message-agent")).toHaveLength(1);
+});
+
 it("fits a workspace dialog and board detail on a narrow phone", async () => {
   await page.viewport(320, 820);
   const { container, rerender } = render(

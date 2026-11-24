@@ -162,6 +162,32 @@ const echoTools = (handler: (args: Record<string, unknown>) => Promise<string>):
 });
 
 describe("codex app-server session", () => {
+  it.each([false, true])(
+    "distinguishes RPC rejection from a lost turn/start response (lost=%s)",
+    async (lost) => {
+      const { session } = makeSession();
+      const onBeforeWrite = vi.fn();
+      if (lost) server.hold.add("turn/start");
+      else
+        server.handlers["turn/start"] = () => {
+          throw new Error("Request rejected");
+        };
+      const sending = session.send("first", { onBeforeWrite });
+      if (lost) {
+        const failed = expect(sending).rejects.toThrow("Connection lost");
+        await flush();
+        expect(server.turns()).toBe(1);
+        server.exit("Connection lost");
+        await failed;
+      } else {
+        await expect(sending).resolves.toMatchObject({
+          disposition: "rejected",
+          error: "Request rejected",
+        });
+      }
+      expect(onBeforeWrite).toHaveBeenCalledTimes(1);
+    },
+  );
   it("retires the idle process and resumes its thread on the next turn", async () => {
     const { session } = makeSession();
     await session.send("first");
@@ -850,7 +876,7 @@ describe("codex session races", () => {
 
 describe("codex steering through the workspace", () => {
   const removed: string[] = [];
-  function makeWorkspace() {
+  function makeWorkspace(onAgentIdle?: () => void) {
     removed.length = 0;
     const registry = new HostRegistry();
     registry.register(new LocalHost("local", "Local"));
@@ -859,6 +885,7 @@ describe("codex steering through the workspace", () => {
       onStreamEvent: () => {},
       onMessageDone: () => {},
       onMessageRemoved: (_ws, id) => removed.push(id),
+      onAgentIdle,
     });
     ws.addAgent("A", "gpt-6-astra", "🤖", "#888", { backend: "codex" });
     return ws;
@@ -867,6 +894,38 @@ describe("codex steering through the workspace", () => {
     server.item("started", { type: "userMessage", id, clientId, content: [] });
   const summary = (ws: Workspace) =>
     ws.messages.filter((m) => m.kind !== "system").map((m) => `${m.kind} ${m.status} ${m.content}`);
+
+  it.each([false, true])(
+    "notifies idle after early turn completion or transport loss (lost=%s)",
+    async (lost) => {
+      const idle: boolean[] = [];
+      const ws = makeWorkspace(() => idle.push(ws.isIdle));
+      if (lost) server.hold.add("turn/start");
+      else
+        server.after["turn/start"] = [
+          {
+            method: "turn/completed",
+            params: {
+              ...codexFields("turn/completed"),
+              ...withId("turn/completed", "turn", "turn_1", { status: "completed" }),
+              threadId: "thr_1",
+            },
+          },
+        ];
+      const sending = ws.sendMessage("first");
+      if (lost) {
+        await flush();
+        expect(server.turns()).toBe(1);
+        server.exit("Connection lost");
+      }
+      await sending;
+      expect(idle).toEqual([true]);
+      expect(ws.messages.find((m) => m.kind === "user")?.status).toBe(
+        lost ? "outcome_unknown" : "done",
+      );
+      expect(ws.messages.filter((m) => m.kind === "agent")).toHaveLength(1);
+    },
+  );
 
   it("steers a message into the running turn and answers it in a reply of its own", async () => {
     const ws = makeWorkspace();

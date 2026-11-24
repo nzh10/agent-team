@@ -98,6 +98,7 @@ export function messageStatusToDeliveryState(
 ): ReportLeadDeliveryState | null {
   switch (status) {
     case "queued":
+    case "starting":
       return "enqueued";
     case "dispatching":
     case "streaming":

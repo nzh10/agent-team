@@ -1239,7 +1239,8 @@ export class ProjectManager {
       (agent.pausedUntil !== undefined && now < agent.pausedUntil) ||
       w.messages.some(
         (m) =>
-          (m.status === "queued" || m.status === "dispatching") && m.queuedFor === agent.info.id,
+          (m.status === "queued" || m.status === "starting" || m.status === "dispatching") &&
+          m.queuedFor === agent.info.id,
       );
     if (waits) return 0;
     const delay = this.takeStartSlot();
@@ -2432,7 +2433,11 @@ function sameRoot(a: string | null, b: string): boolean {
 function sessionState(w: Workspace): "archived" | "working" | "waiting to start" | "idle" {
   if (w.isArchived) return "archived";
   if ([...w.agents.values()].some((a) => a.session.isRunning)) return "working";
-  return w.messages.some((m) => m.status === "queued") ? "waiting to start" : "idle";
+  return w.messages.some(
+    (m) => m.status === "queued" || m.status === "starting" || m.status === "dispatching",
+  )
+    ? "waiting to start"
+    : "idle";
 }
 
 // Files under a folder and their bytes; dot files (an editor's) left out.

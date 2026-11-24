@@ -161,7 +161,7 @@ export interface BackgroundTask {
 }
 
 export type MessageStatus =
-  "done" | "streaming" | "error" | "queued" | "dispatching" | "outcome_unknown";
+  "done" | "streaming" | "error" | "queued" | "starting" | "dispatching" | "outcome_unknown";
 
 export interface PromptEnvelope {
   inputId: string;

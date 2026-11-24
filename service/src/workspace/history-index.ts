@@ -558,7 +558,12 @@ export class HistoryIndex {
       .all() as Array<{ session: string; id: string; hash: string; status: string }>) {
       const k = key(r.session, r.id);
       present.add(k);
-      if (r.status === "streaming" || r.status === "queued" || r.status === "dispatching") {
+      if (
+        r.status === "streaming" ||
+        r.status === "queued" ||
+        r.status === "starting" ||
+        r.status === "dispatching"
+      ) {
         continue;
       }
       if (indexed.get(k) !== r.hash) out.push({ session: r.session, message: r.id });

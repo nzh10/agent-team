@@ -339,6 +339,7 @@ export class CodexSession extends EventEmitter {
     // A turn stopped and replaced meanwhile: what this one's requests do
     // later is not the new turn's.
     const generation = this.generation;
+    let writeClaimed = false;
     try {
       if (this.client && this.launched !== this.launchKey()) this.closeProcess();
       const client = await this.connect();
@@ -352,6 +353,7 @@ export class CodexSession extends EventEmitter {
         beforeEntryCount: 0,
         startedAt: Date.now(),
       });
+      writeClaimed = true;
       const threadId = this.sessionId;
       if (compact) {
         await client.request("thread/compact/start", { threadId });
@@ -363,7 +365,9 @@ export class CodexSession extends EventEmitter {
         this.failTurn(`[Codex error] ${e instanceof Error ? e.message : String(e)}`);
       }
       if (hooks) {
-        if (!this.client || e instanceof RpcRequestError)
+        // A negative RPC response is definitive. A lost response after the
+        // write claim cannot tell us whether the server took the turn.
+        if (!writeClaimed || e instanceof RpcRequestError)
           return { disposition: "rejected", error: e instanceof Error ? e.message : String(e) };
         throw e;
       }

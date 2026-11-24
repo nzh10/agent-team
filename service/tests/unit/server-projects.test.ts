@@ -1085,7 +1085,7 @@ describe("server restart with projects", () => {
         .message as Message;
       expect(delivered).toMatchObject({
         content: "please rebase",
-        status: "queued",
+        status: "starting",
         from: { workspaceId: "ws-lead", role: "lead" },
       });
     } finally {

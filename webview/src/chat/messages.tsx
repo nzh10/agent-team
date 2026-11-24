@@ -1293,9 +1293,10 @@ export const MessageItem = memo(function MessageItem({
             )}
             {!isUser && <MessageStatus msg={msg} />}
 
-            {msg.status === "dispatching" && (
+            {(msg.status === "starting" || msg.status === "dispatching") && (
               <div className="delivery-status delivery-dispatching" role="status">
-                <span className="streaming-dot" /> Sending to the agent…
+                <span className="streaming-dot" />{" "}
+                {msg.status === "starting" ? "Starting the agent…" : "Sending to the agent…"}
               </div>
             )}
             {msg.status === "outcome_unknown" && (

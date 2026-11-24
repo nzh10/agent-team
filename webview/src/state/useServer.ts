@@ -268,7 +268,8 @@ export interface Message {
   agentId: string | null;
   content: string;
   timestamp: number;
-  status: "streaming" | "done" | "error" | "queued" | "dispatching" | "outcome_unknown";
+  status:
+    "streaming" | "done" | "error" | "queued" | "starting" | "dispatching" | "outcome_unknown";
   events?: StreamEvent[];
   turnId?: string;
   images?: MessageImage[];

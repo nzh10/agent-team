@@ -206,7 +206,12 @@ export interface AgentEntry {
   session: HostSessionHandle;
   handler: (event: StreamEvent) => void;
   currentMsg: Message | null;
-  startingMessageId?: string;
+  openingPrompt?: {
+    envelope: PromptEnvelope;
+    input?: Message;
+    writeClaimed: boolean;
+    replied: boolean;
+  };
   recoveringDispatching?: boolean;
   activeReportId?: string;
   // Last prompt dispatched to the session — the retry unit for rate limits.
@@ -445,11 +450,15 @@ export class Workspace {
 
   get isIdle(): boolean {
     for (const a of this.agents.values()) {
-      if (a.session.isRunning) return false;
+      if (this.dispatchHeld(a)) return false;
       if (this.agentState(a) === "waiting") return false;
     }
     return !this.messages.some(
-      (m) => m.status === "queued" || m.status === "streaming" || m.status === "dispatching",
+      (m) =>
+        m.status === "queued" ||
+        m.status === "streaming" ||
+        m.status === "starting" ||
+        m.status === "dispatching",
     );
   }
 
@@ -692,7 +701,8 @@ export class Workspace {
     if (!entry.currentMsg) {
       // A turn the CLI started itself: no prompt of ours to retry, unless
       // one is still waiting for its retry.
-      if (!entry.retryPending) entry.lastEnvelope = undefined;
+      if (entry.openingPrompt) entry.openingPrompt.replied = true;
+      else if (!entry.retryPending) entry.lastEnvelope = undefined;
       entry.currentMsg = this.makeAgentMsg(entry.info.id);
       entry.input?.replies.push(entry.currentMsg.id);
       this.pushMessage(entry.currentMsg);
@@ -814,6 +824,19 @@ export class Workspace {
         }
       }
 
+      if (event.kind === "thinking_tokens" && !entry.currentMsg) return;
+      // Pi can report an option reset before writing the prompt. It is not
+      // output from the turn, and the prompt may be handled without a turn.
+      if (
+        event.kind === "notice" &&
+        entry.openingPrompt &&
+        event.level === "warning" &&
+        entry.session.getState().config.backend === "pi" &&
+        !entry.openingPrompt.writeClaimed
+      ) {
+        this.pushSystemMessage(event.content);
+        return;
+      }
       if (event.kind === "retry" && !event.content) {
         if (entry.currentMsg && clearRetry(entry.currentMsg))
           this.streamed(entry.currentMsg, event);
@@ -880,13 +903,22 @@ export class Workspace {
         const msg = this.ensureAgentMsg(entry);
         this.streamed(msg, event);
       } else if (event.kind === "thinking_tokens") {
-        const msg = this.ensureAgentMsg(entry);
+        const msg = entry.currentMsg;
+        if (!msg) return;
         const block = lastThinking(msg.events!);
         if (block && block.tokens == null) block.tokens = event.tokens;
         this.streamed(msg, event);
       } else if (event.kind === "text") {
         // text comes via text_delta streaming; finalized text event is redundant
       } else if (event.kind === "result") {
+        // A fast Codex turn can finish before the turn/start promise resumes.
+        // Its terminal event still proves a turn ran, even without output.
+        if (
+          !entry.currentMsg &&
+          entry.openingPrompt &&
+          entry.session.getState().config.backend === "codex"
+        )
+          this.ensureAgentMsg(entry);
         if (entry.currentMsg) {
           // Defense in depth: a turn that ends with neither text nor any
           // visible event is a failure (CLI crash, network drop, spawn
@@ -929,9 +961,7 @@ export class Workspace {
             entry.pausedUntil = Date.now();
           }
         }
-        entry.currentMsg = null;
-        this.cb?.onAgentIdle?.(this.id, agentId);
-        setTimeout(() => this.afterTurn(agentId), 0);
+        this.finishReply(entry);
       } else if (event.kind === "error") {
         // The error is an event (rendered as a red banner where it
         // happened); appending it to the text as well showed it twice.
@@ -945,9 +975,7 @@ export class Workspace {
         msg.events!.push(event);
         this.streamed(msg, event);
         this.finished(msg.id, "error", msg.content, msg.events);
-        entry.currentMsg = null;
-        this.cb?.onAgentIdle?.(this.id, agentId);
-        setTimeout(() => this.afterTurn(agentId), 0);
+        this.finishReply(entry);
       } else if (event.kind === "subagent_progress" || event.kind === "subagent_done") {
         const msg = this.ensureAgentMsg(entry);
         this.handleSubagentOnMsg(msg, event);
@@ -1005,6 +1033,16 @@ export class Workspace {
     };
   }
 
+  private finishReply(entry: AgentEntry): void {
+    entry.currentMsg = null;
+    // A terminal event can arrive before send() has resolved. Leave the
+    // input fenced until its receipt arrives, then notify idle after settlement.
+    if (entry.openingPrompt?.input) return;
+    entry.openingPrompt = undefined;
+    this.cb?.onAgentIdle?.(this.id, entry.info.id);
+    setTimeout(() => this.afterTurn(entry.info.id), 0);
+  }
+
   addAgent(
     name: string,
     model: string,
@@ -1055,11 +1093,11 @@ export class Workspace {
     session.on("session_anchor", () => this.cb?.onSaveNow?.());
     session.on("user_message_accepted", (event: { inputId: string }) => {
       const entry = this.agents.get(agentId);
-      if (entry) this.acceptDispatch(entry, event.inputId);
+      if (entry) this.acceptDispatch(entry, event.inputId, true);
     });
     session.on("prompt_outcome_unknown", (event: { inputId: string; reason: string }) => {
       const entry = this.agents.get(agentId);
-      const msg = entry?.startingMessageId && this.findMessage(entry.startingMessageId);
+      const msg = entry?.openingPrompt?.input;
       if (
         entry &&
         msg &&
@@ -1162,6 +1200,7 @@ export class Workspace {
     const entry = this.agents.get(agentId);
     if (!entry) return null;
 
+    this.cancelOpeningPrompt(entry, "Agent removed");
     void this.releaseSession(agentId, entry);
     this.finalizeAbort(entry, false);
     this.agents.delete(agentId);
@@ -1564,7 +1603,7 @@ export class Workspace {
       agentId: null,
       content,
       timestamp: Date.now(),
-      status: "queued",
+      status: busy ? "queued" : "starting",
       images: msgImages?.length ? msgImages : undefined,
       forwardRef,
       queuedFor: agent.info.id,
@@ -1604,7 +1643,7 @@ export class Workspace {
       this.isWritable() &&
       this.cb?.canDequeue?.() !== false &&
       !this.held(entry) &&
-      !entry.startingMessageId &&
+      !entry.openingPrompt &&
       !entry.recoveringDispatching;
     if (!available()) return;
     const msg = this.messages.find(
@@ -1729,7 +1768,7 @@ export class Workspace {
       agentId: null,
       content: text,
       timestamp: Date.now(),
-      status: "queued",
+      status: queued ? "queued" : "starting",
       from,
       queuedFor: agent.info.id,
       ...(steering && { steering: true }),
@@ -1753,92 +1792,72 @@ export class Workspace {
   ): Promise<void> {
     const envelope =
       typeof prompt === "string" ? { inputId: genId("input"), text: prompt } : prompt;
+    const opening = { envelope, input, writeClaimed: false, replied: false };
+    agent.openingPrompt = opening;
     agent.lastEnvelope = envelope.reportId ? undefined : envelope;
     if (input) {
       input.queuedEnvelope ??= envelope;
-      agent.startingMessageId = input.id;
       agent.input = { id: input.id, replies: [] };
       if (input.from) agent.delivered = agent.input;
     }
+    if (agent.currentMsg) this.settle(agent.currentMsg);
+    agent.currentMsg = null;
     this.cb?.onAgentBusy?.(this.id, agent.info.id);
 
-    if (agent.currentMsg) this.settle(agent.currentMsg);
-    agent.currentMsg = this.makeAgentMsg(agent.info.id);
-    agent.input?.replies.push(agent.currentMsg.id);
-    this.pushMessage(agent.currentMsg);
-    if (banner) agent.handler(banner);
-
     try {
+      if (input?.status === "queued") {
+        input.status = "starting";
+        this.finished(input.id, input.status, input.content);
+      }
+      if (banner) {
+        this.ensureAgentMsg(agent);
+        agent.handler(banner);
+      }
       const backend = agent.session.getState().config.backend;
       const receipt = await agent.session.send(
         backend === "pi" || backend === "codex" ? envelope : envelope.text,
         {
           onBeforeWrite: (attempt) => {
             this.assertWritable();
+            if (agent.openingPrompt !== opening) throw new Error("Prompt dispatch cancelled");
             if (!input) {
               this.cb?.onSaveNow?.();
+              opening.writeClaimed = true;
               return;
             }
             this.touch([input.id]);
             input.dispatchAttempt = attempt;
             input.status = "dispatching";
             this.cb?.onSaveNow?.();
+            opening.writeClaimed = true;
             if (envelope.reportId)
               this.cb?.onReportDeliveryState?.(envelope.reportId, "dispatching");
             this.finished(input.id, input.status, input.content);
           },
         },
       );
+      if (agent.openingPrompt !== opening) return;
       if (receipt?.disposition === "rejected") {
-        if (receipt.retryable && input && agent.startingMessageId === input.id) {
-          agent.startingMessageId = undefined;
+        if (receipt.retryable && input) {
           this.touch([input.id]);
           input.status = "queued";
           delete input.dispatchAttempt;
           this.cb?.onSaveNow?.();
+          agent.openingPrompt = undefined;
           this.finished(input.id, "queued", input.content);
-          if (
-            !agent.session.isRunning &&
-            agent.currentMsg?.status === "streaming" &&
-            !agent.currentMsg.content &&
-            !agent.currentMsg.events?.length
-          ) {
-            const orphan = agent.currentMsg;
-            agent.currentMsg = null;
-            const idx = this.messages.indexOf(orphan);
-            if (idx >= 0) this.messages.splice(idx, 1);
-            this.changed.delete(orphan.id);
-            this.cb?.onMessageRemoved?.(this.id, orphan.id);
-          }
+          this.settleIdleReply(agent);
           setTimeout(() => this.dequeueNext(agent.info.id), 100);
         } else {
           this.failDispatch(agent, input, "error", receipt.error ?? "Prompt rejected");
         }
-      } else if (
-        receipt?.disposition !== "started" &&
-        input &&
-        agent.startingMessageId === input.id
-      ) {
-        this.acceptDispatch(agent, envelope.inputId);
-        if (receipt?.disposition === "handled") {
-          agent.activeReportId = undefined;
-          if (
-            !agent.session.isRunning &&
-            agent.currentMsg?.status === "streaming" &&
-            !agent.currentMsg.content &&
-            !agent.currentMsg.events?.length
-          ) {
-            const orphan = agent.currentMsg;
-            agent.currentMsg = null;
-            const idx = this.messages.indexOf(orphan);
-            if (idx >= 0) this.messages.splice(idx, 1);
-            this.changed.delete(orphan.id);
-            this.cb?.onMessageRemoved?.(this.id, orphan.id);
-            this.cb?.onAgentIdle?.(this.id, agent.info.id);
-          }
-        }
+      } else if (receipt?.disposition !== "started") {
+        const handled = receipt?.disposition === "handled";
+        this.acceptDispatch(agent, envelope.inputId, !handled);
+        if (handled) agent.activeReportId = undefined;
+        this.settleIdleReply(agent);
       }
     } catch (err) {
+      if (agent.openingPrompt !== opening) return;
       this.failDispatch(
         agent,
         input,
@@ -1892,12 +1911,16 @@ export class Workspace {
     }
   }
 
-  private acceptDispatch(entry: AgentEntry, inputId?: string): void {
-    const msg = entry.startingMessageId && this.findMessage(entry.startingMessageId);
-    if (!msg || inputId !== msg.queuedEnvelope?.inputId) return;
-    entry.startingMessageId = undefined;
-    entry.activeReportId = msg.queuedEnvelope?.reportId;
-    this.completeDispatch(msg, "done");
+  private acceptDispatch(entry: AgentEntry, inputId?: string, started = false): void {
+    const opening = entry.openingPrompt;
+    if (!opening || inputId !== opening.envelope.inputId) return;
+    const msg = opening.input;
+    if (msg) {
+      entry.activeReportId = opening.envelope.reportId;
+      this.completeDispatch(msg, "done");
+    }
+    if (started && entry.session.isRunning && !opening.replied) this.ensureAgentMsg(entry);
+    entry.openingPrompt = undefined;
     setTimeout(() => this.dequeueNext(entry.info.id), 0);
   }
 
@@ -1907,15 +1930,33 @@ export class Workspace {
     status: "error" | "outcome_unknown",
     reason: string,
   ): void {
-    if (msg && entry.startingMessageId !== msg.id) return;
     if (msg) {
-      entry.startingMessageId = undefined;
       entry.lastEnvelope = undefined;
       this.completeDispatch(msg, status, reason);
     }
-    if (status === "error" && !this.disposed)
+    const replied = entry.openingPrompt?.replied;
+    entry.openingPrompt = undefined;
+    if (status === "error" && !this.disposed && (!replied || entry.currentMsg))
       entry.handler({ kind: "error", content: `[send failed] ${reason}` });
+    else if (!entry.currentMsg) this.settleIdleReply(entry);
     setTimeout(() => this.dequeueNext(entry.info.id), 0);
+  }
+
+  private settleIdleReply(entry: AgentEntry): void {
+    if (entry.session.isRunning) return;
+    if (entry.currentMsg) this.settle(entry.currentMsg);
+    entry.currentMsg = null;
+    this.cb?.onAgentIdle?.(this.id, entry.info.id);
+  }
+
+  private cancelOpeningPrompt(entry: AgentEntry, reason: string): void {
+    const opening = entry.openingPrompt;
+    if (!opening) return;
+    entry.openingPrompt = undefined;
+    entry.lastEnvelope = undefined;
+    const input = opening.input;
+    if (input?.status === "starting") this.completeDispatch(input, "error", reason);
+    else if (input?.status === "dispatching") this.completeDispatch(input, "outcome_unknown");
   }
 
   findMessage(id: string): Message | undefined {
@@ -1945,6 +1986,13 @@ export class Workspace {
     return msg;
   }
 
+  settleStartingOnRestore(): void {
+    for (const msg of this.messages) {
+      if (msg.status === "starting")
+        this.completeDispatch(msg, "error", "Server restarted before sending the message");
+    }
+  }
+
   settlePlainDispatchingOnRestore(): void {
     for (const msg of this.messages) {
       if (
@@ -1965,7 +2013,7 @@ export class Workspace {
     if (
       !entry ||
       entry.recoveringDispatching ||
-      entry.startingMessageId ||
+      entry.openingPrompt ||
       msg.status !== "dispatching"
     )
       return;
@@ -2000,7 +2048,7 @@ export class Workspace {
   }
 
   private dispatchHeld(agent: AgentEntry): boolean {
-    return agent.session.isRunning || !!agent.startingMessageId || !!agent.recoveringDispatching;
+    return agent.session.isRunning || !!agent.openingPrompt || !!agent.recoveringDispatching;
   }
 
   private isWritable(): boolean {
@@ -2042,11 +2090,12 @@ export class Workspace {
   async seal(): Promise<void> {
     this.disposed = true;
     for (const msg of this.messages) {
-      if (msg.status === "queued") this.completeDispatch(msg, "error", "Project sealed");
+      if (msg.status === "queued" || msg.status === "starting")
+        this.completeDispatch(msg, "error", "Project sealed");
       else if (msg.status === "dispatching") this.completeDispatch(msg, "outcome_unknown");
     }
     for (const entry of this.agents.values()) {
-      entry.startingMessageId = undefined;
+      entry.openingPrompt = undefined;
       this.dropRetry(entry);
     }
     await Promise.allSettled(
@@ -2173,8 +2222,6 @@ export class Workspace {
   // A steered one is the running turn's already: only a stop that ends the
   // turn with it (`evenSteered`) takes it back.
   cancelQueued(messageId: string, evenSteered = false): boolean {
-    if ([...this.agents.values()].some((entry) => entry.startingMessageId === messageId))
-      return false;
     const idx = this.messages.findIndex(
       (m) => m.id === messageId && m.status === "queued" && (evenSteered || !m.steering),
     );
@@ -2218,7 +2265,7 @@ export class Workspace {
       agentId: null,
       content: "",
       timestamp: Date.now(),
-      status: "queued",
+      status: busy ? "queued" : "starting",
       forwardRef,
       queuedFor: agent.info.id,
     };
@@ -2239,6 +2286,7 @@ export class Workspace {
     const entry = this.agents.get(agentId);
     if (!entry) return;
     const busy = this.hasWork(entry);
+    this.cancelOpeningPrompt(entry, "Cancelled by user");
     entry.session.abort();
     this.finalizeAbort(entry, busy);
   }
@@ -2246,6 +2294,7 @@ export class Workspace {
   abortAll(by: "user" | "restart" = "user"): void {
     for (const entry of this.agents.values()) {
       const busy = this.hasWork(entry);
+      if (by === "user") this.cancelOpeningPrompt(entry, "Cancelled by user");
       entry.session.abort();
       this.finalizeAbort(entry, busy, by);
     }
@@ -2253,7 +2302,11 @@ export class Workspace {
 
   // A turn, background task or wake-up that a stop would cut short.
   private hasWork(entry: AgentEntry): boolean {
-    return entry.currentMsg?.status === "streaming" || this.agentState(entry) !== "idle";
+    return (
+      !!entry.openingPrompt ||
+      entry.currentMsg?.status === "streaming" ||
+      this.agentState(entry) !== "idle"
+    );
   }
 
   // Stop the running turns and nothing else: background tasks and pending
@@ -2265,7 +2318,11 @@ export class Workspace {
     if (!entry) return;
     this.dropRetry(entry);
     const session = entry.session;
-    if (!session.interrupt || session.interruptPending) {
+    if (
+      !session.interrupt ||
+      session.interruptPending ||
+      (entry.openingPrompt && (!session.isRunning || !entry.openingPrompt.writeClaimed))
+    ) {
       this.abortAgent(agentId);
       return;
     }
@@ -2314,7 +2371,7 @@ export class Workspace {
   clearContext(agentId: string): boolean {
     const entry = this.agents.get(agentId);
     if (!entry) return false;
-    if (entry.session.isRunning) return false;
+    if (this.dispatchHeld(entry)) return false;
     if (this.hasWork(entry) && entry.input) entry.input.stopped = "user";
     this.dropRetry(entry);
     if (entry.session.resetContext) entry.session.resetContext();
@@ -2345,7 +2402,7 @@ export class Workspace {
     return {
       ...a.info,
       canSwitchBackend: this.canSwitchBackend(a, state),
-      busy: a.session.isRunning,
+      busy: a.session.isRunning || !!a.openingPrompt,
       state: this.agentState(a),
       activity: a.activity ?? null,
       effort: state.config.effort ?? null,
