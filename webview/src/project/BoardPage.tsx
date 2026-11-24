@@ -16,7 +16,7 @@ import {
   ProsePathContext,
   type IssueRefs,
 } from "../chat/markdown";
-import { FileOpenContext, parseFileRef } from "../chat/fileRef";
+import { FileOpenContext, splitFileRef } from "../chat/fileRef";
 import { formatRelative } from "../format";
 import { Icon } from "../panels/Icon";
 import {
@@ -221,13 +221,13 @@ export const BoardPage = memo(function BoardPage({
       returnScroll.current = pageRef.current?.querySelector(".bp-detail")?.scrollTop ?? null;
     }
     setMode("notes");
-    setNoteFile({ ...(parseFileRef(ref) ?? { path: ref }), ...(notice && { notice }) });
+    setNoteFile({ ...splitFileRef(ref), ...(notice && { notice }) });
   }, []);
   const openRef = useCallback(
     (ref: string) => {
       const n = ++opening.current;
       if (!editor) return showFile(ref);
-      void openInEditor(project.id, parseFileRef(ref) ?? { path: ref }).then((why) => {
+      void openInEditor(project.id, splitFileRef(ref)).then((why) => {
         if (why === null || n !== opening.current) return;
         showFile(ref, why && `${why}: the file is shown here instead.`);
       });

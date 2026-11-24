@@ -93,7 +93,7 @@ export function fileRoots(sessions: Workspace[]): FileRoot[] {
   for (const w of sessions) {
     if (w.archivedAt != null || seen.has(w.cwd)) continue;
     seen.add(w.cwd);
-    const name = w.cwd.split("/").filter(Boolean).pop() ?? w.cwd;
+    const name = w.cwd.split(/[\\/]/).filter(Boolean).pop() ?? w.cwd;
     out.push({ label: w.git?.branch ? `${name} · ${w.git.branch}` : name, path: w.cwd });
   }
   return out;

@@ -22,10 +22,20 @@ export type FileView =
   | { kind: "image" | "binary"; path: string; size: number };
 
 // "~/x" is under home, a relative path under the workspace directory.
-export function resolveFilePath(cwd: string, input: string): string {
-  const p = input.trim();
-  if (p === "~" || p.startsWith("~/")) return path.join(os.homedir(), p.slice(1));
-  return path.resolve(cwd, p);
+export function resolveFilePath(
+  cwd: string,
+  input: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const pathMod = platform === "win32" ? path.win32 : path.posix;
+  let p = input.trim();
+  // Strip RFC 8089 leading slash from "/C:/..." so path.win32.resolve does not
+  // prepend the current drive letter and produce "C:\C:\...".
+  if (platform === "win32" && /^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);
+  if (p === "~" || p.startsWith("~/") || (platform === "win32" && p.startsWith("~\\"))) {
+    return pathMod.join(os.homedir(), p.slice(1));
+  }
+  return pathMod.resolve(cwd, p);
 }
 
 function looksBinary(head: Buffer): boolean {

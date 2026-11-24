@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { MdBlock, ProsePathContext } from "../chat/markdown";
-import { FileOpenContext, parseFileRef, type FileRef } from "../chat/fileRef";
+import { FileOpenContext, splitFileRef, WIN_DRIVE, type FileRef } from "../chat/fileRef";
 import { CodeView, languageFor, type FileView } from "../panels/FilesPanel";
 import { FileIcon, Icon } from "../panels/Icon";
 import { formatSize, utf8Length } from "../format";
@@ -45,11 +45,18 @@ function fileUrl(project: string, path: string, raw = false): string {
 // named notes/...).
 export function reachable(path: string, root: string | null): boolean {
   if (path.startsWith("~")) return false;
-  if (path.startsWith("/")) {
-    return root !== null && (path === root || path.startsWith(`${root}/`));
+  if (path.startsWith("/") || WIN_DRIVE.test(path)) {
+    if (root === null) return false;
+    const norm = (s: string) => {
+      const u = s.replace(/\\/g, "/").replace(/\/+$/, "");
+      return /^[A-Za-z]:/.test(u) ? u.toLowerCase() : u;
+    };
+    const p = norm(path);
+    const r = norm(root);
+    return p === r || p.startsWith(r ? `${r}/` : "/");
   }
   let depth = 0;
-  for (const seg of path.split("/")) {
+  for (const seg of path.split(/[\\/]/)) {
     if (seg === "..") depth--;
     else if (seg !== "." && seg !== "") depth++;
     if (depth < 0) return false;
@@ -249,7 +256,7 @@ export function FilePreview({
   const markdown = view?.kind === "text" && languageFor(file.path) === "markdown" && !file.line;
   const openRef = useCallback(
     (ref: string) => {
-      const parsed = parseFileRef(ref) ?? { path: ref };
+      const parsed = splitFileRef(ref);
       onRef(
         `${refFrom(file.path, parsed.path)}${parsed.line ? `:${parsed.line}${parsed.endLine ? `-${parsed.endLine}` : ""}` : ""}`,
       );
@@ -262,7 +269,7 @@ export function FilePreview({
     (ref: string) => accept?.(refFrom(file.path, ref)) ?? true,
     [accept, file.path],
   );
-  const name = file.path.split("/").filter(Boolean).pop() ?? file.path;
+  const name = file.path.split(/[\\/]/).filter(Boolean).pop() ?? file.path;
   const notice = failed ?? file.notice;
   return (
     <section className="bn-preview" aria-label={name}>

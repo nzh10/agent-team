@@ -237,6 +237,9 @@ describe("paths in prose", () => {
     expect(reachable("src/../../x.cpp", root)).toBe(false);
     expect(reachable("notes/../../x.md", root)).toBe(false);
     expect(reachable("src/../a.cpp", root)).toBe(true);
+    expect(reachable("C:/repo/clice/src/a.cpp", "C:\\repo\\clice")).toBe(true);
+    expect(reachable("C:\\Users\\me\\Desktop\\a.md", "C:\\repo\\clice")).toBe(false);
+    expect(reachable("C:\\repo\\clice-old\\a.cpp", "C:\\repo\\clice")).toBe(false);
     const { container } = render(
       <FileOpenContext.Provider value={vi.fn()}>
         <ProsePathContext.Provider value={(p) => reachable(p, root)}>

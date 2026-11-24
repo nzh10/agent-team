@@ -17,7 +17,7 @@ import { AgentsPanel, type AgentsPanelActions } from "./panels/AgentsPanel";
 import { workCount } from "./panels/SessionTasks";
 import { FilesPanel, type CodeQuote } from "./panels/FilesPanel";
 import { fileRoots, scopeSessions, scopeSummary, sessionState, stateSummary } from "./panels/scope";
-import { FileOpenContext, parseFileRef, type FileRef } from "./chat/fileRef";
+import { FileOpenContext, splitFileRef, type FileRef } from "./chat/fileRef";
 import { extractImageFiles, installMacCtrlClipboard } from "./chat/clipboard";
 import { installMacTextKeys } from "./chat/textKeys";
 import { isImeKeyEvent } from "./chat/ime";
@@ -576,7 +576,7 @@ export function App() {
     return (wsId: string) => {
       let open = byWs.get(wsId);
       if (!open) {
-        open = (ref) => showFile(wsId, parseFileRef(ref) ?? { path: ref }, fileScope);
+        open = (ref) => showFile(wsId, splitFileRef(ref), fileScope);
         byWs.set(wsId, open);
       }
       return open;

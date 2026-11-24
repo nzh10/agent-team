@@ -15,7 +15,14 @@ import remarkGfm from "remark-gfm";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import { rehypeCodeHighlight } from "./highlight";
 import { prepareSource } from "./mdSource";
-import { FILE_EXT, FILE_NAME, FileOpenContext, linkFileRef, parseFileRef } from "./fileRef";
+import {
+  FILE_EXT,
+  FILE_NAME,
+  FileOpenContext,
+  linkFileRef,
+  parseFileRef,
+  splitFileRef,
+} from "./fileRef";
 import { codeText, copyText } from "./clipboard";
 import "highlight.js/styles/github-dark.css";
 
@@ -178,7 +185,7 @@ function useOpenable(): ((ref: string) => boolean) | null {
   const openFile = useContext(FileOpenContext);
   const accept = useContext(ProsePathContext);
   return useMemo(
-    () => openFile && ((ref: string) => !accept || accept(parseFileRef(ref)?.path ?? ref)),
+    () => openFile && ((ref: string) => !accept || accept(splitFileRef(ref).path)),
     [openFile, accept],
   );
 }

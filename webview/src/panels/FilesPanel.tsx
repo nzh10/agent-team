@@ -12,7 +12,7 @@ import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 import { highlightTree } from "../chat/highlight";
 import { copyText } from "../chat/clipboard";
 import { MdBlock } from "../chat/markdown";
-import { FileOpenContext, parseFileRef, type FileRef } from "../chat/fileRef";
+import { FileOpenContext, splitFileRef, WIN_DRIVE, type FileRef } from "../chat/fileRef";
 import { formatSize, utf8Length } from "../format";
 import { FileIcon, Icon } from "./Icon";
 import {
@@ -114,14 +114,26 @@ const LANG_BY_EXT: Record<string, string> = {
   patch: "diff",
 };
 
+function normPath(p: string): string {
+  const s = p.replace(/\\/g, "/");
+  return WIN_DRIVE.test(s) ? s.toLowerCase() : s;
+}
+
 export function languageFor(path: string): string | null {
-  const name = path.split("/").pop() ?? "";
+  const name = path.split(/[\\/]/).pop() ?? "";
   if (/^(GNU)?makefile$/i.test(name)) return "makefile";
   const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
   return LANG_BY_EXT[ext] ?? null;
 }
 
 function parentOf(path: string): string {
+  if (WIN_DRIVE.test(path)) {
+    const sep = path.includes("\\") ? "\\" : "/";
+    const trimmed = path.replace(/[\\/]+$/, "");
+    if (trimmed.length <= 2) return `${trimmed}${sep}`;
+    const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return cut <= 2 ? `${trimmed.slice(0, 2)}${sep}` : trimmed.slice(0, cut);
+  }
   const trimmed = path.replace(/\/+$/, "");
   // Not yet resolved by the server (still loading, or failed).
   if (!trimmed.startsWith("/")) return trimmed === "." ? ".." : `${trimmed}/..`;
@@ -133,21 +145,30 @@ function parentOf(path: string): string {
 // root's own name when there is no picker.
 function shownPath(path: string, root: FileRoot | undefined, picker: boolean): string {
   if (!root) return path;
-  const rest = path.slice(root.path.length).replace(/^\//, "");
+  const rest = path
+    .slice(root.path.length)
+    .replace(/^[\\/]/, "")
+    .replace(/\\/g, "/");
   if (picker) return rest || "/";
-  const name = root.path.split("/").filter(Boolean).pop() ?? root.path;
+  const name = root.path.split(/[\\/]/).filter(Boolean).pop() ?? root.path;
   return rest ? `${name}/${rest}` : name;
 }
 
 // A reference found inside a previewed file, relative to that file's folder.
 function resolveFrom(dir: string, ref: string): string {
-  if (ref.startsWith("/") || ref.startsWith("~")) return ref;
-  const parts = dir.split("/");
-  for (const seg of ref.split("/")) {
-    if (seg === "..") parts.pop();
-    else if (seg && seg !== ".") parts.push(seg);
+  if (ref.startsWith("/") || ref.startsWith("~") || WIN_DRIVE.test(ref)) return ref;
+  const sep = /^[A-Za-z]:\\/.test(dir) ? "\\" : "/";
+  const parts = dir.replace(/[\\/]+$/, "").split(/[\\/]/);
+  const minLen = /^[A-Za-z]:$/.test(parts[0] ?? "") ? 1 : 0;
+  for (const seg of ref.split(/[\\/]/)) {
+    if (seg === "..") {
+      if (parts.length > minLen) parts.pop();
+    } else if (seg && seg !== ".") {
+      parts.push(seg);
+    }
   }
-  return parts.join("/") || "/";
+  if (minLen === 1 && parts.length === 1) return `${parts[0]}${sep}`;
+  return parts.join(sep) || "/";
 }
 
 export function CodeView({
@@ -219,13 +240,15 @@ function DirView({
   view: Extract<FileView, { kind: "dir" }>;
   open: (p: string) => void;
 }) {
+  const sep = /^[A-Za-z]:\\/.test(view.path) ? "\\" : "/";
+  const base = view.path.replace(/[\\/]+$/, "");
   return (
     <div className="dir-view">
       {view.entries.map((e) => (
         <button
           key={e.name}
           className={`dir-entry${e.dir ? " is-dir" : ""}`}
-          onClick={() => open(`${view.path}/${e.name}`)}
+          onClick={() => open(`${base}${sep}${e.name}`)}
         >
           <FileIcon name={e.name} dir={e.dir} />
           <span className="dir-entry-name">
@@ -347,15 +370,19 @@ export function FilesPanel({
     return /^\.\.?\//.test(p) ? resolveFrom(parentOf(path), p) : p;
   };
   const openRef = (r: string) => {
-    const parsed = parseFileRef(r) ?? { path: r };
+    const parsed = splitFileRef(r);
     go({
       ...parsed,
       path: view?.ref ? noteRef(parsed.path) : resolveFrom(parentOf(path), parsed.path),
     });
   };
   // Worktrees usually live inside the repository: the deepest folder wins.
+  const norm = normPath(path);
   const root = roots
-    .filter((r) => path === r.path || path.startsWith(r.path.endsWith("/") ? r.path : `${r.path}/`))
+    .filter((r) => {
+      const rp = normPath(r.path);
+      return norm === rp || norm.startsWith(rp.endsWith("/") ? rp : `${rp}/`);
+    })
     .reduce<FileRoot | undefined>(
       (a, r) => (a && a.path.length >= r.path.length ? a : r),
       undefined,

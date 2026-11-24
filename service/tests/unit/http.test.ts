@@ -11,6 +11,7 @@ import * as path from "path";
 import * as zlib from "zlib";
 import { Auth } from "../../src/server/auth";
 import { HttpHandler } from "../../src/server/http";
+import { resolveFilePath } from "../../src/repo/files";
 import type { AuthConfig } from "../../src/config/config";
 import { lsofBinary } from "../lsof";
 
@@ -452,5 +453,18 @@ describe("file previews", () => {
     };
     expect(view.truncated).toBe(true);
     expect(view.entries[0]).toMatchObject({ name: "zz-sub", dir: true });
+  });
+
+  it("resolves Windows drive paths and RFC 8089 /C:/... file URIs without doubling drives", () => {
+    expect(resolveFilePath("C:\\repo", "C:/Users/me/Desktop/report.md", "win32")).toBe(
+      "C:\\Users\\me\\Desktop\\report.md",
+    );
+    expect(resolveFilePath("C:\\repo", "C:\\Users\\me\\Desktop\\report.md", "win32")).toBe(
+      "C:\\Users\\me\\Desktop\\report.md",
+    );
+    expect(resolveFilePath("C:\\repo", "/C:/Users/me/Desktop/report.md", "win32")).toBe(
+      "C:\\Users\\me\\Desktop\\report.md",
+    );
+    expect(resolveFilePath("C:\\repo", "src\\a.ts", "win32")).toBe("C:\\repo\\src\\a.ts");
   });
 });

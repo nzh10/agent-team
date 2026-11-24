@@ -303,12 +303,13 @@ export class HttpHandler {
     if (!notes) return { abs: own };
     const p = input.trim();
     const abs =
-      /^notes(\/|$)/.test(p) && !fs.existsSync(own)
-        ? path.resolve(notes, p.slice("notes".length).replace(/^\/+/, "") || ".")
+      /^notes([\\/]|$)/.test(p) && !fs.existsSync(own)
+        ? path.resolve(notes, p.slice("notes".length).replace(/^[\\/]+/, "") || ".")
         : own;
     const rel = path.relative(notes, abs);
-    if (rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) return { abs };
-    return { abs, ref: rel ? `notes/${rel}` : "notes" };
+    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return { abs };
+    const normRel = rel.replace(/\\/g, "/");
+    return { abs, ref: normRel ? `notes/${normRel}` : "notes" };
   }
 
   // For a project's board: `ref`, the path as it writes it (the one found

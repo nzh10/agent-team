@@ -9,7 +9,7 @@ import {
 } from "../src/panels/FilesPanel";
 import { fileRoots } from "../src/panels/scope";
 import { autoPanelWidth } from "../src/panels/SidePanel";
-import { FileOpenContext, parseFileRef } from "../src/chat/fileRef";
+import { FileOpenContext, linkFileRef, parseFileRef, splitFileRef } from "../src/chat/fileRef";
 import { MdBlock } from "../src/chat/markdown";
 import type { Workspace } from "../src/state/useServer";
 
@@ -23,6 +23,22 @@ describe("parseFileRef", () => {
     expect(parseFileRef("/tmp/report")).toEqual({ path: "/tmp/report" });
     expect(parseFileRef("~/notes/")).toEqual({ path: "~/notes/" });
     expect(parseFileRef("README.md")).toEqual({ path: "README.md" });
+  });
+
+  it("reads Windows drive and relative backslash paths", () => {
+    expect(parseFileRef("C:\\Users\\me\\Desktop\\a.ts")).toEqual({
+      path: "C:\\Users\\me\\Desktop\\a.ts",
+    });
+    expect(parseFileRef("C:\\Users\\me\\Desktop\\a.ts:12")).toEqual({
+      path: "C:\\Users\\me\\Desktop\\a.ts",
+      line: 12,
+    });
+    expect(parseFileRef("C:/Users/me/Desktop/a.ts#L3-L9")).toEqual({
+      path: "C:/Users/me/Desktop/a.ts",
+      line: 3,
+      endLine: 9,
+    });
+    expect(parseFileRef("src\\a.ts:12")).toEqual({ path: "src\\a.ts", line: 12 });
   });
 
   it("does not take code or prose for a file", () => {
@@ -40,15 +56,15 @@ describe("parseFileRef", () => {
     }
   });
 
-  it("does not take commands, routes, patterns, sites or Windows paths for a file", () => {
+  it("does not take commands, routes, patterns, escapes, or sites for a file", () => {
     for (const s of [
       "/compact",
       "/model",
       "/\\d+/",
       "src/*.ts",
-      "C:\\Users\\me\\a.ts",
-      "C:\\Users\\me\\a.ts:12",
-      "C:/Users/me/a.ts",
+      "foo\\.ts",
+      "\\a.ts",
+      "foo\\",
       "example.com/index.html",
     ]) {
       expect(parseFileRef(s), s).toBeNull();
@@ -63,11 +79,48 @@ describe("parseFileRef", () => {
     expect(parseFileRef("docs/guide.md#setup")).toEqual({ path: "docs/guide.md" });
     expect(parseFileRef("/api/file")).toEqual({ path: "/api/file" });
   });
+
+  it("splits line suffixes from Windows and spaced link targets", () => {
+    expect(splitFileRef("C:/Users/John Doe/Desktop/report.md#L12-L20")).toEqual({
+      path: "C:/Users/John Doe/Desktop/report.md",
+      line: 12,
+      endLine: 20,
+    });
+    expect(splitFileRef("C:\\Users\\John Doe\\Desktop\\report.md:42")).toEqual({
+      path: "C:\\Users\\John Doe\\Desktop\\report.md",
+      line: 42,
+    });
+    expect(splitFileRef("my file.md")).toEqual({ path: "my file.md" });
+  });
+
+  it("accepts Windows link hrefs and rejects unknown URL schemes", () => {
+    expect(linkFileRef("C:/Users/me/Desktop/report.md")).toBe("C:/Users/me/Desktop/report.md");
+    expect(linkFileRef("C:\\Users\\me\\Desktop\\report.md:12")).toBe(
+      "C:\\Users\\me\\Desktop\\report.md:12",
+    );
+    expect(linkFileRef("file:///C:/Users/me/Desktop/report.md#L3")).toBe(
+      "C:/Users/me/Desktop/report.md#L3",
+    );
+    expect(linkFileRef("file:///c%3A/Users/me/Desktop/report.md")).toBe(
+      "c:/Users/me/Desktop/report.md",
+    );
+    expect(linkFileRef("file://C:/Users/me/Desktop/report.md")).toBe(
+      "C:/Users/me/Desktop/report.md",
+    );
+    expect(linkFileRef("file://localhost/C:/Users/me/Desktop/report.md")).toBe(
+      "C:/Users/me/Desktop/report.md",
+    );
+    expect(linkFileRef("/C:/Users/me/Desktop/report.md")).toBe("C:/Users/me/Desktop/report.md");
+    expect(linkFileRef("javascript:alert(1)")).toBeNull();
+    expect(linkFileRef("data:text/html,hi")).toBeNull();
+    expect(linkFileRef("C:relative.txt")).toBeNull();
+  });
 });
 
 describe("languageFor", () => {
   it("maps file names to highlighter languages", () => {
     expect(languageFor("/a/b.tsx")).toBe("typescript");
+    expect(languageFor("C:\\Users\\me\\Makefile")).toBe("makefile");
     expect(languageFor("x/Makefile")).toBe("makefile");
     expect(languageFor("CMakeLists.txt")).toBeNull();
     expect(languageFor("notes.MD")).toBe("markdown");
@@ -422,6 +475,24 @@ describe("file references in replies", () => {
     ]);
   });
 
+  it("opens Windows desktop links and inline paths from Codex replies", () => {
+    expect(
+      refs(
+        "[slash](C:/Users/me/Desktop/report.md) " +
+          "[back](C:\\Users\\me\\Desktop\\report.md:12) " +
+          "[uri](file:///C:/Users/me/Desktop/report.md#L3-L9) " +
+          "[spaced](<C:\\Users\\John Doe\\Desktop\\报告.md#L5>) " +
+          "`C:\\Users\\me\\Desktop\\a.ts:12`",
+      ).calls,
+    ).toEqual([
+      "C:/Users/me/Desktop/report.md",
+      "C:\\Users\\me\\Desktop\\report.md:12",
+      "C:/Users/me/Desktop/report.md#L3-L9",
+      "C:\\Users\\John Doe\\Desktop\\报告.md#L5",
+      "C:\\Users\\me\\Desktop\\a.ts:12",
+    ]);
+  });
+
   it("opens link targets decoded, without a query or a section anchor", () => {
     expect(
       refs("[说明](docs/说明.md) [x](<my file.md>) [s](docs/setup.md#install) [q](a.ts?plain=1)")
@@ -541,5 +612,38 @@ describe("the Files panel's bar and listing", () => {
     await waitFor(() => expect(container.querySelector(".code-view")).not.toBeNull());
     expect((getByLabelText("Folder") as HTMLSelectElement).value).toBe("/");
     expect(container.querySelector(".fp-path")!.textContent).toBe("etc/hosts");
+  });
+
+  it("navigates and labels Windows drive paths cleanly", async () => {
+    const winRoot = "C:\\Users\\me\\yaat";
+    const file = "C:\\Users\\me\\yaat\\src\\app.ts";
+    const srcDir = "C:\\Users\\me\\yaat\\src";
+    views = {
+      [file]: text(file),
+      [srcDir]: {
+        kind: "dir",
+        path: srcDir,
+        truncated: false,
+        entries: [{ name: "app.ts", dir: false, size: 2 }],
+      },
+    };
+    const roots = fileRoots([
+      { cwd: winRoot, git: { branch: "main" } } as unknown as Workspace,
+      { cwd: "C:\\Users\\me\\other" } as unknown as Workspace,
+    ]);
+    expect(roots[0]).toEqual({ label: "yaat · main", path: winRoot });
+
+    const { container, getByLabelText } = open(file, roots);
+    await waitFor(() => expect(container.querySelector(".code-view")).not.toBeNull());
+    expect((getByLabelText("Folder") as HTMLSelectElement).value).toBe(winRoot);
+    expect(container.querySelector(".fp-path")!.textContent).toBe("src/app.ts");
+
+    fireEvent.click(container.querySelector(".fp-up")!);
+    await waitFor(() => expect(container.querySelector(".dir-view")).not.toBeNull());
+    expect(container.querySelector(".fp-path")!.textContent).toBe("src");
+
+    fireEvent.click(container.querySelector(".dir-entry")!);
+    await waitFor(() => expect(container.querySelector(".code-view")).not.toBeNull());
+    expect(container.querySelector(".fp-path")!.textContent).toBe("src/app.ts");
   });
 });
