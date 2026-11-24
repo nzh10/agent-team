@@ -1027,6 +1027,9 @@ export class Workspace {
     session.on("session_checkpoint", () => {
       if (!this.agents.get(agentId)?.recoveringDispatching) this.cb?.onSaveNow?.();
     });
+    // A first-input disk proof is durable recovery state, not turn completion.
+    // Save it even while a report recovery probe owns the dispatch fence.
+    session.on("session_anchor", () => this.cb?.onSaveNow?.());
     session.on("user_message_accepted", (event: { inputId: string }) => {
       const entry = this.agents.get(agentId);
       if (entry) this.acceptDispatch(entry, event.inputId);
@@ -1279,6 +1282,8 @@ export class Workspace {
       !agent.delivered &&
       !state.sessionId &&
       !state.sessionFile &&
+      !state.hasUnanchoredInput &&
+      !state.persistedSessionAnchor &&
       !state.hasConfirmedTurns &&
       !state.usage.turns &&
       !this.messages.some(

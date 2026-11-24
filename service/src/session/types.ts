@@ -294,6 +294,13 @@ export interface SessionConfig {
   agentId?: string;
 }
 
+export interface PersistedSessionAnchor {
+  sessionFile: string;
+  sessionId: string;
+  leafId: string;
+  entryCount: number;
+}
+
 export interface SessionState {
   sessionId: string | null;
   config: SessionConfig;
@@ -302,6 +309,10 @@ export interface SessionState {
   normalizedCwd?: string;
   expectedLeafAnchorId?: string | null;
   minEntryCount?: number;
+  // A first input crossed the write claim before its durable file anchor was saved.
+  hasUnanchoredInput?: boolean;
+  // Directly verified on disk; independent of turn or dispatch completion.
+  persistedSessionAnchor?: PersistedSessionAnchor;
   hasConfirmedTurns?: boolean;
   desiredModel?: string;
   desiredEffort?: string;

@@ -38,6 +38,7 @@ import type {
   BoundedSessionProof,
   CommandInfo,
   DispatchedReportProbeResult,
+  PersistedSessionAnchor,
   PiAvailableModel,
   PromptEnvelope,
   RunState,
@@ -64,6 +65,8 @@ export interface PiSessionOptions {
   reconcileIntervalMs?: number;
   statsTimeoutMs?: number;
   readyTimeoutMs?: number;
+  anchorTimeoutMs?: number;
+  anchorPollIntervalMs?: number;
   catalogOnly?: boolean;
   dialogFallbackTimeoutMs?: number;
 }
@@ -145,16 +148,203 @@ export function validatePiAttachments(uploadsDir: string | undefined, ids: strin
   readPiAttachments(uploadsDir, ids, false);
 }
 
-function firstSessionRecord(file: string): Json {
-  const fd = fs.openSync(file, "r");
+interface ParsedSessionFile {
+  header: Json;
+  entries: Json[];
+  branch: Json[];
+  leafId: string | null;
+  corruptLine?: number;
+  tornTail?: boolean;
+}
+
+function validTextImageContent(content: unknown, allowString: boolean, allowImage = true): boolean {
+  if (allowString && typeof content === "string") return true;
+  if (!Array.isArray(content)) return false;
+  return content.every((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const block = value as Json;
+    if (block.type === "text") return typeof block.text === "string";
+    return (
+      allowImage &&
+      block.type === "image" &&
+      typeof block.data === "string" &&
+      typeof block.mimeType === "string"
+    );
+  });
+}
+
+function validSessionMessage(entry: Json): boolean {
+  const value = entry.message;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const msg = value as Json;
+  switch (msg.role) {
+    case "bashExecution":
+      return (
+        typeof msg.command === "string" &&
+        typeof msg.output === "string" &&
+        typeof msg.cancelled === "boolean" &&
+        typeof msg.truncated === "boolean"
+      );
+    case "system":
+      return validTextImageContent(msg.content, true, false);
+    case "user":
+      return validTextImageContent(msg.content, true);
+    case "custom":
+      return typeof msg.customType === "string" && validTextImageContent(msg.content, true);
+    case "toolResult":
+      return (
+        typeof msg.toolCallId === "string" &&
+        typeof msg.toolName === "string" &&
+        validTextImageContent(msg.content, false)
+      );
+    case "assistant":
+      return (
+        Array.isArray(msg.content) &&
+        msg.content.every((value) => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+          const block = value as Json;
+          if (block.type === "text") return typeof block.text === "string";
+          if (block.type === "thinking") return typeof block.thinking === "string";
+          return (
+            block.type === "toolCall" &&
+            typeof block.id === "string" &&
+            typeof block.name === "string" &&
+            Boolean(block.arguments) &&
+            typeof block.arguments === "object" &&
+            !Array.isArray(block.arguments)
+          );
+        })
+      );
+    default:
+      return false;
+  }
+}
+
+function readRegularFile(file: string): string {
+  const fd = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW,
+  );
   try {
-    const buffer = Buffer.alloc(64 * 1024);
-    const length = fs.readSync(fd, buffer);
-    const lf = buffer.indexOf(10);
-    return object(JSON.parse(buffer.toString("utf8", 0, lf >= 0 && lf < length ? lf : length)));
+    if (!fs.fstatSync(fd).isFile())
+      throw new Error(`Pi session path is not a regular file: ${file}`);
+    return fs.readFileSync(fd, "utf8");
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// Unlike Pi's tolerant loader, a malformed complete record is not valid proof.
+// An unterminated malformed tail may still be in flight, so only its valid prefix
+// participates in a checkpoint; a later poll can prove the completed record.
+function readSessionFile(file: string): ParsedSessionFile {
+  const lines = readRegularFile(file).split("\n");
+  const tail = lines.pop() ?? "";
+  const records = [
+    ...lines.map((line) => ({ line, terminated: true })),
+    ...(tail ? [{ line: tail, terminated: false }] : []),
+  ];
+  let header: Json | undefined;
+  let corruptLine: number | undefined;
+  let tornTail = false;
+  const entries: Json[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    const line = record.line.endsWith("\r") ? record.line.slice(0, -1) : record.line;
+    if (!line.trim()) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      if (!record.terminated) {
+        tornTail = true;
+        break;
+      }
+      corruptLine = index + 1;
+      break;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      corruptLine = index + 1;
+      break;
+    }
+    const entry = value as Json;
+    if (!header) {
+      if (entry.type !== "session" || typeof entry.id !== "string" || !entry.id) {
+        corruptLine = index + 1;
+        break;
+      }
+      header = entry;
+      continue;
+    }
+    if (
+      entry.type === "session" ||
+      typeof entry.type !== "string" ||
+      typeof entry.id !== "string" ||
+      !entry.id ||
+      (entry.parentId !== null && typeof entry.parentId !== "string") ||
+      (entry.type === "message" && !validSessionMessage(entry))
+    ) {
+      corruptLine = index + 1;
+      break;
+    }
+    entries.push(entry);
+  }
+  if (!header)
+    throw new Error(
+      corruptLine
+        ? `Pi session header is not parseable at line ${corruptLine}`
+        : "Pi session file has no session header",
+    );
+  const byId = new Map<string, Json>();
+  for (const entry of entries) {
+    const id = entry.id as string;
+    const parentId = entry.parentId as string | null;
+    if (byId.has(id) || (parentId !== null && !byId.has(parentId)))
+      throw new Error(`Pi session entry tree is broken at ${id}`);
+    byId.set(id, entry);
+  }
+  const leafId = entries.at(-1)?.id as string | undefined;
+  const branch: Json[] = [];
+  let current = leafId ? byId.get(leafId) : undefined;
+  while (current) {
+    branch.push(current);
+    current = current.parentId ? byId.get(current.parentId as string) : undefined;
+  }
+  branch.reverse();
+  return { header, entries, branch, leafId: leafId ?? null, corruptLine, tornTail };
+}
+
+function sessionMessageText(entry: Json): string | undefined {
+  const content = object(entry.message).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  return content
+    .map(object)
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text as string)
+    .join("\n");
+}
+
+function validateSessionHeader(parsed: ParsedSessionFile, sessionId: string, cwd: string): void {
+  if (parsed.header.id !== sessionId) throw new Error("Pi session header ID does not match");
+  const headerCwd = text(parsed.header.cwd);
+  if (!headerCwd || realpath(headerCwd) !== cwd)
+    throw new Error("Pi session header cwd does not match");
+}
+
+function verifyPersistedSessionAnchor(anchor: PersistedSessionAnchor, cwd: string): void {
+  const parsed = readSessionFile(anchor.sessionFile);
+  if (parsed.corruptLine)
+    throw new Error(`Pi session JSONL is corrupt at line ${parsed.corruptLine}`);
+  if (parsed.tornTail)
+    throw new Error("Pi session JSONL ends with a torn record; repair it before restore");
+  validateSessionHeader(parsed, anchor.sessionId, cwd);
+  if (anchor.entryCount < 1 || parsed.entries.length < anchor.entryCount)
+    throw new Error("Pi session file is shorter than the persisted anchor");
+  if (parsed.entries[anchor.entryCount - 1]?.id !== anchor.leafId)
+    throw new Error("Pi session entry count does not match the persisted anchor");
+  if (!parsed.branch.some((entry) => entry.id === anchor.leafId))
+    throw new Error("Pi persisted anchor is not on the active branch");
 }
 
 interface BlockState {
@@ -166,8 +356,23 @@ interface BlockState {
   thinkingEndedAt?: number;
 }
 
+interface FirstInputClaim {
+  text: string;
+  sessionFile: string | null;
+  sessionId: string | null;
+  beforeLeafId: string | null;
+  beforeEntryCount: number;
+}
+
+interface AnchorProbe {
+  generation: number;
+  deadline: number;
+  pending?: Promise<void>;
+}
+
 interface Turn {
   steer?: { input: BoundarySteer; wireText: string; claimed: boolean; observed: boolean };
+  anchorInput?: FirstInputClaim;
   id: string;
   inputId?: string;
   reportId?: string;
@@ -279,6 +484,9 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   private sessionFile: string | null = null;
   private expectedLeafAnchorId: string | null = null;
   private minEntryCount = 0;
+  private hasUnanchoredInput = false;
+  private persistedSessionAnchor?: PersistedSessionAnchor;
+  private anchorProbe?: AnchorProbe;
   private hasConfirmedTurns = false;
   private sessionProof?: BoundedSessionProof;
   private subagentsSessionId?: string;
@@ -321,10 +529,15 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       { ...state.config, cwd: state.normalizedCwd ?? state.config.cwd },
       options,
     );
-    session.sessionId = state.sessionId;
-    session.sessionFile = state.sessionFile ?? null;
-    session.expectedLeafAnchorId = state.expectedLeafAnchorId ?? null;
-    session.minEntryCount = state.minEntryCount ?? 0;
+    session.persistedSessionAnchor = state.persistedSessionAnchor
+      ? { ...state.persistedSessionAnchor }
+      : undefined;
+    session.sessionId = state.sessionId ?? session.persistedSessionAnchor?.sessionId ?? null;
+    session.sessionFile = state.sessionFile ?? session.persistedSessionAnchor?.sessionFile ?? null;
+    session.expectedLeafAnchorId =
+      state.expectedLeafAnchorId ?? session.persistedSessionAnchor?.leafId ?? null;
+    session.minEntryCount = state.minEntryCount ?? session.persistedSessionAnchor?.entryCount ?? 0;
+    session.hasUnanchoredInput = state.hasUnanchoredInput ?? false;
     session.hasConfirmedTurns = state.hasConfirmedTurns ?? false;
     session.model.desired = state.desiredModel ?? state.config.model;
     session.effort.desired = state.desiredEffort ?? state.config.effort;
@@ -344,6 +557,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       normalizedCwd: this.normalizedCwd,
       expectedLeafAnchorId: this.expectedLeafAnchorId,
       minEntryCount: this.minEntryCount,
+      hasUnanchoredInput: this.hasUnanchoredInput,
+      ...(this.persistedSessionAnchor && {
+        persistedSessionAnchor: { ...this.persistedSessionAnchor },
+      }),
       hasConfirmedTurns: this.hasConfirmedTurns,
       desiredModel: this.model.desired,
       desiredEffort: this.effort.desired,
@@ -474,16 +691,57 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     if (!fs.statSync(this.normalizedCwd, { throwIfNoEntry: false })?.isDirectory())
       throw new Error(`Pi cwd is not a directory: ${this.normalizedCwd}`);
     let sessionArgs: string[];
-    if (this.hasConfirmedTurns) {
-      if (
-        !this.sessionFile ||
-        !this.sessionId ||
-        !fs.statSync(this.sessionFile, { throwIfNoEntry: false })?.size
-      )
-        throw new Error("Pi restore requires the saved nonempty session file");
-      const header = firstSessionRecord(this.sessionFile);
-      if (header.type !== "session" || header.id !== this.sessionId)
-        throw new Error("Pi restore session header does not match the saved session ID");
+    const strictResume = this.hasConfirmedTurns || Boolean(this.persistedSessionAnchor);
+    if (this.persistedSessionAnchor) {
+      const anchor = this.persistedSessionAnchor;
+      try {
+        if (
+          this.sessionFile !== anchor.sessionFile ||
+          this.sessionId !== anchor.sessionId ||
+          realpath(anchor.sessionFile) !== anchor.sessionFile
+        )
+          throw new Error("saved session identity does not match the canonical persisted anchor");
+        verifyPersistedSessionAnchor(anchor, this.normalizedCwd);
+        if (
+          this.hasConfirmedTurns &&
+          (this.expectedLeafAnchorId !== anchor.leafId || this.minEntryCount !== anchor.entryCount)
+        ) {
+          if (!this.expectedLeafAnchorId || this.minEntryCount < 1 || !this.sessionId)
+            throw new Error("confirmed session has no persisted checkpoint");
+          verifyPersistedSessionAnchor(
+            {
+              sessionFile: anchor.sessionFile,
+              sessionId: this.sessionId,
+              leafId: this.expectedLeafAnchorId,
+              entryCount: this.minEntryCount,
+            },
+            this.normalizedCwd,
+          );
+        }
+      } catch (error) {
+        throw new Error(`Pi persisted session recovery failed: ${message(error)}`);
+      }
+      sessionArgs = ["--session", anchor.sessionFile];
+    } else if (this.hasUnanchoredInput) {
+      throw new Error(
+        "Pi recovery is ambiguous: an input may have been written before its durable session anchor was saved; refusing to resume or replay it",
+      );
+    } else if (this.hasConfirmedTurns) {
+      if (!this.sessionFile || !this.sessionId || !this.expectedLeafAnchorId)
+        throw new Error("Pi restore requires a saved nonempty session checkpoint");
+      try {
+        verifyPersistedSessionAnchor(
+          {
+            sessionFile: this.sessionFile,
+            sessionId: this.sessionId,
+            leafId: this.expectedLeafAnchorId,
+            entryCount: this.minEntryCount,
+          },
+          this.normalizedCwd,
+        );
+      } catch (error) {
+        throw new Error(`Pi restore session validation failed: ${message(error)}`);
+      }
       sessionArgs = ["--session", this.sessionFile];
     } else {
       this.sessionId ??= randomUUID();
@@ -601,7 +859,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
         proof.sessionId !== this.sessionId ||
         rpcState.sessionId !== proof.sessionId ||
         realpath(proof.cwd) !== this.normalizedCwd ||
-        (this.hasConfirmedTurns &&
+        (strictResume &&
           (!proof.sessionFile ||
             !this.sessionFile ||
             realpath(proof.sessionFile) !== realpath(this.sessionFile) ||
@@ -686,8 +944,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       if (!this.current(generation, rpc)) throw new Error("Pi startup cancelled");
       this.emit("thinking_levels");
       this.sessionProof = proof;
-      if (this.hasConfirmedTurns)
-        this.updateCheckpoint(proof.leafId, proof.entryCount, proof.sessionFile);
+      if (strictResume) this.updateCheckpoint(proof.leafId, proof.entryCount, proof.sessionFile);
       else this.sessionFile = proof.sessionFile;
       this.subagentsSessionId = ready.subagentsSessionId ?? undefined;
       this.bridgeOwnedToolNames = new Set(ready.ownerToolNames);
@@ -741,15 +998,35 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
             "Pi is already processing a turn",
           );
         if (!this.live(turn) || this.interrupting) throw new Error("Pi prompt dispatch cancelled");
-        hooks?.onBeforeWrite?.({
-          inputId: envelope.inputId,
-          reportId: envelope.reportId,
-          generation: turn.generation,
-          beforeLeafId: this.expectedLeafAnchorId,
-          beforeEntryCount: this.minEntryCount,
-          startedAt: Date.now(),
-        });
+        const hadUnanchoredInput = this.hasUnanchoredInput;
+        if (!compact && !this.hasConfirmedTurns && !this.persistedSessionAnchor) {
+          turn.anchorInput = {
+            text: envelope.text,
+            sessionFile: this.sessionFile,
+            sessionId: this.sessionId,
+            beforeLeafId: this.sessionProof?.leafId ?? this.expectedLeafAnchorId,
+            beforeEntryCount: this.sessionProof?.entryCount ?? this.minEntryCount,
+          };
+          // The workspace hook saves this claim before stdin can accept the input.
+          this.hasUnanchoredInput = true;
+        }
+        try {
+          hooks?.onBeforeWrite?.({
+            inputId: envelope.inputId,
+            reportId: envelope.reportId,
+            generation: turn.generation,
+            beforeLeafId: this.expectedLeafAnchorId,
+            beforeEntryCount: this.minEntryCount,
+            startedAt: Date.now(),
+          });
+        } catch (error) {
+          // PiRpcClient has not invoked stdin.write yet: this was never a write claim.
+          turn.anchorInput = undefined;
+          this.hasUnanchoredInput = hadUnanchoredInput;
+          throw error;
+        }
         turn.written = true;
+        if (turn.anchorInput) queueMicrotask(() => this.schedulePersistedAnchor(turn, rpc));
       };
       if (compact) {
         await rpc.compact(compact[1], onBeforeWrite);
@@ -762,8 +1039,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
         ...(/^\/quota(?:\s|$)/.test(envelope.text.trimStart()) && { timeoutMs: 50_000 }),
       });
       if (reply?.disposition === "handled") {
-        if (!turn.started) this.finish(turn);
-        else if (this.live(turn)) {
+        if (!turn.started) {
+          this.clearUnacceptedInputClaim(turn);
+          this.finish(turn);
+        } else if (this.live(turn)) {
           turn.inputId = undefined;
           turn.reportId = undefined;
           this.emitWakeup();
@@ -795,6 +1074,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
           turn.written = false;
           this.emitWakeup();
         } else {
+          this.clearUnacceptedInputClaim(turn);
           this.finish(turn);
         }
         return {
@@ -983,6 +1263,14 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     this.emit("wakeup");
   }
 
+  private clearUnacceptedInputClaim(turn: Turn): void {
+    if (!turn.anchorInput || turn.started || this.persistedSessionAnchor) return;
+    turn.anchorInput = undefined;
+    if (!this.hasUnanchoredInput) return;
+    this.hasUnanchoredInput = false;
+    this.emit("session_checkpoint");
+  }
+
   private handleEvent(event: Json): void {
     if (event.type === "extension_ui_request") {
       const change = decodeExtensionUi(event, () => this.unhandledUi(event));
@@ -1085,6 +1373,12 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       }
       case "message_end": {
         if (msg.role === "user" && turn.written && turn.inputId && !turn.accepted) {
+          if (turn.anchorInput) {
+            // Skills, input hooks and image normalization finalize the text before
+            // Pi emits message_end and only then appends it to the JSONL file.
+            turn.anchorInput.text = sessionMessageText({ message: msg }) ?? turn.anchorInput.text;
+            if (this.rpc) this.schedulePersistedAnchor(turn, this.rpc, true);
+          }
           turn.accepted = true;
           this.emit("user_message_accepted", {
             inputId: turn.inputId,
@@ -1248,6 +1542,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
 
   private settle(turn: Turn): void {
     this.hasConfirmedTurns = true;
+    if (turn.anchorInput && this.rpc) this.schedulePersistedAnchor(turn, this.rpc, true);
     this.emit("agent_settled", { inputId: turn.inputId });
     this.cancelDialogs();
     this.closeTurnTools(turn, "Tool stopped before completion");
@@ -1302,6 +1597,110 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     );
   }
 
+  private schedulePersistedAnchor(turn: Turn, rpc: PiRpcClient, renew = false): void {
+    const input = turn.anchorInput;
+    const generation = turn.generation;
+    if (!input || this.persistedSessionAnchor) return;
+    const timeoutMs = this.options.anchorTimeoutMs ?? 2_000;
+    const active = this.anchorProbe;
+    if (active?.generation === generation) {
+      // Finalization gets one fresh bounded window even when the raw-input
+      // probe is still active; both read the same mutable finalized claim.
+      if (renew) active.deadline = Date.now() + timeoutMs;
+      return;
+    }
+    const probe: AnchorProbe = { generation, deadline: Date.now() + timeoutMs };
+    const pending = this.provePersistedAnchor(input, rpc, probe).finally(() => {
+      if (this.anchorProbe?.pending === pending) this.anchorProbe = undefined;
+    });
+    probe.pending = pending;
+    this.anchorProbe = probe;
+    void pending;
+  }
+
+  private async provePersistedAnchor(
+    input: FirstInputClaim,
+    rpc: PiRpcClient,
+    probe: AnchorProbe,
+  ): Promise<void> {
+    const generation = probe.generation;
+    const pollInterval = Math.max(1, this.options.anchorPollIntervalMs ?? 10);
+    let anchorToSave: PersistedSessionAnchor | undefined;
+    while (this.current(generation, rpc) && Date.now() <= probe.deadline) {
+      if (anchorToSave) {
+        try {
+          // This is deliberately not user_message_accepted or agent_settled: only
+          // the on-disk anchor changed, and the claimed input must not be replayed.
+          this.emit("session_anchor", { ...anchorToSave });
+          return;
+        } catch {
+          // Snapshot persistence is a separate, idempotent commit. Retry it
+          // without weakening or repeating the already-observed disk proof.
+        }
+      } else {
+        try {
+          if (!input.sessionFile || !input.sessionId) return;
+          const parsed = readSessionFile(input.sessionFile);
+          if (parsed.corruptLine) throw new Error("incomplete session proof");
+          validateSessionHeader(parsed, input.sessionId, this.normalizedCwd);
+          const beforeIndex = input.beforeLeafId
+            ? parsed.branch.findIndex((entry) => entry.id === input.beforeLeafId)
+            : -1;
+          const beforeMatches =
+            input.beforeEntryCount === 0
+              ? input.beforeLeafId === null
+              : input.beforeLeafId !== null &&
+                parsed.entries[input.beforeEntryCount - 1]?.id === input.beforeLeafId &&
+                beforeIndex >= 0;
+          const persistedInput = beforeMatches
+            ? parsed.branch
+                .slice(beforeIndex + 1)
+                .find(
+                  (entry) =>
+                    entry.type === "message" &&
+                    object(entry.message).role === "user" &&
+                    sessionMessageText(entry) === input.text,
+                )
+            : undefined;
+          if (persistedInput && parsed.leafId && parsed.entries.length > input.beforeEntryCount) {
+            const sessionFile = realpath(input.sessionFile);
+            const anchor: PersistedSessionAnchor = {
+              sessionFile,
+              sessionId: input.sessionId,
+              leafId: parsed.leafId,
+              entryCount: parsed.entries.length,
+            };
+            if (
+              !this.current(generation, rpc) ||
+              this.sessionId !== anchor.sessionId ||
+              this.persistedSessionAnchor
+            )
+              return;
+            this.persistedSessionAnchor = anchor;
+            this.hasUnanchoredInput = false;
+            this.sessionFile = sessionFile;
+            if (anchor.entryCount >= this.minEntryCount) {
+              this.expectedLeafAnchorId = anchor.leafId;
+              this.minEntryCount = anchor.entryCount;
+              if (this.sessionProof)
+                this.sessionProof = {
+                  ...this.sessionProof,
+                  sessionFile,
+                  leafId: anchor.leafId,
+                  entryCount: anchor.entryCount,
+                };
+            }
+            anchorToSave = anchor;
+            continue;
+          }
+        } catch {
+          // A missing file, an incomplete append, or a transient read is not proof.
+        }
+      }
+      await delay(Math.min(pollInterval, Math.max(1, probe.deadline - Date.now())));
+    }
+  }
+
   private syncCompactionCheckpoint(rpc: PiRpcClient): Promise<void> | undefined {
     const boundary = this.compactionBoundary;
     if (boundary)
@@ -1334,7 +1733,18 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     if (count < this.minEntryCount) return;
     this.expectedLeafAnchorId = leafId;
     this.minEntryCount = count;
-    this.sessionFile = file ?? this.sessionFile;
+    if (file) {
+      let checkpointFile = file;
+      if (this.persistedSessionAnchor) {
+        try {
+          if (realpath(file) === this.persistedSessionAnchor.sessionFile)
+            checkpointFile = this.persistedSessionAnchor.sessionFile;
+        } catch {
+          // A later strict restore will report an unreadable checkpoint path.
+        }
+      }
+      this.sessionFile = checkpointFile;
+    }
     if (this.sessionProof)
       this.sessionProof = {
         ...this.sessionProof,
@@ -1367,6 +1777,7 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       this.sessionProof.entryCount > 0
     ) {
       this.hasConfirmedTurns = true;
+      this.hasUnanchoredInput = false;
       this.updateCheckpoint(
         this.sessionProof.leafId,
         this.sessionProof.entryCount,
@@ -2029,6 +2440,8 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     this.sessionFile = null;
     this.subagentsSessionId = undefined;
     this.hasConfirmedTurns = false;
+    this.hasUnanchoredInput = false;
+    this.persistedSessionAnchor = undefined;
     this.expectedLeafAnchorId = null;
     this.minEntryCount = 0;
     this.sessionProof = undefined;
