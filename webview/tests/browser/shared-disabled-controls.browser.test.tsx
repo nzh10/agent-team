@@ -200,7 +200,8 @@ describe.each(["light", "dark"])("shared disabled controls in %s", (theme) => {
     const enabled = await expectEnabledPaint(path, gitless, false);
     await tabFrom(name, path);
     expect(paint(path).borderTopColor).not.toBe(enabled.borderTopColor);
-    await userEvent.keyboard("/repo");
+    // One input event: this tests disabling the field, not typing faster than its debounce.
+    await path.fill("/repo");
     await expect.element(path).toHaveValue("/repo");
     await expect.poll(() => list.mock.calls).toEqual([["/repo"]]);
 
