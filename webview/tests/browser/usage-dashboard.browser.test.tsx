@@ -20,6 +20,52 @@ function bounds(element: Element) {
   return { x, y, width, height };
 }
 
+// Composite computed translucent surfaces as painted before measuring WCAG contrast.
+function contrastRatio(foreground: string, ...background: string[]) {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  const painted = (colors: string[]) => {
+    context.clearRect(0, 0, 1, 1);
+    for (const color of colors) {
+      expect(CSS.supports("color", color), color).toBe(true);
+      context.fillStyle = color;
+      context.fillRect(0, 0, 1, 1);
+    }
+    const pixel = context.getImageData(0, 0, 1, 1).data;
+    expect(pixel[3], colors.join(" + ")).toBe(255);
+    const [r, g, b] = Array.from(pixel.slice(0, 3), (byte) => {
+      const channel = byte / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const a = painted(background);
+  const b = painted([...background, foreground]);
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
+function expectNoHorizontalOverflow(dialog: HTMLElement, label: string) {
+  const box = dialog.getBoundingClientRect();
+  expect(box.left, `${label}: dialog left`).toBeGreaterThanOrEqual(-1);
+  expect(box.right, `${label}: dialog right`).toBeLessThanOrEqual(window.innerWidth + 1);
+  const regions: [string, HTMLElement][] = [
+    ["document", document.documentElement],
+    ["dialog", dialog],
+    ["body", dialog.querySelector<HTMLElement>(".usage-body")!],
+    ["actions", dialog.querySelector<HTMLElement>(".usage-actions")!],
+    ...Array.from(
+      dialog.querySelectorAll<HTMLElement>(".usage-card, .usage-row summary, .usage-pages"),
+      (element, index): [string, HTMLElement] => [`${element.className}[${index}]`, element],
+    ),
+  ];
+  for (const [name, element] of regions) {
+    expect(element.scrollWidth, `${label}: ${name} horizontal overflow`).toBeLessThanOrEqual(
+      element.clientWidth + 1,
+    );
+  }
+}
+
 afterEach(() => {
   cleanup();
   document.getElementById("root")?.remove();
@@ -405,6 +451,205 @@ it.each(["light", "dark"])(
     await screen.findByText("Update failed · previous results");
     expect(bounds(status)).toEqual(pendingStatus);
     expectBoundedHeading();
+  },
+);
+
+const surfaceCases = ["light", "dark"].flatMap((theme) => [
+  { theme, width: 1000, height: 800 },
+  { theme, width: 390, height: 760 },
+]);
+
+it.each(surfaceCases)(
+  "inherits dialog fonts and keeps Usage colors readable and numerals aligned in $theme at $width",
+  async ({ theme, width, height }) => {
+    document.documentElement.dataset.theme = theme;
+    await page.viewport(width, height);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation((url) =>
+          Promise.resolve(
+            usageUrl(url).pathname.endsWith("/overview")
+              ? overviewResponse()
+              : journeyResponse([observation], { total: 91 }),
+          ),
+        ),
+    );
+    render(<UsageDashboard onClose={vi.fn()} />);
+    await screen.findByText("92.31%");
+    await document.fonts.ready;
+    const dialog = screen.getByRole("dialog");
+
+    for (const selector of [
+      ".usage-kpis .usage-card > strong",
+      ".usage-prices dd",
+      ".usage-method dd",
+      ".usage-axis",
+      ".usage-overview-rank-label strong",
+    ]) {
+      const elements = dialog.querySelectorAll(selector);
+      expect(elements.length, selector).toBeGreaterThan(0);
+      for (const element of elements) {
+        expect(getComputedStyle(element).fontVariantNumeric, selector).toBe("tabular-nums");
+      }
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "Records" }));
+    await screen.findByText("Page 1 of 4 · 91 records");
+    const pageInput = screen.getByRole("spinbutton", { name: "Page number" });
+    const dialogInput = screen.getByRole("textbox", { name: "Channel contains" });
+    const bodyFont = getComputedStyle(document.body).fontFamily;
+    expect(getComputedStyle(pageInput).fontFamily).toBe(getComputedStyle(dialogInput).fontFamily);
+    expect(getComputedStyle(pageInput).fontFamily).toBe(bodyFont);
+    expect(bodyFont).toContain("Sarasa Mono SC");
+    expect(getComputedStyle(pageInput).fontSize).toBe(
+      getComputedStyle(document.querySelector(".usage-pages")!).fontSize,
+    );
+    for (const selector of [".usage-row-total", ".usage-pages > span", ".usage-pages input"]) {
+      const elements = dialog.querySelectorAll(selector);
+      expect(elements.length, selector).toBeGreaterThan(0);
+      for (const element of elements) {
+        expect(getComputedStyle(element).fontVariantNumeric, selector).toBe("tabular-nums");
+      }
+    }
+
+    const summary = dialog.querySelector<HTMLElement>(".usage-row summary")!;
+    const surface = getComputedStyle(dialog).backgroundColor;
+    const disclosureColor = () => getComputedStyle(summary, "::after").color;
+    const summaryBackground = () => getComputedStyle(summary).backgroundColor;
+    const expectContrast = (state: string, foreground: string, ...background: string[]) =>
+      expect(
+        contrastRatio(foreground, ...background),
+        `${theme} ${width}: ${state} contrast`,
+      ).toBeGreaterThanOrEqual(4.5);
+    const closedDisclosure = disclosureColor();
+    expectContrast("resting disclosure", closedDisclosure, surface);
+
+    await page.elementLocator(summary).hover();
+    expect(summary.matches(":hover")).toBe(true);
+    expect(summaryBackground()).not.toBe("rgba(0, 0, 0, 0)");
+    expectContrast("hovered disclosure", disclosureColor(), surface, summaryBackground());
+
+    // Move the pointer away, then reach each target by keyboard so :focus-visible is real.
+    await page.getByRole("button", { name: "Refresh", exact: true }).hover();
+    screen.getByRole("button", { name: "Records" }).focus();
+    const tabTo = async (element: HTMLElement) => {
+      for (let count = 0; count < 20 && document.activeElement !== element; count++) {
+        await userEvent.keyboard("{Tab}");
+      }
+      expect(document.activeElement).toBe(element);
+      expect(element.matches(":focus-visible")).toBe(true);
+    };
+    await tabTo(summary);
+    expectContrast("keyboard-focused disclosure", disclosureColor(), surface, summaryBackground());
+    await userEvent.keyboard("{Enter}");
+    await screen.findByText("inference-receipt");
+    expect(disclosureColor()).toBe(closedDisclosure);
+    expectContrast(
+      "open keyboard-focused disclosure",
+      disclosureColor(),
+      surface,
+      summaryBackground(),
+    );
+
+    const filterLink = dialog.querySelector<HTMLElement>(".usage-filter-link")!;
+    const filterColor = () => getComputedStyle(filterLink).color;
+    const filterBackground = () => getComputedStyle(filterLink).backgroundColor;
+    expectContrast("resting filter link", filterColor(), surface, filterBackground());
+    await tabTo(filterLink);
+    expectContrast("keyboard-focused filter link", filterColor(), surface, filterBackground());
+    await page.elementLocator(filterLink).hover();
+    expect(filterLink.matches(":hover")).toBe(true);
+    expectContrast("hovered filter link", filterColor(), surface, filterBackground());
+  },
+);
+
+const responsiveCases = ["light", "dark"].flatMap((theme) =>
+  [
+    { width: 390, height: 760, stepped: true },
+    { width: 680, height: 800, stepped: true },
+    { width: 681, height: 800, stepped: true },
+    { width: 768, height: 800, stepped: true },
+    { width: 844, height: 390, stepped: true },
+    { width: 1000, height: 800, stepped: false },
+  ].map((viewport) => ({ theme, ...viewport })),
+);
+
+it.each(responsiveCases)(
+  "steps Usage typography up without horizontal overflow in $theme at $width x $height",
+  async ({ theme, width, height, stepped }) => {
+    document.documentElement.dataset.theme = theme;
+    await page.viewport(width, height);
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation((url) =>
+          Promise.resolve(
+            usageUrl(url).pathname.endsWith("/overview")
+              ? overviewResponse()
+              : journeyResponse([observation], { total: 91 }),
+          ),
+        ),
+    );
+    render(<UsageDashboard onClose={vi.fn()} />);
+    await screen.findByText("92.31%");
+    await document.fonts.ready;
+    const dialog = screen.getByRole("dialog");
+    for (const animation of dialog.getAnimations()) animation.finish();
+    expect(matchMedia("(max-width: 768px), (max-height: 500px)").matches).toBe(stepped);
+    const expected = {
+      name: stepped ? "14px" : "13px",
+      text: stepped ? "13px" : "12px",
+      meta: stepped ? "12px" : "11px",
+    };
+    const root = getComputedStyle(document.documentElement);
+    expect(root.getPropertyValue("--fs-name").trim()).toBe(expected.name);
+    expect(root.getPropertyValue("--fs-text").trim()).toBe(expected.text);
+    expect(root.getPropertyValue("--fs-meta").trim()).toBe(expected.meta);
+
+    const checkTypography = (records: boolean) => {
+      const typed: [string, string][] = [[".usage-dialog .dialog-title", expected.name]];
+      if (records) {
+        typed.push([".usage-row-type", expected.meta], [".usage-pages", expected.text]);
+      } else {
+        typed.push(
+          [".usage-card h3", expected.text],
+          [".usage-card p", expected.meta],
+          [".usage-overview-ranking button", expected.meta],
+        );
+      }
+      for (const [selector, fontSize] of typed) {
+        const element = dialog.querySelector(selector);
+        expect(element, selector).not.toBeNull();
+        expect(getComputedStyle(element!).fontSize, `${width}x${height}: ${selector}`).toBe(
+          fontSize,
+        );
+      }
+      if (records) {
+        expect(
+          getComputedStyle(screen.getByRole("spinbutton", { name: "Page number" })).fontSize,
+        ).toBe(expected.text);
+      } else {
+        const hero = dialog.querySelector(".usage-kpis .usage-card > strong")!;
+        const heroSize = Number.parseFloat(getComputedStyle(hero).fontSize);
+        expect(heroSize).toBeGreaterThanOrEqual(16);
+        expect(heroSize).toBeLessThanOrEqual(25);
+      }
+      expectNoHorizontalOverflow(
+        dialog,
+        `${theme} ${records ? "Records" : "Overview"} ${width}x${height}`,
+      );
+    };
+
+    checkTypography(false);
+    fireEvent.click(screen.getByRole("button", { name: "Records" }));
+    await screen.findByText("Page 1 of 4 · 91 records");
+    fireEvent.click(document.querySelector(".usage-filters > summary")!);
+    fireEvent.click(document.querySelector(".usage-row summary")!);
+    await screen.findByText("inference-receipt");
+    checkTypography(true);
   },
 );
 

@@ -3537,7 +3537,7 @@ button.quote-bar-content:focus-visible {
   --usage-output: var(--warning);
 }
 .usage-dialog .dialog-title {
-  font-size: 20px;
+  font-size: var(--fs-name);
   color: var(--text-strong);
 }
 .usage-dialog .usage-body {
@@ -3549,7 +3549,7 @@ button.quote-bar-content:focus-visible {
   min-height: 2.8em;
   margin: 0;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-meta);
   line-height: 1.4;
   text-align: right;
   overflow-wrap: anywhere;
@@ -3645,17 +3645,18 @@ button.quote-bar-content:focus-visible {
 }
 .usage-card h3 {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-text);
   color: var(--text-strong);
 }
 .usage-card p {
   margin: 4px 0 0;
-  font-size: 11px;
+  font-size: var(--fs-meta);
 }
 .usage-kpis .usage-card > strong {
   display: block;
   margin-top: 5px;
   font-size: clamp(16px, 3vw, 25px);
+  font-variant-numeric: tabular-nums;
   color: var(--text-strong);
   line-height: 1.25;
 }
@@ -3668,11 +3669,12 @@ button.quote-bar-content:focus-visible {
   display: flex;
   justify-content: space-between;
   gap: 6px;
-  font-size: 11px;
+  font-size: var(--fs-meta);
 }
 .usage-prices dd,
 .usage-method dd {
   margin: 0;
+  font-variant-numeric: tabular-nums;
   color: var(--text-strong);
   overflow-wrap: anywhere;
 }
@@ -3696,7 +3698,7 @@ button.quote-bar-content:focus-visible {
 .usage-legend,
 .usage-axis,
 .usage-dates {
-  font-size: 11px;
+  font-size: var(--fs-meta);
 }
 .usage-legend {
   list-style: none;
@@ -3742,6 +3744,7 @@ button.quote-bar-content:focus-visible {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  font-variant-numeric: tabular-nums;
   text-align: right;
 }
 .usage-plot {
@@ -3801,7 +3804,7 @@ button.quote-bar-content:focus-visible {
 .usage-row summary::after {
   content: "+" / "";
   grid-column: -2;
-  color: var(--accent-hover);
+  color: var(--text-muted);
 }
 .usage-row[open] summary::after {
   content: "−" / "";
@@ -3811,13 +3814,14 @@ button.quote-bar-content:focus-visible {
   font-weight: 600;
 }
 .usage-row :is(.usage-row-type, .usage-row-time, .usage-row-total) {
-  font-size: 11px;
+  font-size: var(--fs-meta);
 }
 .usage-row-time time {
   display: grid;
   font-variant-numeric: tabular-nums;
 }
 .usage-row-total {
+  font-variant-numeric: tabular-nums;
   text-align: right;
 }
 .usage-details {
@@ -3835,7 +3839,7 @@ button.quote-bar-content:focus-visible {
   padding: 2px 0;
   margin-inline-end: 8px;
   border: 0;
-  color: var(--accent-hover);
+  color: var(--accent-text);
   background: transparent;
   font: inherit;
   text-align: start;
@@ -3855,7 +3859,7 @@ button.quote-bar-content:focus-visible {
 }
 .usage-pages {
   margin-right: auto;
-  font-size: 12px;
+  font-size: var(--fs-text);
   gap: 4px;
 }
 .usage-pages .btn-secondary {
@@ -3882,6 +3886,8 @@ button.quote-bar-content:focus-visible {
   border-radius: 4px;
   background: var(--bg-tertiary);
   color: var(--text-primary);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
 }
 .usage-pages .btn-secondary:hover:not(:disabled) {
   border-color: var(--text-muted);
@@ -3901,6 +3907,7 @@ button.quote-bar-content:focus-visible {
 }
 .usage-pages > span {
   margin-inline-end: 4px;
+  font-variant-numeric: tabular-nums;
 }
 @media (max-width: 768px), (max-height: 500px) {
   .usage-chips .bp-chip {

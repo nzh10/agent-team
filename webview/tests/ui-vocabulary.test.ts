@@ -9,6 +9,7 @@ import filesPanelSrc from "../src/panels/FilesPanel.tsx?raw";
 import sidePanelSrc from "../src/panels/SidePanel.tsx?raw";
 import projectPartsSrc from "../src/project/parts.tsx?raw";
 import css from "../src/styles.css?raw";
+import usageOverviewCss from "../src/usage/UsageOverview.css?raw";
 import dialogFrameSrc from "../src/workspace/DialogFrame.tsx?raw";
 
 interface CssRule {
@@ -272,6 +273,59 @@ describe("UI Zen vocabulary contract", () => {
 
     // FilterChip renders the canonical .bp-chip class.
     expect(projectPartsSrc).toContain('"bp-chip"');
+  });
+
+  it("keeps Usage typography, static text colors, and numeric alignment on semantic tokens", () => {
+    const usageRules = [...rules, ...parseRules(usageOverviewCss)].filter((rule) =>
+      rule.selectors.some((selector) => selector.includes(".usage-")),
+    );
+    const heroSelector = ".usage-kpis .usage-card > strong";
+    let fontSizeCount = 0;
+    for (const rule of usageRules) {
+      for (const match of rule.body.matchAll(/(?:^|;)\s*font-size\s*:\s*([^;]+)/g)) {
+        fontSizeCount++;
+        if (rule.selectors.includes(heroSelector)) {
+          expect(match[1].trim(), heroSelector).toBe("clamp(16px, 3vw, 25px)");
+        } else {
+          expect(match[1].trim(), rule.selectors.join(", ")).toMatch(
+            /^var\(--fs-(?:name|text|meta|tag)\)$/,
+          );
+        }
+      }
+    }
+    expect(fontSizeCount, "Usage font-size declarations checked").toBeGreaterThan(0);
+
+    const pageInput = findRule(usageRules, ".usage-pages input");
+    expect(pageInput, ".usage-pages input rule").toBeDefined();
+    expect(hasDeclaration(pageInput!.body, "font", /^inherit$/)).toBe(true);
+
+    const filterLink = findRule(usageRules, ".usage-filter-link");
+    const disclosure = findRule(usageRules, ".usage-row summary::after");
+    expect(filterLink, ".usage-filter-link rule").toBeDefined();
+    expect(disclosure, ".usage-row summary::after rule").toBeDefined();
+    expect(hasDeclaration(filterLink!.body, "color", /^var\(--accent-text\)$/)).toBe(true);
+    expect(hasDeclaration(disclosure!.body, "color", /^var\(--text-muted\)$/)).toBe(true);
+
+    for (const selector of [
+      ".usage-row-total",
+      heroSelector,
+      ".usage-prices dd",
+      ".usage-method dd",
+      ".usage-axis",
+      ".usage-overview-rank-label strong",
+      ".usage-pages > span",
+      ".usage-pages input",
+    ]) {
+      expect(
+        usageRules.some(
+          (rule) =>
+            rule.media === null &&
+            rule.selectors.includes(selector) &&
+            hasDeclaration(rule.body, "font-variant-numeric", /^tabular-nums$/),
+        ),
+        `${selector} uses tabular-nums`,
+      ).toBe(true);
+    }
   });
 
   it("preserves nested flatness inside tinted status containers and optical/touch geometry rules", () => {
