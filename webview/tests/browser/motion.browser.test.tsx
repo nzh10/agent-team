@@ -160,10 +160,10 @@ it.each(["light", "dark"])(
         <div className="messages">
           {open && (
             <TranscriptChoiceScope id="row" choices={choices}>
-              <div className="message-highlight" style={{ height: 60 }}>
+              <div className="message message-highlight" style={{ height: 60 }}>
                 Jumped
               </div>
-              <div className="message-highlight" style={{ height: 1800 }}>
+              <div className="message message-highlight" style={{ height: 1800 }}>
                 Tall reply
               </div>
               <StepGroup group={{ step: 0, events: [{ kind: "thinking", content: "Thought" }] }} />
@@ -179,11 +179,17 @@ it.each(["light", "dark"])(
         </div>
       );
       view.rerender(chat(true));
-      const [row, tall] = [...view.container.querySelectorAll(".message-highlight")];
+      const rows = [...view.container.querySelectorAll(".message-highlight")];
+      expect(rows).toHaveLength(2);
+      for (const row of rows) {
+        const tint = getComputedStyle(row, "::before");
+        const { width, height } = row.getBoundingClientRect();
+        expect([tint.top, tint.right, tint.bottom, tint.left]).toEqual(Array(4).fill("0px"));
+        expect([parseFloat(tint.width), parseFloat(tint.height)]).toEqual([width, height]);
+        expect(tint.pointerEvents).toBe("none");
+      }
+      const [row] = rows;
       const tint = getComputedStyle(row, "::before");
-      expect(tint.height).toBe("60px");
-      expect(parseFloat(getComputedStyle(tall, "::before").height)).toBeLessThan(844 / 3);
-      expect(tint.pointerEvents).toBe("none");
       expect(getComputedStyle(row).opacity).toBe("1");
       expect(tint.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
       if (mode === "no-preference") {

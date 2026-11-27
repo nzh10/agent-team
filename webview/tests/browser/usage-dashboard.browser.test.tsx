@@ -15,9 +15,26 @@ import {
 } from "../usageFixtures";
 import "../../src/styles.css";
 
-function bounds(element: Element) {
+function bounds(element: Element | Range) {
   const { x, y, width, height } = element.getBoundingClientRect();
   return { x, y, width, height };
+}
+
+function textBounds(element: Element) {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  return bounds(range);
+}
+
+function expectTextContained(element: Element, label: string) {
+  const box = bounds(element);
+  const text = textBounds(element);
+  expect(text.x, `${label}: text left`).toBeGreaterThanOrEqual(box.x - 0.5);
+  expect(text.x + text.width, `${label}: text right`).toBeLessThanOrEqual(box.x + box.width + 0.5);
+  expect(text.y, `${label}: text top`).toBeGreaterThanOrEqual(box.y - 0.5);
+  expect(text.y + text.height, `${label}: text bottom`).toBeLessThanOrEqual(
+    box.y + box.height + 0.5,
+  );
 }
 
 // Composite computed translucent surfaces as painted before measuring WCAG contrast.
@@ -271,86 +288,93 @@ it("shares instant picks and Enter-applied fuzzy filters with responsive numbere
   expect(params()).toEqual({ range: "7d", unit: "turn", granularity: "day", page: "1" });
 });
 
-it("keeps results, geometry, scroll and focus continuous through delayed reloads", async () => {
-  await page.viewport(1000, 620);
-  let finishRefresh!: (response: Response) => void;
-  let finishFailure!: (response: Response) => void;
-  let finishSuccess!: (response: Response) => void;
-  const request = vi
-    .fn<typeof fetch>()
-    .mockResolvedValueOnce(overviewResponse())
-    .mockReturnValueOnce(new Promise<Response>((resolve) => (finishRefresh = resolve)))
-    .mockReturnValueOnce(new Promise<Response>((resolve) => (finishFailure = resolve)))
-    .mockReturnValueOnce(new Promise<Response>((resolve) => (finishSuccess = resolve)));
-  vi.stubGlobal("fetch", request);
-  render(<UsageDashboard onClose={vi.fn()} />);
-  await screen.findByText("Inference records");
-  await page.getByText("Measurement details and benchmarks").click();
+it.each(["light", "dark"])(
+  "keeps results, geometry, scroll and focus continuous through delayed reloads in %s",
+  async (theme) => {
+    document.documentElement.dataset.theme = theme;
+    await page.viewport(1000, 620);
+    let finishRefresh!: (response: Response) => void;
+    let finishFailure!: (response: Response) => void;
+    let finishSuccess!: (response: Response) => void;
+    const request = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(overviewResponse())
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishRefresh = resolve)))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishFailure = resolve)))
+      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishSuccess = resolve)));
+    vi.stubGlobal("fetch", request);
+    render(<UsageDashboard onClose={vi.fn()} />);
+    await screen.findByText("Inference records");
+    await page.getByText("Measurement details and benchmarks").click();
 
-  const dialog = screen.getByRole("dialog");
-  await document.fonts.ready;
-  for (const animation of dialog.getAnimations()) animation.finish();
-  const body = dialog.querySelector<HTMLElement>(".usage-body")!;
-  const refresh = screen.getByRole("button", { name: "Refresh" });
-  const filterSummary = dialog.querySelector(".usage-filters > summary")!;
-  const loadState = dialog.querySelector(".usage-load-state")!;
-  expect(body.scrollHeight).toBeGreaterThan(body.clientHeight);
-  body.scrollTop = Math.min(120, body.scrollHeight - body.clientHeight);
-  const scrollTop = body.scrollTop;
-  expect(scrollTop).toBeGreaterThan(0);
-  const snapshot = () => ({
-    dialog: bounds(dialog),
-    refresh: bounds(refresh),
-    filterSummary: bounds(filterSummary),
-    loadState: bounds(loadState),
-  });
-  const initial = snapshot();
+    const dialog = screen.getByRole("dialog");
+    await document.fonts.ready;
+    for (const animation of dialog.getAnimations()) animation.finish();
+    const body = dialog.querySelector<HTMLElement>(".usage-body")!;
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    const filterSummary = dialog.querySelector(".usage-filters > summary")!;
+    const loadState = dialog.querySelector(".usage-load-state")!;
+    expect(body.scrollHeight).toBeGreaterThan(body.clientHeight);
+    body.scrollTop = Math.min(120, body.scrollHeight - body.clientHeight);
+    const scrollTop = body.scrollTop;
+    expect(scrollTop).toBeGreaterThan(0);
+    const snapshot = () => ({
+      dialog: bounds(dialog),
+      refresh: bounds(refresh),
+      filterSummary: bounds(filterSummary),
+      loadState: bounds(loadState),
+    });
+    const initial = snapshot();
 
-  refresh.focus();
-  fireEvent.click(refresh);
-  await screen.findByText("Updating usage…");
-  expect(snapshot()).toEqual(initial);
-  expect(body.scrollTop).toBe(scrollTop);
-  expect(body.getAttribute("aria-busy")).toBe("true");
-  expect(document.activeElement).toBe(refresh);
-  expect(screen.getByText("Inference records")).toBeTruthy();
-  expect(request).toHaveBeenCalledTimes(2);
-  finishRefresh(overviewResponse());
-  await expect.element(page.getByText("Updating usage…")).not.toBeInTheDocument();
+    refresh.focus();
+    fireEvent.click(refresh);
+    await screen.findByText("Updating usage…");
+    expectTextContained(loadState, `${theme} 1000px pending`);
+    expect(snapshot()).toEqual(initial);
+    expect(body.scrollTop).toBe(scrollTop);
+    expect(body.getAttribute("aria-busy")).toBe("true");
+    expect(document.activeElement).toBe(refresh);
+    expect(screen.getByText("Inference records")).toBeTruthy();
+    expect(request).toHaveBeenCalledTimes(2);
+    finishRefresh(overviewResponse());
+    await expect.element(page.getByText("Updating usage…")).not.toBeInTheDocument();
 
-  const unit = screen.getByRole<HTMLSelectElement>("combobox", { name: "Reporting unit" });
-  const beforeFailure = snapshot();
-  unit.focus();
-  fireEvent.change(unit, { target: { value: "turn" } });
-  await screen.findByText("Updating usage…");
-  expect(snapshot()).toEqual(beforeFailure);
-  expect(body.scrollTop).toBe(scrollTop);
-  expect(document.activeElement).toBe(unit);
-  expect(screen.getByText("Inference records")).toBeTruthy();
-  expect(screen.queryByText("Turn records")).toBeNull();
-  expect(request).toHaveBeenCalledTimes(3);
-  finishFailure(new Response(null, { status: 503 }));
-  await screen.findByText("Update failed · previous results");
-  expect(snapshot()).toEqual(beforeFailure);
-  expect(body.scrollTop).toBe(scrollTop);
-  expect(body.getAttribute("aria-busy")).toBe("false");
-  expect(document.activeElement).toBe(unit);
-  expect(screen.getByText("Inference records")).toBeTruthy();
-  expect(screen.queryByText("Turn records")).toBeNull();
+    const unit = screen.getByRole<HTMLSelectElement>("combobox", { name: "Reporting unit" });
+    const beforeFailure = snapshot();
+    unit.focus();
+    fireEvent.change(unit, { target: { value: "turn" } });
+    await screen.findByText("Updating usage…");
+    expectTextContained(loadState, `${theme} 1000px pending before failure`);
+    expect(snapshot()).toEqual(beforeFailure);
+    expect(body.scrollTop).toBe(scrollTop);
+    expect(document.activeElement).toBe(unit);
+    expect(screen.getByText("Inference records")).toBeTruthy();
+    expect(screen.queryByText("Turn records")).toBeNull();
+    expect(request).toHaveBeenCalledTimes(3);
+    finishFailure(new Response(null, { status: 503 }));
+    await screen.findByText("Update failed · previous results");
+    expectTextContained(loadState, `${theme} 1000px error`);
+    expect(snapshot()).toEqual(beforeFailure);
+    expect(body.scrollTop).toBe(scrollTop);
+    expect(body.getAttribute("aria-busy")).toBe("false");
+    expect(document.activeElement).toBe(unit);
+    expect(screen.getByText("Inference records")).toBeTruthy();
+    expect(screen.queryByText("Turn records")).toBeNull();
 
-  refresh.focus();
-  fireEvent.click(refresh);
-  await screen.findByText("Updating usage…");
-  expect(snapshot()).toEqual(beforeFailure);
-  expect(body.scrollTop).toBe(scrollTop);
-  expect(document.activeElement).toBe(refresh);
-  expect(request).toHaveBeenCalledTimes(4);
-  finishSuccess(overviewResponse());
-  await screen.findByText("Turn records");
-  expect(screen.queryByText("Inference records")).toBeNull();
-  expect(screen.queryByText("Update failed · previous results")).toBeNull();
-  expect(screen.queryByText("Updating usage…")).toBeNull();
-});
+    refresh.focus();
+    fireEvent.click(refresh);
+    await screen.findByText("Updating usage…");
+    expect(snapshot()).toEqual(beforeFailure);
+    expect(body.scrollTop).toBe(scrollTop);
+    expect(document.activeElement).toBe(refresh);
+    expect(request).toHaveBeenCalledTimes(4);
+    finishSuccess(overviewResponse());
+    await screen.findByText("Turn records");
+    expect(screen.queryByText("Inference records")).toBeNull();
+    expect(screen.queryByText("Update failed · previous results")).toBeNull();
+    expect(screen.queryByText("Updating usage…")).toBeNull();
+  },
+);
 
 it("gates retained Records pagination while a new query is pending or failed", async () => {
   await page.viewport(1000, 700);
@@ -387,11 +411,11 @@ it("gates retained Records pagination while a new query is pending or failed", a
   expect(request).toHaveBeenCalledTimes(3);
 });
 
-it.each(["light", "dark"])(
-  "keeps narrow heading status and long filter chips bounded in %s",
-  async (theme) => {
+it.each(["light", "dark"].flatMap((theme) => [280, 390].map((width) => ({ theme, width }))))(
+  "keeps narrow heading status and long filter chips bounded in $theme at $width",
+  async ({ theme, width }) => {
     document.documentElement.dataset.theme = theme;
-    await page.viewport(280, 700);
+    await page.viewport(width, 700);
     const longModel = "enterprise-model-with-a-long-name-and-a-quantized-variant";
     const ranking = [{ model: longModel, tokens: 104 }];
     let finishFailure!: (response: Response) => void;
@@ -442,6 +466,8 @@ it.each(["light", "dark"])(
       expect(statusBox.y + statusBox.height).toBeLessThanOrEqual(
         bounds(heading).y + bounds(heading).height,
       );
+      expectTextContained(title, `${theme} ${width}px title`);
+      expectTextContained(status, `${theme} ${width}px status`);
     };
     expectBoundedHeading();
     await act(async () => {

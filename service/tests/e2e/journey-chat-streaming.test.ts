@@ -376,7 +376,10 @@ it("reads every history window, preserves the reconnect anchor and restores evic
   expect(Buffer.byteLength(pressureBody)).toBeGreaterThan(1024 * 1024);
   await openPressure();
   expect(detailRequests).toBe(1);
-  await pressure.getByRole("button", { name: "Collapse step trace" }).click();
+  await pressure
+    .locator(".trace-collapse-footer")
+    .getByRole("button", { name: "Collapse steps" })
+    .click();
   await clipAnchor(pressure);
   await settle();
   const anchor = (await visible())[0];
@@ -422,7 +425,10 @@ it("streams Replay Demo and expands and collapses thinking and completed subagen
   const thinking = turn.locator(".step-group", { hasText: "1 thinking" });
   await thinking.getByRole("button", { name: "Expand steps" }).click();
   await thinking.getByText(/The geometry should stay the same/).waitFor();
-  await thinking.getByRole("button", { name: "Collapse step trace" }).click();
+  await thinking
+    .locator(".trace-collapse-footer")
+    .getByRole("button", { name: "Collapse steps" })
+    .click();
   await thinking.getByText(/The geometry should stay the same/).waitFor({ state: "hidden" });
 
   const card = page.locator(".subagent-item", { hasText: "Search the syntax module" });
@@ -432,6 +438,6 @@ it("streams Replay Demo and expands and collapses thinking and completed subagen
   const details = card.locator(":scope > .subagent-details");
   await details.getByText("Found 2 mutation sites, verifying callers now.").waitFor();
   await card.locator(".subagent-time", { hasText: /^21s$/ }).waitFor();
-  await details.getByRole("button", { name: "Collapse subagent trace" }).click();
+  await details.getByRole("button", { name: "Collapse subagent", exact: true }).click();
   await details.waitFor({ state: "detached" });
 }, 50_000);

@@ -279,7 +279,7 @@ it("preserves a historical reading anchor on open, close, session switch and rec
   expect(view.details()?.textContent).toContain("old trace");
   expect(scroller().contains(view.details())).toBe(true);
   sameGeometry();
-  fireEvent.click(view.getByRole("button", { name: "Collapse subagent trace" }));
+  fireEvent.click(view.getByRole("button", { name: "Collapse subagent" }));
   expect(view.details()).toBeNull();
   expect(document.activeElement).toBe(
     view.getByRole("button", { name: "Expand subagent: Review" }),
@@ -540,7 +540,7 @@ it("retains one bounded reading window under repeated live growth, paging and op
     view.answer();
     fireEvent.click(view.getByRole("button", { name: "Newer" }));
     // Close with the newer request still outstanding; a late page must be ignored.
-    fireEvent.click(view.getByRole("button", { name: "Collapse subagent trace" }));
+    fireEvent.click(view.getByRole("button", { name: "Collapse subagent" }));
     view.answer();
     expect(view.details()).toBeNull();
     expect(view.container.querySelectorAll(".subagent-item")).toHaveLength(1);
@@ -839,7 +839,7 @@ it("keeps BottomCollapse reachable after scrolling a tall subagent trace and res
   for (let i = 0; i < 2; i++) {
     view.openTrace();
     view.answer(0);
-    const collapseBtn = view.getByRole("button", { name: "Collapse subagent trace" });
+    const collapseBtn = view.getByRole("button", { name: "Collapse subagent" });
     scroller.scrollTop +=
       collapseBtn.getBoundingClientRect().bottom - scroller.getBoundingClientRect().bottom + 24;
     expect(header.getBoundingClientRect().bottom).toBeLessThan(

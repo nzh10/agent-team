@@ -95,7 +95,7 @@ export function QuotaPanel({
                   title={isUnavailable ? `${rowLabel} — ${statusText}` : rowLabel}
                 >
                   <span className="quota-caret" aria-hidden="true">
-                    {open ? "▾" : "▸"}
+                    ▸
                   </span>{" "}
                   <span className="quota-name">{rowLabel}</span>{" "}
                   <span className="quota-summary">

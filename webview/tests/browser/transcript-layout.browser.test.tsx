@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { page, cdp, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
@@ -119,7 +119,7 @@ it.each([390, 1200])(
   "collapsing the %ipx step trace from the bottom restores its off-screen header",
   async (width) => {
     await page.viewport(width, width === 390 ? 844 : 720);
-    const { container, getByRole } = render(
+    const { container } = render(
       <div className="messages" style={{ height: 360, overflowAnchor: "none" }}>
         <div style={{ flex: "none", height: 210 }} />
         <StepGroup
@@ -138,7 +138,9 @@ it.each([390, 1200])(
     const header = get(container, ".step-header");
     const toggle = get(header, "button");
     fireEvent.click(toggle);
-    const footer = getByRole("button", { name: "Collapse step trace" });
+    const footer = within(get(container, ".trace-collapse-footer")).getByRole("button", {
+      name: "Collapse steps",
+    });
     expect(rect(footer).height).toBeGreaterThanOrEqual(width === 390 ? 44 : 26);
     if (width === 1200) expect(rect(footer).height).toBeLessThan(44);
     expect(rect(footer).width).toBeCloseTo(rect(footer.parentElement!).width, 1);
@@ -269,7 +271,7 @@ it.each([390, 1200])(
     const toggle = get(container, ".btn-diff");
     for (let i = 0; i < 2; i++) {
       fireEvent.click(toggle);
-      const footer = getByRole("button", { name: "Collapse tool result" });
+      const footer = getByRole("button", { name: "Hide result" });
       footer.focus();
       expect(rect(toggle).bottom).toBeLessThan(rect(scroller).top);
       fireEvent.click(footer);
@@ -281,7 +283,145 @@ it.each([390, 1200])(
   },
 );
 
-it("returns focus to Details rather than Result when both tool folds are open", () => {
+it.each([
+  { theme: "light", width: 1200 },
+  { theme: "dark", width: 390 },
+])("separates tool and container collapse scopes ($theme, $width px)", async ({ theme, width }) => {
+  await page.viewport(width, 720);
+  const touch = width === 390;
+  await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: touch });
+  document.documentElement.dataset.theme = theme;
+  try {
+    const { container, getByRole } = render(
+      <div className="messages" style={{ height: 400 }}>
+        <div style={{ flex: "none", height: 40 }} />
+        <StepGroup
+          group={{
+            step: 0,
+            events: [
+              {
+                kind: "tool_use",
+                toolName: "Bash",
+                content: "**Bash** `pwd`",
+                toolResult: "The current directory is `/repo`.",
+                toolResultIsMarkdown: true,
+              },
+            ],
+          }}
+        />
+        <SubAgentItem
+          ev={{
+            kind: "subagent_done",
+            content: "",
+            subagent: { taskId: "review", description: "Review", status: "completed" },
+          }}
+        />
+        <div style={{ flex: "none", height: 600 }} />
+      </div>,
+    );
+    await document.fonts.ready;
+    const stepToggle = getByRole("button", { name: "Expand steps" });
+    const subagentToggle = getByRole("button", { name: "Expand subagent: Review" });
+    fireEvent.click(stepToggle);
+    fireEvent.click(subagentToggle);
+    const resultToggle = getByRole("button", { name: /^Result ·/ });
+    fireEvent.click(resultToggle);
+    const inner = getByRole("button", { name: "Hide result" });
+    const result = get(container, ".event-result");
+    const events = get(container, ".events-list");
+    const details = get(container, ".subagent-details");
+    const stepBar = get(events, ":scope > .trace-collapse-footer");
+    const subagentBar = get(details, ":scope > .trace-collapse-footer");
+    const steps = within(stepBar).getByRole("button", { name: "Collapse steps" });
+    const subagent = within(subagentBar).getByRole("button", { name: "Collapse subagent" });
+
+    expect(inner.previousElementSibling).toBe(result);
+    expect(result.parentElement!.querySelector(".trace-collapse-footer")).toBeNull();
+    expect(getComputedStyle(inner).borderTopWidth).toBe("0px");
+    const innerCenter = rect(inner).left + rect(inner).width / 2;
+    const resultCenter = rect(result).left + rect(result).width / 2;
+    expect(Math.abs(innerCenter - resultCenter)).toBeLessThanOrEqual(1);
+    expect(rect(inner).left).toBeGreaterThanOrEqual(rect(result).left - 1);
+    expect(rect(inner).right).toBeLessThanOrEqual(rect(result).right + 1);
+    expect(rect(inner).width).toBeLessThan(rect(result).width / 2);
+    expect(rect(inner).height).toBeGreaterThanOrEqual(touch ? 36 : 24);
+    for (const [bar, footer, body] of [
+      [stepBar, steps, events],
+      [subagentBar, subagent, details],
+    ]) {
+      expect(getComputedStyle(bar).borderTopWidth).toBe("1px");
+      expect(rect(bar).width).toBe(rect(body).width);
+      expect(rect(footer).width).toBe(rect(bar).width);
+      expect(rect(footer).height).toBeGreaterThanOrEqual(touch ? 44 : 28);
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 1;
+    const paint = canvas.getContext("2d", { willReadFrequently: true })!;
+    const luminance = () => {
+      const [r, g, b, alpha] = paint.getImageData(0, 0, 1, 1).data;
+      expect(alpha).toBe(255);
+      const linear = (n: number) =>
+        n / 255 <= 0.04045 ? n / (255 * 12.92) : ((n / 255 + 0.055) / 1.055) ** 2.4;
+      return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    };
+    for (const control of [inner, steps, subagent]) {
+      const backdrop: string[] = [];
+      for (let node: HTMLElement | null = control; node; node = node.parentElement) {
+        backdrop.unshift(getComputedStyle(node).backgroundColor);
+      }
+      paint.clearRect(0, 0, 1, 1);
+      for (const color of backdrop) {
+        paint.fillStyle = color;
+        paint.fillRect(0, 0, 1, 1);
+      }
+      const background = luminance();
+      paint.fillStyle = getComputedStyle(control).color;
+      paint.fillRect(0, 0, 1, 1);
+      const foreground = luminance();
+      expect(
+        (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+
+    const scroller = get(container, ".messages");
+    scroller.scrollTop = 32;
+    // Tab from the tool's Copy button, then collapse each scope from the bottom.
+    for (const [control, toggle] of [
+      [inner, resultToggle],
+      [steps, stepToggle],
+      [subagent, subagentToggle],
+    ]) {
+      if (control === inner) {
+        getByRole("button", { name: "Copy" }).focus({ preventScroll: true });
+        await userEvent.keyboard("{Tab}");
+      } else {
+        control.focus({ preventScroll: true });
+      }
+      expect(document.activeElement).toBe(control);
+      expect(control.matches(":focus-visible")).toBe(true);
+      const focus = getComputedStyle(control);
+      expect(focus.outlineWidth).toBe("2px");
+      paint.fillStyle = focus.getPropertyValue("--focus-ring").trim();
+      const ring = paint.fillStyle;
+      paint.fillStyle = focus.outlineColor;
+      expect(paint.fillStyle).toBe(ring);
+      const anchor = rect(toggle).top;
+      const scrollTop = scroller.scrollTop;
+      await userEvent.keyboard("{Enter}");
+      expect(control.isConnected).toBe(false);
+      expect(document.activeElement).toBe(toggle);
+      expect(rect(toggle).top).toBe(anchor);
+      expect(scroller.scrollTop).toBe(scrollTop);
+    }
+  } finally {
+    delete document.documentElement.dataset.theme;
+    await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: false });
+  }
+});
+
+it("returns focus to Details rather than Result when both tool folds are open", async () => {
+  await page.viewport(1200, 720);
   const { getByRole } = render(
     <EventItem
       ev={{ kind: "tool_use", content: "**SomeLongToolName** reading", toolResult: "completed" }}
@@ -292,7 +432,14 @@ it("returns focus to Details rather than Result when both tool folds are open", 
   fireEvent.click(result);
   for (let i = 0; i < 2; i++) {
     fireEvent.click(details);
-    const footer = getByRole("button", { name: "Collapse tool details" });
+    const footer = getByRole("button", { name: "Hide details" });
+    const content = footer.previousElementSibling!;
+    expect(content.classList.contains("event-content")).toBe(true);
+    const footerCenter = rect(footer).left + rect(footer).width / 2;
+    const contentCenter = rect(content).left + rect(content).width / 2;
+    expect(Math.abs(footerCenter - contentCenter)).toBeLessThanOrEqual(1);
+    expect(rect(footer).left).toBeGreaterThanOrEqual(rect(content).left - 1);
+    expect(rect(footer).right).toBeLessThanOrEqual(rect(content).right + 1);
     footer.focus();
     fireEvent.click(footer);
     expect(document.activeElement).toBe(details);

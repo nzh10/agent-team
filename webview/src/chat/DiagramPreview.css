@@ -1,4 +1,20 @@
-.code-block > pre[hidden] {
+.code-block--diagram {
+  position: relative;
+  --diagram-action-width: 27px;
+  --diagram-action-gap: 4px;
+  --diagram-action-inset: 6px;
+  --diagram-status-end: calc(
+    2 * var(--diagram-action-width) + 2 * var(--diagram-action-gap) + var(--diagram-action-inset)
+  );
+}
+
+@media (hover: none) {
+  .code-block--diagram {
+    --diagram-action-width: 36px;
+  }
+}
+
+.code-block--diagram > pre[hidden] {
   display: none;
 }
 
@@ -9,14 +25,15 @@
   z-index: 1;
   display: flex;
   align-items: center;
-  gap: 4px;
-  margin: 6px 6px -100% -100%;
+  gap: var(--diagram-action-gap);
+  margin: var(--diagram-action-inset) var(--diagram-action-inset) -100% -100%;
 }
 
 .code-block .code-block-actions .copy-btn {
   float: none;
   position: static;
   flex: none;
+  width: var(--diagram-action-width);
   margin: 0;
 }
 
@@ -39,20 +56,11 @@
   margin: 0 auto;
 }
 
-.diagram-reservation {
-  position: relative;
-}
 .diagram-reservation::before {
   content: "";
   display: block;
   inline-size: var(--diagram-width);
   block-size: var(--diagram-height);
-}
-.diagram-reservation .diagram-preview-status {
-  position: absolute;
-  inset: 4px 12px auto;
-  overflow: hidden;
-  white-space: nowrap;
 }
 
 .diagram-preview--mermaid text {
@@ -73,19 +81,32 @@
   fill: transparent;
 }
 
-.diagram-preview-status,
+.diagram-preview-status {
+  /* Neither source nor the sticky actions should move while rendering. */
+  position: absolute;
+  top: var(--diagram-action-inset);
+  right: var(--diagram-status-end);
+  z-index: 1;
+  max-width: calc(100% - var(--diagram-status-end) - var(--diagram-action-inset));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+  color: var(--text-muted);
+  font-size: var(--fs-meta);
+  line-height: 16px;
+}
+
+.diagram-preview-status:not(:empty) {
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
 .diagram-preview-error {
-  display: block;
   clear: both;
   margin: 4px 0;
   font-size: var(--fs-meta);
-}
-
-.diagram-preview-status {
-  color: var(--text-muted);
-}
-
-.diagram-preview-error {
   color: var(--error);
   overflow-wrap: anywhere;
 }

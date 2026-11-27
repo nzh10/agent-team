@@ -70,8 +70,27 @@ async function render(source: string, theme: DiagramTheme): Promise<string> {
   // alone cannot prevent the request. Parse first and never draw those nodes.
   const diagram = await mermaid.mermaidAPI.getDiagramFromText(source);
   if (hasImageNode(diagram.db)) throw new Error("Image nodes are disabled in diagram previews");
-  // Do not bind Mermaid's optional click callbacks: previews are passive SVG.
-  return (await mermaid.render(`diagram-preview-${++nextId}`, source)).svg;
+  // Mermaid looks up live SVG nodes by ID and measures text. Keep them connected
+  // but out of the body's flow and scroll range until the SVG is serialized.
+  const host = document.createElement("div");
+  host.setAttribute("aria-hidden", "true");
+  Object.assign(host.style, {
+    position: "fixed",
+    visibility: "hidden",
+    pointerEvents: "none",
+    left: "-9999px",
+    top: "0",
+    width: "100%",
+    contain: "layout style",
+    overflow: "clip",
+  });
+  document.body.append(host);
+  try {
+    // Do not bind Mermaid's optional click callbacks: previews are passive SVG.
+    return (await mermaid.render(`diagram-preview-${++nextId}`, source, host)).svg;
+  } finally {
+    host.remove();
+  }
 }
 
 export function renderMermaid(source: string, theme: DiagramTheme): Promise<string> {

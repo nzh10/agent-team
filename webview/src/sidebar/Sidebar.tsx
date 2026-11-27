@@ -77,7 +77,7 @@ function SessionWait({ workspace }: { workspace: Workspace }) {
     const attempt = retry.match(/\bRetrying (?:in \d+s )?\((\d+)\b/)?.[1];
     return (
       <span className="session-silence" title={retry}>
-        {attempt ? `Retrying (attempt ${attempt})` : "Retrying"}
+        <span className="clip">{attempt ? `Retrying (attempt ${attempt})` : "Retrying"}</span>
       </span>
     );
   }
@@ -484,7 +484,9 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
           {...telemetryTarget("sidebar.archive_toggle")}
           onClick={() => toggleArchive(g.key)}
         >
-          <span className="events-toggle">{open ? "▾" : "▸"}</span>
+          <span className="events-toggle" aria-hidden="true">
+            ▸
+          </span>
           <span>Archived</span>
           {open && <span className="ws-group-count">{list.length}</span>}
           {open && g.project && g.project.status !== "sealed" && (
@@ -597,7 +599,13 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
                 <span
                   className={`session-attention attention-${cue}${cue === "yourTurn" ? " awaits-tag" : ""}`}
                 >
-                  {cue === "yourTurn" ? "Your turn" : cue === "failed" ? "Failed" : "Unread result"}
+                  <span className="clip">
+                    {cue === "yourTurn"
+                      ? "Your turn"
+                      : cue === "failed"
+                        ? "Failed"
+                        : "Unread result"}
+                  </span>
                 </span>
               ) : p.connected ? (
                 <SessionWait workspace={ws} />
@@ -631,6 +639,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
       <div key={g.key} className="ws-group">
         <div
           className={`ws-group-header${g.project ? " ws-group-project" : ""}${lead && lead.id === p.activeWsId ? " active" : ""}${current ? " current" : ""}`}
+          aria-expanded={lead ? undefined : expanded}
           title={
             lead
               ? `Open the lead of ${g.label}`
@@ -654,10 +663,14 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
                 toggle();
               }}
             >
-              {expanded ? "▾" : "▸"}
+              <span className="events-toggle" aria-hidden="true">
+                ▸
+              </span>
             </button>
           ) : (
-            <span className="events-toggle">{expanded ? "▾" : "▸"}</span>
+            <span className="events-toggle" aria-hidden="true">
+              ▸
+            </span>
           )}
           {isRenaming ? (
             <NameInput
@@ -707,7 +720,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
                   aria-label={`${g.label}: ${summary}`}
                   title={summary}
                 >
-                  {summary}
+                  <span className="clip">{summary}</span>
                 </span>
               ) : lead && p.connected ? (
                 <SessionWait workspace={lead} />
@@ -779,7 +792,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
                     onClick={toggleIdle}
                   >
                     <span className="events-toggle" aria-hidden="true">
-                      {idleOpen ? "▾" : "▸"}
+                      ▸
                     </span>
                     <span className="ws-idle-label">... ({idle.length})</span>
                   </button>
@@ -843,7 +856,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
           </button>
           {p.onCreateProject && (
             <button title="New project" onClick={p.onCreateProject}>
-              <Icon name="board" />
+              <Icon name="newProject" />
             </button>
           )}
           <button
@@ -909,7 +922,7 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
               void push.testPush();
             }}
           >
-            <Icon name="bell" />
+            <Icon name="testPush" />
           </button>
           <a
             className="sidebar-debug-action"
@@ -992,10 +1005,13 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
               <div
                 className="ws-group-header ws-archived-header"
                 {...telemetryTarget("sidebar.archive_toggle")}
+                aria-expanded={showShelf}
                 onClick={() => setShelfOpen((v) => !v)}
                 title="Projects filed away. Their leads and history are still there."
               >
-                <span className="events-toggle">{showShelf ? "▾" : "▸"}</span>
+                <span className="events-toggle" aria-hidden="true">
+                  ▸
+                </span>
                 <span className="ws-group-label">Archived projects</span>
                 <span className="ws-group-count">{shelved.length}</span>
               </div>
@@ -1007,10 +1023,13 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
               <div
                 className="ws-group-header ws-archived-header"
                 {...telemetryTarget("sidebar.archive_toggle")}
+                aria-expanded={showArchived}
                 onClick={() => setArchivedOpen((v) => !v)}
                 title="Idle workspaces. History stays on disk; sending a message restores one."
               >
-                <span className="events-toggle">{showArchived ? "▾" : "▸"}</span>
+                <span className="events-toggle" aria-hidden="true">
+                  ▸
+                </span>
                 <span className="ws-group-label">Archived</span>
                 {showArchived && <span className="ws-group-count">{archived.length}</span>}
                 {showArchived && (
