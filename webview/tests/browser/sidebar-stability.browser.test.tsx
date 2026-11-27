@@ -81,14 +81,21 @@ function checkGutter(s: string, overflow: boolean) {
   expect.soft(list.offsetWidth - list.clientWidth).toBe(width);
   expect.soft(getComputedStyle(list).scrollbarGutter).toBe("stable");
 }
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   delete document.documentElement.dataset.theme;
+  await cdp().send("Emulation.setEmulatedMedia", { features: [] });
 });
 for (const theme of ["light", "dark"])
   for (const width of [1280, 390])
     describe(`${theme} at ${width}px`, () => {
-      const viewport = () => themedViewport(width, 650, theme);
+      const viewport = async () => {
+        await themedViewport(width, 650, theme);
+        // Windows Server runners default to prefers-reduced-motion: reduce.
+        await cdp().send("Emulation.setEmulatedMedia", {
+          features: [{ name: "prefers-reduced-motion", value: "no-preference" }],
+        });
+      };
       it("keeps disclosure labels, hit boxes and neighboring row edges stable across overflow", async () => {
         await viewport();
         render(<Drawer />);
