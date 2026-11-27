@@ -33,6 +33,7 @@ import {
   PendingEvent,
   withoutLiveTiming,
 } from "./stream";
+import { retainInactiveTranscripts } from "./transcriptRetention";
 
 // Liveness probing. Mobile browsers freeze the page when the screen turns off
 // or the app goes to the background and the socket often dies underneath it
@@ -512,7 +513,29 @@ function wsTelemetryAction(data: { type: string; force?: unknown }): TelemetryAc
 }
 
 export function useServer() {
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const useMock = import.meta.env.DEV && new URLSearchParams(window.location.search).has("mock");
+  const useReplay =
+    import.meta.env.DEV && new URLSearchParams(window.location.search).has("replay");
+  const [transcripts, setTranscripts] = useState<{
+    workspaces: Workspace[];
+    activeId: string | null;
+    lastUsed: string[];
+  }>({ workspaces: [], activeId: null, lastUsed: [] });
+  const { workspaces } = transcripts;
+  const setWorkspaces = useCallback(
+    (update: Workspace[] | ((prev: Workspace[]) => Workspace[])) => {
+      setTranscripts((prev) => {
+        const next = typeof update === "function" ? update(prev.workspaces) : update;
+        // Stand-alone dev fixtures have no server from which to reload a page.
+        const workspaces =
+          useMock || useReplay
+            ? next
+            : retainInactiveTranscripts(next, prev.activeId, prev.lastUsed);
+        return workspaces === prev.workspaces ? prev : { ...prev, workspaces };
+      });
+    },
+    [useMock, useReplay],
+  );
   const [projects, setProjects] = useState<Project[]>([]);
   // By project; a project with no issues has no entry.
   const [issues, setIssues] = useState<Record<string, IssueModules>>({});
@@ -583,12 +606,18 @@ export function useServer() {
   // effect after the commit, once each even under StrictMode's double run.
   const detailRefetchRef = useRef<Set<string>>(new Set());
 
-  const flushDetailRefetches = useCallback(() => {
+  const flushDetailRefetches = useCallback((workspaces: Workspace[]) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     for (const key of detailRefetchRef.current) {
       const [workspaceId, messageId] = key.split("/");
-      ws.send(JSON.stringify({ type: "load_message_details", workspaceId, messageId }));
+      if (
+        workspaces
+          .find((w) => w.id === workspaceId)
+          ?.messages.some((m) => m.id === messageId && m.detail === "summary")
+      ) {
+        ws.send(JSON.stringify({ type: "load_message_details", workspaceId, messageId }));
+      }
     }
     detailRefetchRef.current.clear();
   }, []);
@@ -637,7 +666,24 @@ export function useServer() {
         };
       }),
     );
-  }, []);
+  }, [setWorkspaces]);
+
+  const setActiveTranscript = useCallback(
+    (workspaceId: string | null) => {
+      // Exempt the new reader before applying a queued stream batch, then
+      // account for the workspace the reader just left.
+      setTranscripts((prev) => {
+        if (prev.activeId === workspaceId) return prev;
+        const ids = new Set(prev.workspaces.map((w) => w.id));
+        const lastUsed = prev.lastUsed.filter((id) => id !== workspaceId && ids.has(id));
+        if (workspaceId !== null) lastUsed.push(workspaceId);
+        return { ...prev, activeId: workspaceId, lastUsed };
+      });
+      flushStreamEvents();
+      setWorkspaces((prev) => prev);
+    },
+    [flushStreamEvents, setWorkspaces],
+  );
 
   const scheduleFlush = useCallback(() => {
     const hidden = document.visibilityState === "hidden";
@@ -868,22 +914,10 @@ export function useServer() {
           setWorkspaces((prev) =>
             prev.map((w) => {
               if (w.id !== wsId) return w;
-              if (!w.messagesLoaded) {
-                // An older page for a history that was dropped since (archived)
-                // is not a first page.
-                if (before != null) return w;
-                return {
-                  ...w,
-                  messages: incoming,
-                  hasMore,
-                  messagesLoaded: true,
-                  loadingOlder: false,
-                };
-              }
               if (before != null) {
-                // Asked for before a resync replaced the list: prepending it
-                // now would put it in the wrong place.
-                if (before !== w.messages[0]?.timestamp) return w;
+                // An older page cannot start a dropped cache or prepend to a
+                // different cursor after eviction, archive, or resync.
+                if (!w.messagesLoaded || before !== w.messages[0]?.timestamp) return w;
                 const existingIds = new Set(w.messages.map((m) => m.id));
                 const newMsgs = incoming.filter((m) => !existingIds.has(m.id));
                 return {
@@ -893,9 +927,15 @@ export function useServer() {
                   loadingOlder: false,
                 };
               }
-              // Newest page again (reconnect resync): reconcile in place so
-              // turns that finished while we were away stop showing as live.
-              const messages = mergeLatestPage(w.messages, incoming);
+              // Reconcile a resync, including any contiguous live tail that
+              // arrived after eviction. The incoming page wins where it overlaps.
+              const merged = mergeLatestPage(w.messages, incoming);
+              // A complete snapshot can also prove that a cached row outside
+              // (or tied with) its first timestamp was removed.
+              const messages =
+                !hasMore && merged.length > incoming.length
+                  ? merged.slice(-incoming.length)
+                  : merged;
               for (const id of downgradedMessageIds(w.messages, messages)) {
                 detailRefetchRef.current.add(`${wsId}/${id}`);
               }
@@ -903,10 +943,12 @@ export function useServer() {
               return {
                 ...w,
                 messages,
-                hasMore: keptOlder ? w.hasMore : hasMore,
+                messagesLoaded: true,
+                hasMore: keptOlder ? !w.messagesLoaded || w.hasMore : hasMore,
                 // A newest-page reply cannot complete an older-page request
                 // that still targets the same cursor.
-                loadingOlder: w.loadingOlder && messages[0]?.timestamp === w.messages[0]?.timestamp,
+                loadingOlder:
+                  !!w.loadingOlder && messages[0]?.timestamp === w.messages[0]?.timestamp,
               };
             }),
           );
@@ -914,6 +956,7 @@ export function useServer() {
         }
 
         case "workspace_created":
+          flushStreamEvents();
           setWorkspaces((prev) => [...prev, msg.workspace as Workspace]);
           break;
 
@@ -994,6 +1037,7 @@ export function useServer() {
         case "new_message": {
           const wsId = msg.workspaceId as string;
           const message = msg.message as Message;
+          flushStreamEvents();
           setWorkspaces((prev) =>
             prev.map((w) =>
               w.id === wsId
@@ -1146,6 +1190,7 @@ export function useServer() {
                     messages: [],
                     messagesLoaded: false,
                     hasMore: false,
+                    loadingOlder: false,
                   }
                 : w,
             ),
@@ -1169,12 +1214,11 @@ export function useServer() {
           setWorkspaces((prev) =>
             prev.map((w) => {
               if (w.id !== wsId) return w;
-              return {
-                ...w,
-                messages: w.messages.map((m) =>
-                  m.id === messageId ? { ...m, events, detail: undefined } : m,
-                ),
-              };
+              const index = w.messages.findIndex((m) => m.id === messageId);
+              if (index < 0) return w;
+              const messages = w.messages.slice();
+              messages[index] = { ...messages[index], events, detail: undefined };
+              return { ...w, messages };
             }),
           );
           break;
@@ -1220,6 +1264,7 @@ export function useServer() {
         case "message_removed": {
           const wsId = msg.workspaceId as string;
           const messageId = msg.messageId as string;
+          flushStreamEvents();
           setWorkspaces((prev) =>
             prev.map((w) =>
               w.id === wsId
@@ -1276,11 +1321,11 @@ export function useServer() {
           break;
       }
     },
-    [flushStreamEvents, scheduleFlush],
+    [flushStreamEvents, scheduleFlush, setWorkspaces],
   );
 
   useEffect(() => {
-    if (detailRefetchRef.current.size > 0) flushDetailRefetches();
+    if (detailRefetchRef.current.size > 0) flushDetailRefetches(workspaces);
   }, [workspaces, flushDetailRefetches]);
 
   const send = useCallback(
@@ -1382,10 +1427,6 @@ export function useServer() {
     watchSocket(ws, connecting);
   }, [connect, watchSocket]);
 
-  const useMock = import.meta.env.DEV && new URLSearchParams(window.location.search).has("mock");
-  const useReplay =
-    import.meta.env.DEV && new URLSearchParams(window.location.search).has("replay");
-
   useEffect(() => {
     if (useMock) {
       setWorkspaces([...MOCK_WORKSPACES, ...MOCK_PROJECT_WORKSPACES]);
@@ -1421,7 +1462,7 @@ export function useServer() {
       wsRef.current = null;
       ws?.close();
     };
-  }, [connect, useMock, useReplay, handleServerMessage]);
+  }, [connect, useMock, useReplay, handleServerMessage, setWorkspaces]);
 
   useEffect(() => {
     if (useMock || useReplay) return;
@@ -1462,6 +1503,7 @@ export function useServer() {
     connected,
     snapshotReady,
     connectionEpoch,
+    setActiveTranscript,
     user,
     presets,
     models,
@@ -1489,15 +1531,21 @@ export function useServer() {
     loadMessages: useCallback(
       (wsId: string, before?: number, pageSize?: number) => {
         // Small screens get smaller first pages; scrolling back fetches more.
-        const limit = pageSize ?? (before ? 50 : window.innerWidth < 768 ? 25 : 50);
-        if (before) {
+        const limit = pageSize ?? (before != null ? 50 : window.innerWidth < 768 ? 25 : 50);
+        const requested = send({ type: "load_messages", workspaceId: wsId, before, limit });
+        if (requested && before != null) {
+          recordTelemetry("chat.history_page");
           setWorkspaces((prev) =>
-            prev.map((w) => (w.id === wsId ? { ...w, loadingOlder: true } : w)),
+            prev.map((w) =>
+              w.id === wsId && w.messagesLoaded && w.messages[0]?.timestamp === before
+                ? { ...w, loadingOlder: true }
+                : w,
+            ),
           );
         }
-        send({ type: "load_messages", workspaceId: wsId, before, limit });
+        return requested;
       },
-      [send],
+      [send, setWorkspaces],
     ),
     loadMessageDetails: useCallback(
       (wsId: string, messageId: string) =>

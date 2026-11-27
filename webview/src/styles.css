@@ -1559,14 +1559,28 @@ button {
   padding-bottom: 6px;
 }
 .message-highlight {
-  animation: highlight-fade 2s ease-out;
+  position: relative;
+  isolation: isolate;
 }
-@keyframes highlight-fade {
-  0% {
-    background: var(--bg-highlight);
+.message-highlight::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  margin-block: auto;
+  /* Keep the emphasis visible for a centered jump into a tall row without
+     promoting a surface as tall as the entire reply or trace. */
+  max-block-size: min(220px, 30dvh);
+  pointer-events: none;
+  background: var(--bg-highlight);
+  animation: highlight-release 300ms ease 1000ms forwards;
+}
+@keyframes highlight-release {
+  from {
+    opacity: 1;
   }
-  100% {
-    background: transparent;
+  to {
+    opacity: 0;
   }
 }
 .message-gutter {
@@ -2035,6 +2049,13 @@ span.katex-display {
   border: 0;
   padding: 0;
   cursor: pointer;
+}
+.trace-caret {
+  display: block;
+  transition: transform var(--motion-quick) ease-out;
+}
+.trace-header-toggle[aria-expanded="true"] .trace-caret {
+  transform: rotate(90deg);
 }
 .trace-collapse-footer {
   display: flex;
@@ -2924,6 +2945,11 @@ button.action-target:hover {
   border-top-color: var(--accent);
   animation: spin 0.9s linear infinite;
   flex-shrink: 0;
+}
+.history-cold-reveal .spinner {
+  animation:
+    spin 0.9s linear infinite,
+    chrome-reveal var(--motion-quick) ease-out;
 }
 .event-placeholder {
   display: block;
@@ -4408,6 +4434,9 @@ button.quote-bar-content:focus-visible {
   border-radius: 4px;
   border: 2px solid transparent;
   background-clip: padding-box;
+}
+.messages::-webkit-scrollbar-thumb {
+  min-height: 50px;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
@@ -7627,6 +7656,7 @@ button.from-author {
   .banner-retry .banner-icon,
   .subagent-icon-running,
   .spinner,
+  .history-cold-reveal .spinner,
   .ap-dot.ss-working,
   .ap-dot.ss-waiting,
   .sidebar-debug-strip,
@@ -7634,11 +7664,8 @@ button.from-author {
   .stop-actions,
   .quota-details,
   .dialog,
-  .message-highlight {
+  .message-highlight::before {
     animation: none;
-  }
-  .message-highlight {
-    background: var(--bg-active);
   }
   .btn-primary,
   .btn-secondary,
@@ -7650,6 +7677,7 @@ button.from-author {
   .input-row,
   .input-row button,
   .bp-node,
+  .trace-caret,
   .bn-caret {
     transition: none;
   }

@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type Locator, type Page } from "playwright";
 import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
 import { seedDemo } from "../../../scripts/seed-demo";
@@ -12,6 +12,11 @@ import type { Message } from "../../src/workspace/workspace";
 const webDir = join(__dirname, "../../../dist/webview");
 const imageName = "journey preview.png";
 const historySize = 125;
+const pressureId = "journey-pressure";
+const pressureBody = `Pressure result start\n${"Synthetic settled tool output.\n".repeat(35_000)}Pressure result end`;
+let historyIds: string[];
+let wakeId: string;
+let newestCursor: number;
 let dir: string | undefined;
 let server: Server | undefined;
 let browser: Browser;
@@ -26,6 +31,7 @@ beforeAll(async () => {
   const sessions = loadAll(dir);
   const mobile = sessions.find((session) => session.id === workspaces.mobile)!;
   const wake = sessions.find((session) => session.id === workspaces.wake)!;
+  wakeId = wake.id;
   const history = wake.messages!;
   const start = history[0].timestamp - historySize;
   const older: Message[] = Array.from({ length: historySize }, (_, i) => ({
@@ -36,7 +42,30 @@ beforeAll(async () => {
     timestamp: start + i,
     content: `History entry ${i}`,
   }));
-  saveWorkspace(dir, { ...wake, messages: [...older, ...history] });
+  older[4] = {
+    ...older[4],
+    id: pressureId,
+    kind: "agent",
+    agentId: wake.agents[0].id,
+    content: "The pressure result is ready.",
+    events: [
+      {
+        kind: "tool_use",
+        toolName: "Bash",
+        toolUseId: pressureId,
+        content: "**Bash** `print synthetic output`",
+        contentOffset: 0,
+        toolResult: pressureBody,
+      },
+    ],
+  };
+  const fullHistory = [...older, ...history];
+  historyIds = fullHistory.map((m) => `msg-${m.id}`);
+  newestCursor = fullHistory.at(-50)!.timestamp;
+  // HistoryDb preserves sequence numbers for existing rows. Insert the
+  // fixture in chronological order instead of appending the older rows.
+  saveWorkspace(dir, { ...wake, messages: [] });
+  saveWorkspace(dir, { ...wake, messages: fullHistory });
 
   writeFileSync(
     join(mobile.cwd, imageName),
@@ -83,7 +112,7 @@ beforeAll(async () => {
   browser = await chromium.launch();
 }, 60_000);
 
-async function open(query = "") {
+async function open(query = "", prepare?: (page: Page) => Promise<void>) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 800 },
     permissions: ["clipboard-read", "clipboard-write"],
@@ -95,6 +124,7 @@ async function open(query = "") {
     if (message.type() === "error") errors.push(message.text());
   });
   current.on("pageerror", (error) => errors.push(error.stack ?? error.message));
+  await prepare?.(current);
   await current.goto(`${origin}/${query}`);
   await current
     .locator(".messages")
@@ -257,64 +287,177 @@ it("keeps per-workspace drafts through desktop and phone navigation and selects 
   expect(await overflow(page)).toBe(0);
 }, 40_000);
 
-it("pages through older history without losing the scroll anchor, then hydrates a fresh newest page", async () => {
-  const page = await open();
-  await worker(page, "wake-up time").click();
+it("reads every history window, preserves the reconnect anchor and restores evicted history", async () => {
+  let detailRequests = 0;
+  let returning = false;
+  let resumeNewest: (() => void) | undefined;
+  const cursors: unknown[] = [];
+  const frame = (raw: Buffer | string) => JSON.parse(raw.toString()) as Record<string, unknown>;
+  const page = await open("", (page) =>
+    page.routeWebSocket(`ws://${new URL(origin).host}/`, (socket) => {
+      const upstream = socket.connectToServer();
+      socket.onMessage((raw) => {
+        const { type, workspaceId, before, messageId } = frame(raw);
+        if (type === "load_message_details" && messageId === pressureId) detailRequests++;
+        if (returning && workspaceId === wakeId && type === "load_messages") {
+          // Hold the routine newest request so it cannot mask the evicted state.
+          if (cursors.push(before) === 1 && before == null) {
+            resumeNewest = () => upstream.send(raw);
+            return;
+          }
+        }
+        upstream.send(raw);
+      });
+    }),
+  );
+  const wake = worker(page, "wake-up time");
+  await wake.click();
   const messages = page.locator(".messages");
   const older = messages.getByText("Scroll up for older messages");
-  await older.waitFor();
-  const ids = () =>
-    page.evaluate<string[]>(
-      `Array.from(document.querySelectorAll(".messages [id^=msg-]"), row => row.id)`,
-    );
-  const newest = await ids();
-  const first = page.locator(`#${newest[0]}`);
-  const offset = async () => (await first.boundingBox())!.y - (await messages.boundingBox())!.y;
-  // Jump in one scroll event so Chromium cannot start paging midway through a wheel animation.
-  const top = () => page.evaluate("document.querySelector('.messages').scrollTop = 0");
-  expect(newest.length).toBeLessThan(historySize);
-  await page.evaluate("document.fonts.ready.then(() => undefined)");
+  const loaded = (n: number) => messages.locator(`[data-loaded-messages="${n}"]`).waitFor();
+  const settle = () =>
+    page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))");
+  const readRows = () =>
+    messages.evaluate((el) => {
+      const viewport = el.getBoundingClientRect();
+      return Array.from(
+        el.querySelectorAll<HTMLElement>("[data-transcript-row] [id^=msg-]"),
+        (row) => {
+          const rect = row.getBoundingClientRect();
+          return {
+            id: row.id,
+            text: row.innerText,
+            top: rect.top - viewport.top,
+            visible: rect.bottom > viewport.top && rect.top < viewport.bottom,
+          };
+        },
+      );
+    });
+  type Row = Awaited<ReturnType<typeof readRows>>[number];
+  const visible = async () => (await readRows()).filter((row) => row.visible);
+  const contents = (rows: Row[]) => rows.map(({ id, text }) => ({ id, text }));
+  const expectSameView = (actual: Row[], expected: Row[]) => {
+    expect(contents(actual)).toEqual(contents(expected));
+    for (const [i, row] of actual.entries())
+      expect(Math.abs(row.top - expected[i].top), row.id).toBeLessThanOrEqual(3);
+  };
+  const scroll = (next: boolean) =>
+    messages.evaluate((el, next) => {
+      el.scrollTop = next ? el.scrollTop + Math.floor(el.clientHeight * 0.75) : 0;
+      return el.scrollHeight - el.scrollTop - el.clientHeight;
+    }, next);
+  const clipAnchor = (anchor: Locator) =>
+    anchor.evaluate((row) => {
+      const host = row.closest(".messages")!;
+      host.scrollTop += row.getBoundingClientRect().top - host.getBoundingClientRect().top + 12;
+    });
+  const newestVisible = async () => {
+    await older.waitFor();
+    await loaded(50);
+    await page.evaluate(() => document.fonts.ready.then(() => undefined));
+    await settle();
+    const onScreen = await visible();
+    expect(onScreen.at(-1)?.id).toBe(historyIds.at(-1));
+    return onScreen;
+  };
+  const newest = await newestVisible();
   await page.waitForFunction("document.querySelector('.messages').scrollTop >= 80");
-  const before = await page.evaluate<number>(`(() => {
-    const scroller = document.querySelector('.messages');
-    const row = document.getElementById(${JSON.stringify(newest[0])});
-    return row.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
-  })()`);
-  await top();
-  await expect.poll(async () => (await ids()).length).toBeGreaterThan(newest.length);
-  await expect.poll(async () => Math.abs((await offset()) - before)).toBeLessThanOrEqual(2);
-  expect((await ids()).slice(-newest.length)).toEqual(newest);
-  await top();
-  await messages.getByText("Beginning of conversation").waitFor();
-  const all = await ids();
-  expect(all.slice(0, historySize)).toEqual(
-    Array.from({ length: historySize }, (_, i) => `msg-journey-older-${i}`),
+  // The true first row is initially in a spacer, immediately after the hint.
+  const before = await messages.evaluate(
+    (el) =>
+      el.querySelector(".history-hint")!.getBoundingClientRect().bottom -
+      el.getBoundingClientRect().top +
+      el.scrollTop,
   );
-  expect(new Set(all).size).toBe(all.length);
+  await scroll(false);
+  await loaded(100);
+  await expect
+    .poll(async () => {
+      const row = (await readRows()).find(({ id }) => id === historyIds.at(-50));
+      return Math.abs((row?.top ?? Infinity) - before);
+    })
+    .toBeLessThanOrEqual(3);
+  await scroll(false);
+  await loaded(historyIds.length);
+  await scroll(false);
+  await clipAnchor(messages.locator(`#${historyIds[0]}`));
+  await settle();
+  const oldest = await visible();
+  expect(oldest[0]?.id).toBe(historyIds[0]);
+  expect(oldest[0].top).toBeLessThan(0);
 
-  const transcript = () => Promise.all(newest.map((id) => page.locator(`#${id}`).textContent()));
-  const beforeReconnect = await transcript();
   // Close only the scratch server's browser connections, not the server or its history.
-  const reconnect = page.waitForEvent("websocket");
-  for (const socket of server!["wss"].clients) socket.close(1000, "Journey reconnect");
-  const socket = await reconnect;
-  await socket.waitForEvent("framereceived", {
-    predicate: ({ payload }) =>
-      (JSON.parse(payload.toString()) as { type: string }).type === "workspace_messages",
-    timeout: 7_000,
-  });
-  // A wire receipt can precede the render that merges that page.
-  await page.evaluate(
-    "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+  const reconnect = page.waitForEvent("websocket").then((socket) =>
+    socket.waitForEvent("framereceived", {
+      predicate: ({ payload }) => {
+        const { type, workspaceId } = frame(payload);
+        return type === "workspace_messages" && workspaceId === wakeId;
+      },
+      timeout: 7_000,
+    }),
   );
-  expect(await ids()).toEqual(all);
-  expect(await transcript()).toEqual(beforeReconnect);
+  for (const socket of server!["wss"].clients) socket.close(1000, "Journey reconnect");
+  await reconnect;
+  await settle();
+  await loaded(historyIds.length);
+  expectSameView(await visible(), oldest);
+
+  const seen: string[] = [];
+  for (let step = 0; seen.length < historyIds.length; step++) {
+    expect(step).toBeLessThan(historyIds.length);
+    const mounted = (await readRows()).map(({ id }) => id);
+    const start = historyIds.indexOf(mounted[0]);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(mounted).toEqual(historyIds.slice(start, start + mounted.length));
+    expect(mounted.length).toBeLessThanOrEqual(45);
+    if (step) expect(start).toBeLessThan(seen.length);
+    seen.push(...mounted.slice(seen.length - start));
+    await scroll(true);
+    await settle();
+  }
+  expect(seen).toEqual(historyIds);
+  await page.getByRole("button", { name: /Jump to latest/ }).click();
+  expect((await visible()).at(-1)?.id).toBe(historyIds.at(-1));
+  await scroll(false);
+  const pressure = messages.locator(`#msg-${pressureId}`);
+  const output = pressure.locator(".event-result code");
+  const openPressure = async () => {
+    await pressure.getByRole("button", { name: "Expand steps" }).click();
+    expect(await output.count()).toBe(0);
+    await pressure.getByRole("button", { name: /^Result ·/ }).click();
+    await expect
+      .poll(() => output.evaluate((el, expected) => el.textContent === expected, pressureBody))
+      .toBe(true);
+  };
+  expect(Buffer.byteLength(pressureBody)).toBeGreaterThan(1024 * 1024);
+  await openPressure();
+  expect(detailRequests).toBe(1);
+  await pressure.getByRole("button", { name: "Collapse step trace" }).click();
+  await clipAnchor(pressure);
+  await settle();
+  const anchor = (await visible())[0];
+  expect(anchor.id).toBe(`msg-${pressureId}`);
+  expect(anchor.top).toBeLessThan(0);
+  await worker(page, "mobile panels").click();
+  await messages.getByText(/sheet 头部已经改好/).waitFor();
+  returning = true;
+  await wake.click();
+  await messages.getByText("Loading conversation…", { exact: true }).waitFor();
+  expect(await messages.locator("[data-loaded-messages]").count()).toBe(0);
+  expect(await pressure.count()).toBe(0);
+  resumeNewest!();
+  await loaded(historyIds.length);
+  await settle();
+  const restored = (await visible())[0];
+  expect(restored?.id).toBe(anchor.id);
+  expect(Math.abs(restored.top - anchor.top)).toBeLessThanOrEqual(3);
+  expect(cursors).toEqual([undefined, newestCursor]);
+  returning = false;
+  await openPressure();
+  expect(detailRequests).toBe(2);
 
   await page.reload();
-  await older.waitFor();
-  expect(await ids()).toEqual(newest);
-  expect(await transcript()).toEqual(beforeReconnect);
-
+  expectSameView(await newestVisible(), newest);
   await page.locator(".search-bar input").fill("History entry 0");
   await page.locator(".search-result-item", { hasText: "History entry 0" }).click();
   await messages.locator("#msg-journey-older-0.message-highlight").waitFor();

@@ -234,7 +234,13 @@ function collectToolChips(chipElements: Element[]): {
 
 function transcriptItems(scroller: Element): Element[] {
   const contents = directChild(scroller, "messages-content") ?? scroller;
-  return [...contents.children].filter((c) => !c.classList.contains("history-hint"));
+  return [...contents.children].flatMap((c) =>
+    c.hasAttribute("data-transcript-row")
+      ? [...c.children]
+      : c.classList.contains("history-hint") || c.getAttribute("aria-hidden") === "true"
+        ? []
+        : [c],
+  );
 }
 
 export function collectActiveTurn(root: ParentNode = document): ActiveTurnDiagnostics | undefined {

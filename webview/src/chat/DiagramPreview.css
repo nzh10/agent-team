@@ -55,6 +55,22 @@
   margin: 0 auto;
 }
 
+.diagram-reservation {
+  position: relative;
+}
+.diagram-reservation::before {
+  content: "";
+  display: block;
+  inline-size: var(--diagram-width);
+  block-size: var(--diagram-height);
+}
+.diagram-reservation .diagram-preview-status {
+  position: absolute;
+  inset: 4px 12px auto;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 .diagram-preview--mermaid text {
   fill: var(--text-primary) !important;
   font-family: var(--font-mono) !important;

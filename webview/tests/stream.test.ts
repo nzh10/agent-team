@@ -8,7 +8,11 @@ import {
   toolNameOf,
   toolSummary,
 } from "../src/state/stream";
-import { Message, StreamEvent } from "../src/state/useServer";
+import { Message, StreamEvent, type Workspace } from "../src/state/useServer";
+import {
+  INACTIVE_TRANSCRIPT_BUDGET,
+  retainInactiveTranscripts,
+} from "../src/state/transcriptRetention";
 import { splitEvents } from "../src/chat/events";
 
 const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
@@ -516,6 +520,51 @@ describe("mergeLatestPage", () => {
     expect(mergeLatestPage([at(1)], [newer])[0]).toEqual(newer);
   });
 });
+
+it(
+  "charges UTF-8 inactive prefixes by read order without splitting the protected suffix",
+  { tags: ["history-stress"] },
+  () => {
+    expect(INACTIVE_TRANSCRIPT_BUDGET).toBe(1_048_576);
+    const half = "界".repeat(180_000);
+    const row = (id: string, timestamp: number, patch: Partial<Message> = {}) =>
+      msg({ id, timestamp, status: "done", ...patch });
+    const floor = [
+      row("tie", 1),
+      row("prompt", 1, { kind: "user" }),
+      row("queued", 2, { kind: "user", status: "queued", queuedFor: "a", steering: true }),
+      row("live", 3, { status: "streaming", replyTo: "prompt" }),
+      row("last", 4, { content: half.repeat(2) }),
+    ];
+    const ws = (id: string, messages: Message[]): Workspace => ({
+      id,
+      name: id,
+      project: "p",
+      hostId: "h",
+      cwd: "/",
+      createdAt: 0,
+      agents: [],
+      messages,
+      messagesLoaded: true,
+    });
+    const older = {
+      ...ws("older", [row("prefix", 0, { content: half }), ...floor]),
+      loadingOlder: true,
+      queued: true,
+    };
+    const recent = ws("recent", [
+      row("nested", 0, { events: [ev("thinking", { content: half })] }),
+    ]);
+    const active = ws("active", [row("large", 0, { content: half.repeat(2) })]);
+    const order = [active.id, older.id, recent.id];
+    expect(retainInactiveTranscripts([recent, active], active.id, order)).toEqual([recent, active]);
+    expect(retainInactiveTranscripts([recent, active, older], active.id, order)).toEqual([
+      recent,
+      active,
+      { ...older, messages: floor, hasMore: true, loadingOlder: false },
+    ]);
+  },
+);
 
 describe("downgradedMessageIds", () => {
   it("names messages that had bodies and came back as summaries", () => {

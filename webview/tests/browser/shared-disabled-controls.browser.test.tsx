@@ -203,7 +203,9 @@ describe.each(["light", "dark"])("shared disabled controls in %s", (theme) => {
     // One input event: this tests disabling the field, not typing faster than its debounce.
     await path.fill("/repo");
     await expect.element(path).toHaveValue("/repo");
-    await expect.poll(() => list.mock.calls).toEqual([["/repo"]]);
+    // Focusing the enabled input may already have listed the empty prefix.
+    await expect.poll(() => list.mock.lastCall).toEqual(["/repo"]);
+    const requests = list.mock.calls.length;
 
     await gitless.click();
     await expectDisabledPaint(path, gitless, enabled);
@@ -211,7 +213,7 @@ describe.each(["light", "dark"])("shared disabled controls in %s", (theme) => {
     await path.click({ force: true });
     await userEvent.keyboard("ignored");
     await expect.element(path).toHaveValue("/repo");
-    expect(list).toHaveBeenCalledOnce();
+    expect(list).toHaveBeenCalledTimes(requests);
   });
 
   it("UsageDashboard excludes Granularity from long-window interaction", async () => {

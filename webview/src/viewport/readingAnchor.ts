@@ -5,7 +5,9 @@ export type ReadingPosition =
 export function rememberReadingPosition(el: HTMLElement, following: boolean): ReadingPosition {
   if (following) return { following: true };
   const top = el.getBoundingClientRect().top;
-  const items = el.querySelectorAll<HTMLElement>(".message[id]");
+  const items = el.querySelectorAll<HTMLElement>(
+    ".message[id], .system-message[id], .message-render-error[id]",
+  );
   // Rows are stacked in DOM order. Do not measure every row on scroll.
   let low = 0;
   let high = items.length;

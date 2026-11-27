@@ -12,6 +12,8 @@ const clickActions = [
   "panel.issues",
   "panel.close",
   "chat.jump_latest",
+  "chat.quote_jump",
+  "chat.diagram_preview",
   "sidebar.archive_toggle",
   "trace.step_toggle",
   "trace.subagent_toggle",

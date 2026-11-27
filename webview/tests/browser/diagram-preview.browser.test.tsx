@@ -5,6 +5,8 @@ import type {} from "@vitest/browser-playwright";
 import type { ReactNode } from "react";
 import { MdBlock } from "../../src/chat/markdown";
 import { sanitizeDiagramSvg } from "../../src/chat/diagramRender";
+import { DiagramCacheScope } from "../../src/chat/diagramCache";
+import { TranscriptChoiceScope } from "../../src/chat/transcriptChoices";
 import "../../src/styles.css";
 
 function Chat({ children, width }: { children: ReactNode; width?: number }) {
@@ -385,18 +387,68 @@ describe("diagram previews", () => {
     },
   );
 
+  it("uses separate SVG identities and reserves intrinsic size after cache eviction", async () => {
+    await page.viewport(390, 844);
+    const choices = new Map();
+    const source = fence("mermaid", "flowchart LR\nA[Start] --> B[Finish]");
+    const chat = (ids: string[], width = 350) => (
+      <DiagramCacheScope workspaceId="w">
+        <Chat width={width}>
+          {ids.map((id) => (
+            <TranscriptChoiceScope key={id} id={id} choices={choices}>
+              <MdBlock>{source}</MdBlock>
+            </TranscriptChoiceScope>
+          ))}
+        </Chat>
+      </DiagramCacheScope>
+    );
+    const view = render(chat(["a", "b"]));
+    const previews = () => [
+      ...view.container.querySelectorAll<HTMLElement>(".diagram-preview:has(svg)"),
+    ];
+    for (const button of view.getAllByRole("button", { name: "Preview diagram" }))
+      fireEvent.click(button);
+    await expect.poll(() => previews().length).toBe(2);
+    const ids = (element: HTMLElement) => [...element.querySelectorAll("[id]")].map((el) => el.id);
+    const firstIds = new Set(ids(previews()[0]));
+    expect(previews()[0].querySelector("marker[id]")).not.toBeNull();
+    expect(ids(previews()[1]).filter((id) => firstIds.has(id))).toEqual([]);
+    const height = previews()[0].offsetHeight;
+    for (const id of ["c", "d", "e", "f"]) {
+      view.rerender(chat([id]));
+      fireEvent.click(view.getByRole("button", { name: "Preview diagram" }));
+      await preview(view.container);
+    }
+    view.rerender(chat(["a"], 300));
+    expect(view.container.querySelector<HTMLElement>(".diagram-reservation")?.offsetHeight).toBe(
+      height,
+    );
+    expect(view.container.querySelector("pre")?.hidden).toBe(true);
+    await expect.poll(() => previews()[0]?.offsetHeight).toBe(height);
+  });
+
   it.each(["light", "dark"])(
     "keeps wide previews inside a 390px touch viewport and scrolls them locally (%s)",
     { timeout: 25_000 },
     async (theme) => {
       document.documentElement.dataset.theme = theme;
       await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: true });
-      await page.viewport(390, 700);
+      await page.viewport(390, 844);
       expect(matchMedia("(hover: none)").matches).toBe(true);
       const source = `flowchart LR\n${Array.from({ length: 9 }, (_, i) => `N${i}[Node ${i}]`).join(" --> ")}`;
-      const { container, getByRole } = render(
-        <Chat width={350}>{<MdBlock>{fence("mermaid", source)}</MdBlock>}</Chat>,
+      const choices = new Map();
+      const chat = (mounted: boolean, width = 350, workspaceId = "w") => (
+        <DiagramCacheScope workspaceId={workspaceId}>
+          <Chat width={width}>
+            {mounted && (
+              <TranscriptChoiceScope id="row" choices={choices}>
+                <MdBlock>{fence("mermaid", source)}</MdBlock>
+              </TranscriptChoiceScope>
+            )}
+          </Chat>
+        </DiagramCacheScope>
       );
+      const { container, getByRole, rerender } = render(chat(true));
       const toggle = getByRole("button", { name: "Preview diagram" });
       const copy = getByRole("button", { name: "Copy" });
       expect(getComputedStyle(toggle).opacity).toBe("1");
@@ -422,6 +474,18 @@ describe("diagram previews", () => {
       rendered.scrollLeft = 100;
       expect(rendered.scrollLeft).toBeGreaterThan(0);
       expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+      const svg = rendered.innerHTML;
+      rerender(chat(false, 300));
+      expect(container.querySelector("svg")).toBeNull();
+      rerender(chat(true, 300));
+      expect(container.querySelector(".diagram-preview")?.innerHTML).toBe(svg);
+      expect(container.querySelector("pre")?.hidden).toBe(true);
+      expect(container.querySelector(".diagram-preview-status")).toBeNull();
+      rerender(chat(false, 300, "other"));
+      rerender(chat(true));
+      expect(container.querySelector(".diagram-preview svg")).toBeNull();
+      expect(container.querySelector("pre")?.hidden).toBe(false);
+      await preview(container);
     },
   );
 });

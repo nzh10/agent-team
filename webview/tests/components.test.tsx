@@ -4,6 +4,10 @@ import { SubAgentItem, StepGroup, MessageItem, CreateWorkspaceDialog } from "../
 import { HostInfo } from "../src/state/useServer";
 import { StreamEvent, Message, AgentInfo } from "../src/state/useServer";
 import { applyEventsToMessage } from "../src/state/stream";
+import { readTracePage } from "../../shared/subagent-trace";
+import { MessageBoundary } from "../src/chat/messages";
+import { SubagentTraceContext } from "../src/chat/subagentTrace";
+import { TranscriptChoiceScope } from "../src/chat/transcriptChoices";
 
 const sa = (over: Partial<NonNullable<StreamEvent["subagent"]>> = {}): StreamEvent => ({
   kind: "subagent_start",
@@ -39,6 +43,39 @@ describe("SubAgentItem", () => {
     expect(container.querySelector(".subagent-details")).toBeNull();
   });
 
+  it("does not copy a positional action's expanded state to an earlier trace page", () => {
+    const events = ["Earlier", "Latest"].map((name) => ({
+      kind: "tool_use",
+      toolName: "mcp__panel__report_progress",
+      content: `Progress: ${name}`,
+      toolResult: `${name} result`,
+    }));
+    const ev = sa({ status: "completed" });
+    const trace = [{ ...ev, subagent: { ...ev.subagent!, events } }];
+    const scope: NonNullable<React.ContextType<typeof SubagentTraceContext>> = {
+      workspaceId: "ws",
+      epoch: 1,
+      requestPage: ({ taskId }, window, receive) => {
+        receive(readTracePage(1, trace, taskId, { ...window, limit: 1 }));
+        return () => {};
+      },
+    };
+    const view = render(
+      <TranscriptChoiceScope id="reply" choices={new Map()}>
+        <SubagentTraceContext value={scope}>
+          <SubAgentItem ev={ev} messageId="reply" />
+        </SubagentTraceContext>
+      </TranscriptChoiceScope>,
+    );
+    const click = (name: string | RegExp) => fireEvent.click(view.getByRole("button", { name }));
+    click(/Expand subagent/);
+    click("more");
+    expect(view.getByText("Latest result")).toBeTruthy();
+    click("Earlier");
+    expect(view.queryByText("Earlier result")).toBeNull();
+    expect(view.getByRole("button", { name: "more" })).toBeTruthy();
+  });
+
   it("shows a cancel button while running and reports the taskId", () => {
     const onCancel = vi.fn();
     const { container, getByTitle } = render(
@@ -57,6 +94,20 @@ describe("SubAgentItem", () => {
     );
     expect(container.querySelector(".btn-cancel-subagent")).toBeNull();
   });
+});
+
+it("lets a failed transcript row receive programmatic jump focus", () => {
+  using _log = vi.spyOn(console, "error").mockImplementation(() => {});
+  function Broken(): never {
+    throw new Error("failed transcript row");
+  }
+  render(
+    <MessageBoundary messageId="broken">
+      <Broken />
+    </MessageBoundary>,
+  );
+  document.getElementById("msg-broken")!.focus();
+  expect(document.activeElement?.id).toBe("msg-broken");
 });
 
 describe("StepGroup", () => {

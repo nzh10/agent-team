@@ -25,7 +25,15 @@ import {
   splitFileRef,
 } from "./fileRef";
 import { codeText, copyText } from "./clipboard";
-import { DiagramPreview, diagramLanguage, diagramSource } from "./DiagramPreview";
+import {
+  DiagramPreview,
+  diagramLanguage,
+  diagramSource,
+  useDiagramPreview,
+  type DiagramLanguage,
+} from "./DiagramPreview";
+
+const DiagramSlot = createContext("");
 
 export function CopyButton({ text }: { text: () => string }) {
   const [copied, setCopied] = useState(false);
@@ -45,30 +53,49 @@ export function CopyButton({ text }: { text: () => string }) {
   );
 }
 
-export function CodeBlock({ children, node: _node, ...rest }: ComponentProps<"pre"> & ExtraProps) {
-  const preRef = useRef<HTMLPreElement>(null);
-  const [previewing, setPreviewing] = useState(false);
-  const language = diagramLanguage(children);
-  const source = language ? diagramSource(children) : "";
-  const text = () => {
-    const code = preRef.current?.querySelector("code");
-    return code ? codeText(code) : "";
-  };
-  // The button sits outside the <pre>: inside, it scrolled away with a wide
-  // block's lines.
+type PreProps = ComponentProps<"pre">;
+
+function copyCode(pre: HTMLPreElement | null) {
+  const code = pre?.querySelector("code");
+  return code ? codeText(code) : "";
+}
+
+function DiagramCodeBlock({
+  language,
+  offset,
+  children,
+  ...rest
+}: PreProps & {
+  language: DiagramLanguage;
+  offset?: number;
+}) {
+  const pre = useRef<HTMLPreElement>(null);
+  const slot = useContext(DiagramSlot);
+  const view = useDiagramPreview(language, diagramSource(children), slot, offset);
   return (
     <div className="code-block">
-      {language ? (
-        <DiagramPreview
-          language={language}
-          source={source}
-          onPreviewChange={setPreviewing}
-          copy={<CopyButton text={text} />}
-        />
-      ) : (
-        <CopyButton text={text} />
-      )}
-      <pre {...rest} ref={preRef} hidden={language !== null && previewing}>
+      <DiagramPreview {...view} copy={<CopyButton text={() => copyCode(pre.current)} />} />
+      <pre {...rest} ref={pre} hidden={!!(view.display || view.box)}>
+        {children}
+      </pre>
+    </div>
+  );
+}
+
+export function CodeBlock({ children, node, ...rest }: PreProps & ExtraProps) {
+  const pre = useRef<HTMLPreElement>(null);
+  const language = diagramLanguage(children);
+  if (language)
+    return (
+      <DiagramCodeBlock {...rest} language={language} offset={node?.position?.start.offset}>
+        {children}
+      </DiagramCodeBlock>
+    );
+  // The button sits outside the <pre>: inside, it scrolled away with a wide block's lines.
+  return (
+    <div className="code-block">
+      <CopyButton text={() => copyCode(pre.current)} />
+      <pre {...rest} ref={pre}>
         {children}
       </pre>
     </div>
@@ -517,8 +544,8 @@ function useMathPlugins(needed: boolean): MathPlugins | null {
 // Markdown parsing + highlighting is the hottest path during streaming.
 // Memoized so a re-render only re-parses blocks whose text actually changed
 // (inline plugin arrays would defeat react-markdown's own memoization).
-type MdBlockProps = { children: string; thinking?: boolean };
-export const MdBlock = memo(function MdBlock({ children, thinking }: MdBlockProps) {
+type MdBlockProps = { children: string; thinking?: boolean; diagramSlot?: string };
+export const MdBlock = memo(function MdBlock({ children, thinking, diagramSlot }: MdBlockProps) {
   const { text, hasMath } = useMemo(() => prepareSource(children, thinking), [children, thinking]);
   const math = useMathPlugins(hasMath);
   const resolveImage = useContext(ImagePathContext);
@@ -544,7 +571,7 @@ export const MdBlock = memo(function MdBlock({ children, thinking }: MdBlockProp
         : remark,
     [refs, paths, remark],
   );
-  return (
+  const block = (
     <Markdown
       remarkPlugins={remarkPlugins}
       rehypePlugins={math?.rehype ?? mdRehypePlugins}
@@ -554,6 +581,7 @@ export const MdBlock = memo(function MdBlock({ children, thinking }: MdBlockProp
       {text}
     </Markdown>
   );
+  return diagramSlot ? <DiagramSlot value={diagramSlot}>{block}</DiagramSlot> : block;
 });
 
 // Text written as markdown (a task, an objective's title or goal) shown in
@@ -708,7 +736,9 @@ export function StreamingMdBlock({ children, thinking }: MdBlockProps) {
       {markdownBlocks(children).map((block, i) => (
         <Fragment key={i}>
           {i > 0 && "\n"}
-          <MdBlock thinking={thinking}>{block}</MdBlock>
+          <MdBlock thinking={thinking} diagramSlot={i ? `chunk:${i}` : undefined}>
+            {block}
+          </MdBlock>
         </Fragment>
       ))}
     </>

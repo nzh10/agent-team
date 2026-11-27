@@ -1123,7 +1123,8 @@ describe("live thinking", () => {
     expect(box().querySelector(".live-thinking > .event-row")).toBeNull();
     expect(box().querySelector(".live-thinking")!.textContent).toBe("Let me see.");
     void act(() => vi.advanceTimersByTime(1_000));
-    expect(header.textContent).toBe("▾Thinking · 1s");
+    expect(header.querySelector("button")?.getAttribute("aria-expanded")).toBe("true");
+    expect(header.textContent).toContain("Thinking · 1s");
     expect(container.textContent.match(/Thinking · 1s/g)).toHaveLength(1);
     expect(container.querySelector(".turn-footer")).toBeNull();
     fireEvent.click(box().querySelector(".step-header")!);

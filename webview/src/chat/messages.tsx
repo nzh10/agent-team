@@ -27,6 +27,11 @@ import { copySelectionAsMarkdown } from "./clipboard";
 import { CodeBlock, CopyButton, FileRefCode, MdBlock, StreamingMdBlock } from "./markdown";
 import { FileOpenContext } from "./fileRef";
 import { LocalDayContext, parseLocalDayKey } from "./localDay";
+import {
+  TranscriptChoiceScope,
+  useResetTranscriptChoices,
+  useTranscriptChoice,
+} from "./transcriptChoices";
 import { DEFAULT_USER } from "../state/useServer";
 import { AgentAvatar, Avatar, isImageAvatar } from "../workspace/avatar";
 import {
@@ -112,7 +117,7 @@ export const BannerItem = memo(function BannerItem({
   // Summary pages cap banner bodies; opening one fetches the full message.
   onLoadDetails?: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useTranscriptChoice<boolean>("banner", false);
   const level =
     ev.kind === "compact"
       ? "compact"
@@ -217,7 +222,7 @@ export const PanelActionItem = memo(function PanelActionItem({
   action: string;
   onLoadDetails?: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useTranscriptChoice<boolean>("action", false);
   const links = useContext(SessionLinkContext);
   const { head, quote } = actionParts(ev.content);
   const failed = !!ev.toolResultIsError;
@@ -428,8 +433,8 @@ export const EventItem = memo(function EventItem({
   // bodies get fetched.
   onLoadDetails?: () => void;
 }) {
-  const [resultOpen, setResultOpen] = useState(false);
-  const [bodyOpen, setBodyOpen] = useState(false);
+  const [resultOpen, setResultOpen] = useTranscriptChoice<boolean>("tool-result", false);
+  const [bodyOpen, setBodyOpen] = useTranscriptChoice<boolean>("tool-body", false);
   const resultFold = useBottomCollapse(resultOpen, () => setResultOpen(false));
   const bodyFold = useBottomCollapse(bodyOpen, () => setBodyOpen(false));
   const summarized = !!onLoadDetails;
@@ -601,7 +606,7 @@ export const EventItem = memo(function EventItem({
           {hasResult && resultOpen && ev.toolResult != null && (
             <div className="event-content event-result">
               {ev.toolResultIsMarkdown ? (
-                <MdBlock>{ev.toolResult}</MdBlock>
+                <MdBlock diagramSlot="result">{ev.toolResult}</MdBlock>
               ) : (
                 <CodeBlock>
                   <code>{ev.toolResult}</code>
@@ -708,6 +713,7 @@ type TraceScope = {
   revision: number;
 };
 const ROOT_TRACE_PATH: readonly string[] = [];
+const LATEST_TRACE_PAGE: Pick<TraceWindow, "cursor" | "direction"> = {};
 
 export const SubAgentItem = memo(function SubAgentItem({
   ev,
@@ -720,8 +726,13 @@ export const SubAgentItem = memo(function SubAgentItem({
   traceParent?: TraceScope;
   onCancel?: (taskId: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const bottom = useBottomCollapse(open, () => setOpen(false));
+  const [open, setOpen] = useTranscriptChoice<boolean>("subagent", false);
+  const reset = useResetTranscriptChoices();
+  const close = () => {
+    reset("trace");
+    setOpen(false);
+  };
+  const bottom = useBottomCollapse(open, close);
   const sa = ev.subagent;
   const parentPath = traceParent?.path;
   const taskId = sa?.taskId;
@@ -746,7 +757,7 @@ export const SubAgentItem = memo(function SubAgentItem({
         className="subagent-header"
         ref={bottom.header}
         {...telemetryTarget("trace.subagent_toggle")}
-        onClick={() => setOpen((value) => !value)}
+        onClick={open ? close : () => setOpen(true)}
       >
         <button
           type="button"
@@ -756,7 +767,9 @@ export const SubAgentItem = memo(function SubAgentItem({
           {...telemetryTarget("trace.subagent_toggle")}
           aria-label={`${open ? "Collapse" : "Expand"} subagent: ${role}`}
         >
-          {open ? "▾" : "▸"}
+          <span className="trace-caret" aria-hidden="true">
+            ▸
+          </span>
         </button>
         <span className={`subagent-status-icon subagent-icon-${status}`} title={status}>
           {SUBAGENT_STATUS_ICONS[status]}
@@ -822,7 +835,10 @@ function SubagentDetails({ scope, onCollapse }: { scope: TraceScope; onCollapse:
     () => (workspaceId && messageId ? { workspaceId, messageId, taskId: rootTaskId } : null),
     [workspaceId, messageId, rootTaskId],
   );
-  const [cursor, setCursor] = useState<Pick<TraceWindow, "cursor" | "direction">>({});
+  const [cursor, setCursor] = useTranscriptChoice<Pick<TraceWindow, "cursor" | "direction">>(
+    "trace-page",
+    LATEST_TRACE_PAGE,
+  );
   const window = useMemo(() => ({ ...cursor, ...(path.length ? { path } : {}) }), [cursor, path]);
   const { page, isNavigating, timedOut } = useTracePage(connection, target, window, revision);
   const projection = useMemo(() => {
@@ -843,7 +859,7 @@ function SubagentDetails({ scope, onCollapse }: { scope: TraceScope; onCollapse:
               ? "Trace is unavailable."
               : null;
   const usage = page?.usage;
-  const reset = () => setCursor({});
+  const reset = () => setCursor(LATEST_TRACE_PAGE);
   return (
     <div className="subagent-details subagent-body">
       {loading && (
@@ -917,22 +933,28 @@ function SubagentDetails({ scope, onCollapse }: { scope: TraceScope; onCollapse:
             <div className="subagent-events">
               {projection.blocks.flatMap((block, i) =>
                 block.kind === "steps"
-                  ? block.events.map((ev) => (
-                      <EventItem key={`step:${page.start + projection.indexes.get(ev)!}`} ev={ev} />
-                    ))
+                  ? block.events.map((ev) => {
+                      const key = `trace:${page.start + projection.indexes.get(ev)!}`;
+                      return (
+                        <TranscriptChoiceScope key={key} id={key}>
+                          <EventItem ev={ev} />
+                        </TranscriptChoiceScope>
+                      );
+                    })
                   : [
-                      <TimelineBlockItem
-                        key={timelineBlockKey(block, i)}
-                        block={block}
-                        traceParent={scope}
-                      />,
+                      <TranscriptChoiceScope
+                        key={`trace:${page.start}:${timelineBlockKey(block, i)}`}
+                        id={`trace:${page.start}:${timelineBlockKey(block, i)}`}
+                      >
+                        <TimelineBlockItem block={block} traceParent={scope} />
+                      </TranscriptChoiceScope>,
                     ],
               )}
             </div>
           )}
           {page.result && (
             <div className="subagent-summary">
-              <MdBlock>{page.result}</MdBlock>
+              <MdBlock diagramSlot="result">{page.result}</MdBlock>
             </div>
           )}
           {usage && (
@@ -1059,23 +1081,37 @@ function StepBox({
   onLoadDetails?: () => void;
   defaultOpen?: boolean;
 }) {
-  const [toggled, setToggled] = useState<boolean | null>(null);
+  const [toggled, setToggled] = useTranscriptChoice<boolean | null>("steps", null);
+  const reset = useResetTranscriptChoices();
   const hasBody = !!live?.trim() || events.some(hasVisibleEventBody);
   const open = hasBody && (toggled ?? defaultOpen);
-  const bottom = useBottomCollapse(open, () => setToggled(false));
+  const close = () => {
+    reset("step:");
+    setToggled(false);
+  };
+  const bottom = useBottomCollapse(open, close);
   if (events.length === 0 && live == null && liveSince == null) return null;
   const toggle = () => {
-    if (!open) onLoadDetails?.();
-    setToggled(!open);
+    if (open) close();
+    else {
+      onLoadDetails?.();
+      setToggled(true);
+    }
   };
   const tools = stepTools(events);
   const items = open
-    ? events.map((ev, i) => <EventItem key={i} ev={ev} onLoadDetails={onLoadDetails} />)
+    ? events.map((ev, i) => (
+        <TranscriptChoiceScope key={i} id={`step:${i}`}>
+          <EventItem ev={ev} onLoadDetails={onLoadDetails} />
+        </TranscriptChoiceScope>
+      ))
     : [];
   // The persisted event takes the same slot, preserving state inside its Markdown body.
   if (open && live != null) {
     items.push(
-      <EventItem key={events.length} ev={{ kind: "thinking", content: live }} liveThinking />,
+      <TranscriptChoiceScope key={events.length} id={`step:${events.length}`}>
+        <EventItem ev={{ kind: "thinking", content: live }} liveThinking />
+      </TranscriptChoiceScope>,
     );
   }
   return (
@@ -1095,7 +1131,9 @@ function StepBox({
             {...telemetryTarget("trace.step_toggle")}
             aria-label={open ? "Collapse steps" : "Expand steps"}
           >
-            {open ? "▾" : "▸"}
+            <span className="trace-caret" aria-hidden="true">
+              ▸
+            </span>
           </button>
         ) : (
           <span className="trace-header-placeholder" aria-hidden="true" />
@@ -1156,24 +1194,26 @@ function StepTimeline({
       {blocks.map((block, i) => {
         if (block.kind === "steps") {
           return (
-            <StepBox
-              key={`s${i}`}
-              events={block.events}
-              live={i === blocks.length - 1 ? live : undefined}
-              liveSince={i === blocks.length - 1 ? liveSince : undefined}
-              onLoadDetails={onLoadDetails}
-              defaultOpen={defaultOpen}
-            />
+            <TranscriptChoiceScope key={`s${i}`} id={`steps:${i}`}>
+              <StepBox
+                events={block.events}
+                live={i === blocks.length - 1 ? live : undefined}
+                liveSince={i === blocks.length - 1 ? liveSince : undefined}
+                onLoadDetails={onLoadDetails}
+                defaultOpen={defaultOpen}
+              />
+            </TranscriptChoiceScope>
           );
         }
         return (
-          <TimelineBlockItem
-            key={timelineBlockKey(block, i)}
-            block={block}
-            messageId={messageId}
-            onCancelSubagent={onCancelSubagent}
-            onLoadDetails={onLoadDetails}
-          />
+          <TranscriptChoiceScope key={timelineBlockKey(block, i)} id={timelineBlockKey(block, i)}>
+            <TimelineBlockItem
+              block={block}
+              messageId={messageId}
+              onCancelSubagent={onCancelSubagent}
+              onLoadDetails={onLoadDetails}
+            />
+          </TranscriptChoiceScope>
         );
       })}
     </>
@@ -1311,7 +1351,11 @@ export class MessageBoundary extends Component<
   }
   render(): ReactNode {
     if (this.state.failed) {
-      return <div className="message-render-error">This message could not be rendered.</div>;
+      return (
+        <div id={`msg-${this.props.messageId}`} className="message-render-error" tabIndex={-1}>
+          This message could not be rendered.
+        </div>
+      );
     }
     return this.props.children;
   }
@@ -1442,7 +1486,7 @@ export const MessageItem = memo(function MessageItem({
   if (msg.kind === "system") {
     const [avatar, text] = systemAvatar(msg.content);
     return (
-      <div className="system-message">
+      <div id={`msg-${msg.id}`} className="system-message" tabIndex={-1}>
         {avatar && <img className="system-avatar" src={avatar} alt="" />}
         <div className="system-message-body">
           <MdBlock>{text}</MdBlock>
@@ -1666,6 +1710,7 @@ export const MessageItem = memo(function MessageItem({
                 {...(jump && {
                   type: "button" as const,
                   title: "Jump to quoted message",
+                  ...telemetryTarget("chat.quote_jump"),
                   "aria-label": `Jump to quoted message from ${forward.fromAgent}: ${forward.preview}`,
                   onClick: () => jump(forward.messageId),
                 })}
@@ -1704,22 +1749,24 @@ export const MessageItem = memo(function MessageItem({
                   <div className="message-content" onCopy={copySelectionAsMarkdown}>
                     {segments.map((seg, si) => (
                       <div key={si}>
-                        {seg.text &&
-                          (streaming ? (
-                            <StreamingMdBlock>{seg.text}</StreamingMdBlock>
-                          ) : (
-                            <MdBlock>{seg.text}</MdBlock>
-                          ))}
-                        {(seg.events.length > 0 || si === tailAt) && (
-                          <StepTimeline
-                            blocks={si === tailAt ? tailBlocks : timelineBlocks(seg.events)}
-                            messageId={msg.id}
-                            onCancelSubagent={handleCancelSubagent}
-                            onLoadDetails={handleLoadDetails}
-                            live={si === tailAt ? liveBlock : undefined}
-                            liveSince={si === tailAt ? headerLiveSince : undefined}
-                          />
-                        )}
+                        <TranscriptChoiceScope id={`segment:${si}`}>
+                          {seg.text &&
+                            (streaming ? (
+                              <StreamingMdBlock>{seg.text}</StreamingMdBlock>
+                            ) : (
+                              <MdBlock>{seg.text}</MdBlock>
+                            ))}
+                          {(seg.events.length > 0 || si === tailAt) && (
+                            <StepTimeline
+                              blocks={si === tailAt ? tailBlocks : timelineBlocks(seg.events)}
+                              messageId={msg.id}
+                              onCancelSubagent={handleCancelSubagent}
+                              onLoadDetails={handleLoadDetails}
+                              live={si === tailAt ? liveBlock : undefined}
+                              liveSince={si === tailAt ? headerLiveSince : undefined}
+                            />
+                          )}
+                        </TranscriptChoiceScope>
                       </div>
                     ))}
                   </div>

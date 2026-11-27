@@ -13,6 +13,21 @@ import {
 
 import { FakeSocket } from "./fakeSocket";
 
+// Observe App's own client cache: most loaded rows are intentionally not mounted.
+let clientWorkspaces: Workspace[];
+vi.mock(import("../src/state/useServer"), async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    useServer: () => {
+      const server = actual.useServer();
+      clientWorkspaces = server.workspaces;
+      return server;
+    },
+  };
+});
+const transcript = () => clientWorkspaces.find((w) => w.id === "w1")!;
+
 class ReactSocket extends FakeSocket {
   override receive(frame: unknown) {
     act(() => super.receive(frame));
@@ -139,6 +154,7 @@ beforeEach(() => {
   sessionStorage.clear();
   Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
   FakeSocket.instances = [];
+  clientWorkspaces = [];
   vi.stubGlobal("WebSocket", ReactSocket);
   scrollIntoView = vi.fn<(arg?: boolean | ScrollIntoViewOptions) => void>();
   Element.prototype.scrollIntoView = scrollIntoView as unknown as Element["scrollIntoView"];
@@ -272,14 +288,14 @@ describe("UI telemetry middleware", { tags: ["app-detail"] }, () => {
     ]);
   });
 
-  it("records user dispatch once and excludes automatic quota, paging, and trace hydration", () => {
+  it("records older-page requests and user dispatch once, without logging hydration", () => {
     const record = vi.spyOn(telemetry, "recordTelemetry");
     const { result } = renderHook(useServer);
     const sock = FakeSocket.instances.at(-1)!;
     openSocket(sock, [AGENT]);
     act(() => {
       result.current.refreshQuota(false, ["provider"]);
-      result.current.loadMessages("w1", 123);
+      result.current.loadMessages("w1");
       result.current.markSeen("w1");
       result.current.requestSubagentTrace(
         { workspaceId: "w1", messageId: "message-private", taskId: "task-private" },
@@ -289,6 +305,7 @@ describe("UI telemetry middleware", { tags: ["app-detail"] }, () => {
     });
     expect(record).not.toHaveBeenCalled();
     act(() => {
+      result.current.loadMessages("w1", 0);
       result.current.refreshQuota(true, ["provider"]);
       result.current.loadMessageDetails("w1", "message-private");
       result.current.archiveWorkspace("w1");
@@ -297,6 +314,7 @@ describe("UI telemetry middleware", { tags: ["app-detail"] }, () => {
     });
     expect(sock.frames().filter(({ type }) => type === "interrupt")).toHaveLength(2);
     expect(record.mock.calls).toEqual([
+      ["chat.history_page"],
       ["quota.refresh"],
       ["trace.load_details"],
       ["workspace.archive"],
@@ -684,8 +702,11 @@ describe("search jumps against the server's paging", () => {
     frame();
   }
 
-  const renderedIds = () =>
-    [...document.querySelectorAll("[id^=msg-]")].map((e) => e.id.slice("msg-".length));
+  function expectHistory(all: Message[], hit: Message) {
+    expect(document.querySelector(`#msg-${hit.id}.message-highlight`)).not.toBeNull();
+    expect(document.querySelectorAll("[data-transcript-row]").length).toBeLessThanOrEqual(45);
+    expect(transcript().messages.map((m) => m.id)).toEqual(all.map((m) => m.id));
+  }
 
   it(
     "reaches an old hit through tie groups split across pages, with no gap or duplicate",
@@ -699,8 +720,8 @@ describe("search jumps against the server's paging", () => {
       answerAll(sock, () => all);
       searchAndOpen(sock, all[5]);
       answerAll(sock, () => all);
-      expect(renderedIds()).toEqual(all.map((m) => m.id));
-      expect(document.querySelector("#msg-m5")!.classList).toContain("message-highlight");
+      expectHistory(all, all[5]);
+      expect(FakeSocket.instances).toEqual([sock]);
     },
   );
 
@@ -718,6 +739,11 @@ describe("search jumps against the server's paging", () => {
     );
     first.drop();
     all = [...all, ...Array.from({ length: 100 }, (_, i) => message(150 + i, 1150 + i))];
+    all[249] = {
+      ...all[249],
+      kind: "user",
+      forwardRef: { messageId: "m3", fromAgent: "Agent", fromAvatar: "A", preview: "Early reply" },
+    };
     act(() => {
       vi.advanceTimersByTime(2_000);
     });
@@ -732,8 +758,108 @@ describe("search jumps against the server's paging", () => {
         .map((f) => f.before ?? null),
     ).toEqual([null, 1100]);
     answerAll(next, () => all);
-    expect(renderedIds()).toEqual(all.map((m) => m.id));
+    expectHistory(all, all[10]);
+    expect(FakeSocket.instances).toEqual([first, next]);
+
+    const jumpLatest = () => {
+      const latest = document.querySelector<HTMLButtonElement>(".jump-latest")!;
+      latest.focus();
+      fireEvent.click(latest);
+      expect(document.getElementById("msg-m249")).not.toBeNull();
+      expect(document.getElementById("msg-m3")).toBeNull();
+    };
+    jumpLatest();
+    // The quoted row is loaded but unmounted. Mount and focus it without paging.
+    const before = next.frames().length;
+    using record = vi.spyOn(telemetry, "recordTelemetry");
+    fireEvent.click(document.querySelector("#msg-m249 .forward-ref")!);
+    expect(record.mock.calls).toEqual([["chat.quote_jump"]]);
+    expectHistory(all, all[3]);
+    expect(document.activeElement?.id).toBe("msg-m3");
+    expect(next.frames()).toHaveLength(before);
+    jumpLatest();
   });
+});
+
+it("reloads the newest page on sidebar return after a late detail evicts inactive history", () => {
+  const large = "界".repeat(Math.ceil(1_048_576 / 3));
+  const message: Message = {
+    ...settled(0),
+    timestamp: 0,
+    detail: "summary",
+    events: [{ kind: "thinking", content: "", contentLength: large.length }],
+  };
+  const newest = {
+    type: "workspace_messages",
+    workspaceId: "w1",
+    before: null,
+    messages: [message],
+    hasMore: true,
+  };
+  const detail = {
+    type: "message_details",
+    workspaceId: "w1",
+    messageId: message.id,
+    events: [{ kind: "thinking", content: large }],
+  };
+  const sock = boot([message], { hasMore: true, others: ["w2"] });
+  const openStep = () => {
+    fireEvent.click(document.querySelector(".step-header")!);
+    expect(sock.frames().at(-1)).toEqual({
+      type: "load_message_details",
+      workspaceId: "w1",
+      messageId: message.id,
+    });
+  };
+  openStep();
+  fireEvent.scroll(document.querySelector(".messages")!, { target: { scrollTop: 10 } });
+  expect(sock.frames().at(-1)).toMatchObject({
+    type: "load_messages",
+    workspaceId: "w1",
+    before: 0,
+  });
+  expect(transcript().loadingOlder).toBe(true);
+
+  selectWorkspace("w2");
+  sock.receive({ type: "workspace_attention", workspaceId: "w1", unread: 2, lastResult: "done" });
+  expect(transcript()).toMatchObject({ messagesLoaded: true, messages: [message] });
+  sock.receive(detail);
+  const evicted = {
+    messages: [],
+    messagesLoaded: false,
+    hasMore: false,
+    loadingOlder: false,
+    unread: 2,
+    lastResult: "done",
+  };
+  expect(transcript()).toMatchObject(evicted);
+  const older = {
+    ...newest,
+    before: 0,
+    hasMore: false,
+    messages: [{ ...settled(-1), timestamp: -1 }, message],
+  };
+  for (const reply of [older, detail, older, detail]) {
+    sock.receive(reply);
+    expect(transcript()).toMatchObject(evicted);
+  }
+
+  selectWorkspace("w");
+  expect(sock.frames().at(-1)).toEqual({ type: "load_messages", workspaceId: "w1", limit: 50 });
+  expect(document.getElementById(`msg-${message.id}`)).toBeNull();
+  sock.receive(newest);
+  expect(transcript()).toMatchObject({
+    messagesLoaded: true,
+    messages: [message],
+    hasMore: true,
+    unread: 2,
+    lastResult: "done",
+  });
+  expect(document.getElementById(`msg-${message.id}`)).not.toBeNull();
+  openStep();
+  sock.receive(detail);
+  expect(transcript().messages[0].events?.[0].content).toBe(large);
+  expect(FakeSocket.instances).toEqual([sock]);
 });
 
 describe("files panel", { tags: ["app-detail"] }, () => {

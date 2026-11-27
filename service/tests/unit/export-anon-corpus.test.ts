@@ -96,7 +96,10 @@ it("reads cache and SQLite rows without rewriting them and validates the committ
     telemetry.exec(`CREATE TABLE ui_events (id, ts, tab_run_id, layout, action, outcome);
       INSERT INTO ui_events VALUES (1, 10, 'tab-secret', 'wide', 'workspace.switch', 'trigger'),
         (2, 20, 'tab-secret', 'wide', 'chat.send', 'trigger'),
-        (3, 30, 'different-secret', 'wide', 'chat.send', 'trigger');`);
+        (3, 30, 'tab-secret', 'wide', 'chat.quote_jump', 'trigger'),
+        (4, 40, 'tab-secret', 'wide', 'chat.history_page', 'trigger'),
+        (5, 50, 'tab-secret', 'wide', 'chat.diagram_preview', 'trigger'),
+        (6, 60, 'different-secret', 'wide', 'chat.send', 'trigger');`);
     const output = exportCorpus(base, [0], [[0, 0]]);
     expect(output).not.toContain("secret");
     expect(JSON.parse(output)).toMatchObject({
@@ -104,10 +107,22 @@ it("reads cache and SQLite rows without rewriting them and validates the committ
       telemetry: [
         { ts: 10, action: "workspace.switch" },
         { ts: 20, action: "chat.send" },
+        { ts: 30, action: "chat.quote_jump" },
+        { ts: 40, action: "chat.history_page" },
+        { ts: 50, action: "chat.diagram_preview" },
       ],
     });
     const journey = projectJourney(JSON.parse(output) as AnonCorpus);
-    expect(journey).toEqual({ actions: ["workspace.switch", "chat.send"], history: [["agent"]] });
+    expect(journey).toEqual({
+      actions: [
+        "workspace.switch",
+        "chat.send",
+        "chat.quote_jump",
+        "chat.history_page",
+        "chat.diagram_preview",
+      ],
+      history: [["agent"]],
+    });
     assertJourneyCorpus(JSON.parse(JSON.stringify(journey)));
     expect(readFileSync(metadataFile, "utf8")).toBe(metadata);
     expect(() => exportCorpus(base, [0], [[0, 9]])).toThrow("Selected message missing");

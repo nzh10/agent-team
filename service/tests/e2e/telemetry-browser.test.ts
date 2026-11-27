@@ -7,7 +7,12 @@ import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
 import { seedDemo } from "../../../scripts/seed-demo";
 import { Server } from "../../src/server/server";
 import type { TelemetryStore } from "../../src/storage/telemetry";
-import { closeHistory } from "../../src/workspace/state";
+import {
+  closeHistory,
+  loadAll,
+  loadWorkspaceMessages,
+  saveWorkspace,
+} from "../../src/workspace/state";
 
 async function dispose(
   dir: string,
@@ -140,13 +145,38 @@ it.each([true, false])(
   60_000,
 );
 
-it("counts a real workspace switch, chat file preview and explicit Files opening separately", async () => {
+it("counts transcript and panel actions without recording destinations", async () => {
   ensureWebviewBuilt();
   const dir = mkdtempSync(join(tmpdir(), "yaat-telemetry-browser-"));
   let server: Server | undefined;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   try {
     const seeded = seedDemo(dir, { quiet: true, writeConfig: true });
+    const archived = loadAll(dir).find(({ id }) => id === seeded.workspaces.past)!;
+    const history = loadWorkspaceMessages(dir, archived.id);
+    const last = history.at(-1)!;
+    const older = Array.from({ length: 50 }, (_, i) => ({
+      id: `telemetry-history-${i}`,
+      kind: "user" as const,
+      status: "done" as const,
+      agentId: null,
+      timestamp: history[0].timestamp - 50 + i,
+      content: `Earlier reply ${i}`,
+    }));
+    // The history store appends new IDs regardless of timestamp.
+    saveWorkspace(dir, { ...archived, messages: [] });
+    saveWorkspace(dir, {
+      ...archived,
+      messages: [
+        ...older,
+        ...history.slice(0, -1),
+        {
+          ...last,
+          content: `${last.content}\n\n\`\`\`dot\ndigraph { sample -> result; }\n\`\`\``,
+        },
+      ],
+    });
+    closeHistory(dir);
     appendFileSync(join(dir, "config.toml"), "\n[telemetry]\nenabled = true\n");
     server = new Server(0, dir, webDir);
     const origin = `http://127.0.0.1:${await server.listening}`;
@@ -167,6 +197,18 @@ it("counts a real workspace switch, chat file preview and explicit Files opening
     await preview.waitFor({ state: "hidden" });
     await page.locator("nav.side-rail").getByRole("button", { name: "Files", exact: true }).click();
     await preview.waitFor();
+
+    const chat = page.locator(".messages");
+    await chat.getByRole("button", { name: "Preview diagram", exact: true }).click();
+    await chat.locator(".diagram-preview svg").waitFor();
+    await chat.getByRole("button", { name: "Show code", exact: true }).click();
+    await chat.getByRole("button", { name: "Quote this message", exact: true }).last().click();
+    await page.locator(".quote-bar-content").click();
+    await chat.locator(".message-highlight").waitFor();
+    await chat.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await chat.getByText("Beginning of conversation", { exact: true }).waitFor();
     await page.goto("about:blank");
 
     const actions = [
@@ -175,6 +217,9 @@ it("counts a real workspace switch, chat file preview and explicit Files opening
       "chat.file_link",
       "panel.close",
       "panel.files",
+      "chat.diagram_preview",
+      "chat.quote_jump",
+      "chat.history_page",
     ];
     await expect
       .poll(async () => (await summary(origin)).counts)

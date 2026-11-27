@@ -1,11 +1,15 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import { cdp, page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
+import { StepGroup, SubAgentItem } from "../../src/chat/messages";
+import { TranscriptChoiceScope } from "../../src/chat/transcriptChoices";
 import "../../src/styles.css";
 
 afterEach(async () => {
   cleanup();
+  delete document.documentElement.dataset.theme;
+  await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: false });
   await cdp().send("Emulation.setEmulatedMedia", { features: [] });
 });
 
@@ -32,7 +36,7 @@ it("stops status loops and chrome motion without hiding status text in reduced m
         <span className="banner-icon">!</span> Retrying
       </span>
       <span className="subagent-icon-running">◌</span>
-      <span className="history-loading">
+      <span className="history-loading history-cold-reveal">
         <span className="spinner" /> Loading history
       </span>
       <button className="quota-refresh" disabled aria-label="Refreshing…">
@@ -45,7 +49,7 @@ it("stops status loops and chrome motion without hiding status text in reduced m
       <div className="quota-details">Quota details</div>
       <div className="stop-actions">Stop actions</div>
       <div className="dialog">New session</div>
-      <span className="message-highlight">Jump target</span>
+      <div className="message-highlight">Jump target</div>
       <div className="code-block">
         <button className="copy-btn">Copy code</button>
       </div>
@@ -84,7 +88,9 @@ it("stops status loops and chrome motion without hiding status text in reduced m
     return [...keys].sort();
   }
   for (const selector of loopMarkers) {
-    expect(getComputedStyle(get(selector)).animationIterationCount, selector).toBe("infinite");
+    expect(getComputedStyle(get(selector)).animationIterationCount.split(", "), selector).toContain(
+      "infinite",
+    );
   }
   for (const selector of [
     ".task-status.waiting.sleeping",
@@ -96,6 +102,12 @@ it("stops status loops and chrome motion without hiding status text in reduced m
   }
   for (const selector of fades) expect(properties(selector), selector).toEqual(["opacity"]);
   expect(properties(".dialog")).toEqual(["opacity", "transform"]);
+  const hint = get(".history-loading");
+  const spinnerFade = hint
+    .getAnimations({ subtree: true })
+    .find((a) => (a as CSSAnimation).animationName === "chrome-reveal")!;
+  expect(spinnerFade.effect?.getTiming().duration).toBe(120);
+  expect(getComputedStyle(hint).opacity).toBe("1");
   for (const selector of transitions) {
     expect(getComputedStyle(get(selector)).transitionDuration, selector).not.toBe("0s");
   }
@@ -115,5 +127,88 @@ it("stops status loops and chrome motion without hiding status text in reduced m
     expect(get(selector).textContent?.trim(), selector).toBeTruthy();
     expect(get(selector).getBoundingClientRect().height, selector).toBeGreaterThan(0);
   }
-  expect(getComputedStyle(get(".message-highlight")).backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  const accent = getComputedStyle(get(".message-highlight"), "::before");
+  expect(accent.animationName).toBe("none");
+  expect(accent.opacity).toBe("1");
+  expect(accent.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
 });
+
+it.each(["light", "dark"])(
+  "keeps mobile jump emphasis and disclosure motion local (%s)",
+  async (theme) => {
+    await page.viewport(390, 844);
+    await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    document.documentElement.dataset.theme = theme;
+    const choices = new Map();
+    const view = render(<div className="messages" />);
+    const setMotion = (value: string) =>
+      cdp().send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-reduced-motion", value }],
+      });
+    for (const mode of ["no-preference", "reduce"]) {
+      await setMotion(mode);
+      choices.clear();
+      const chat = (open: boolean) => (
+        <div className="messages">
+          {open && (
+            <TranscriptChoiceScope id="row" choices={choices}>
+              <div className="message-highlight" style={{ height: 60 }}>
+                Jumped
+              </div>
+              <div className="message-highlight" style={{ height: 1800 }}>
+                Tall reply
+              </div>
+              <StepGroup group={{ step: 0, events: [{ kind: "thinking", content: "Thought" }] }} />
+              <SubAgentItem
+                ev={{
+                  kind: "subagent_start",
+                  content: "",
+                  subagent: { taskId: "a", description: "Check", status: "completed" },
+                }}
+              />
+            </TranscriptChoiceScope>
+          )}
+        </div>
+      );
+      view.rerender(chat(true));
+      const [row, tall] = [...view.container.querySelectorAll(".message-highlight")];
+      const tint = getComputedStyle(row, "::before");
+      expect(tint.height).toBe("60px");
+      expect(parseFloat(getComputedStyle(tall, "::before").height)).toBeLessThan(844 / 3);
+      expect(tint.pointerEvents).toBe("none");
+      expect(getComputedStyle(row).opacity).toBe("1");
+      expect(tint.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+      if (mode === "no-preference") {
+        const animation = row.getAnimations({ subtree: true })[0];
+        const effect = animation.effect as KeyframeEffect;
+        expect(effect.getTiming()).toMatchObject({ duration: 300, delay: 1000, fill: "forwards" });
+        expect(effect.getKeyframes().map((frame) => frame.opacity)).toEqual(["1", "0"]);
+        animation.pause();
+        animation.currentTime = 999;
+        expect(tint.opacity).toBe("1");
+        animation.currentTime = 1300;
+        expect(tint.opacity).toBe("0");
+      } else expect(tint.animationName).toBe("none");
+      const toggles = () => view.container.querySelectorAll(".trace-header-toggle");
+      for (const button of toggles()) {
+        const { width, height } = button.getBoundingClientRect();
+        const caret = button.querySelector(".trace-caret")!;
+        expect(getComputedStyle(caret).transform).toBe("none");
+        fireEvent.click(button.closest(".step-header,.subagent-header")!);
+        expect(button.getAttribute("aria-expanded")).toBe("true");
+        expect(button.getBoundingClientRect()).toMatchObject({ width, height });
+        expect(getComputedStyle(caret).transitionDuration).toBe(mode === "reduce" ? "0s" : "0.12s");
+      }
+      view.rerender(chat(false));
+      view.rerender(chat(true));
+      for (const caret of view.container.querySelectorAll(".trace-caret")) {
+        expect(caret.getAnimations()).toHaveLength(0);
+        expect(getComputedStyle(caret).transform).toBe("matrix(0, 1, -1, 0, 0, 0)");
+      }
+      const messages = view.container.querySelector(".messages")!;
+      expect(getComputedStyle(messages, "::-webkit-scrollbar-thumb").minHeight).toBe("50px");
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+      view.rerender(chat(false));
+    }
+  },
+);

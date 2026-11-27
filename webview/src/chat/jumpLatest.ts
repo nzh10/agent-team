@@ -24,7 +24,7 @@ export function findLatestMessageElement(
     if (byId && scroller.contains(byId)) return byId;
   }
   const content = scroller.firstElementChild;
-  if (!content) return null;
+  if (!content || content.hasAttribute("data-loaded-messages")) return null;
   for (let child = content.lastElementChild; child; child = child.previousElementSibling) {
     if (
       child instanceof HTMLElement &&

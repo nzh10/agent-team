@@ -155,8 +155,9 @@ it("sends, streams, cancels, switches sessions, resyncs and stops through the Hu
           await expect
             .poll(
               () =>
-                app.container.querySelector(".message-agent:last-child .message-content")
-                  ?.textContent,
+                [...app.container.querySelectorAll(".messages .message[id]")]
+                  .at(-1)
+                  ?.querySelector(".message-agent .message-content")?.textContent,
               { interval: 10 },
             )
             .toBe("xxxx");

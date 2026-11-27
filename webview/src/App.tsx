@@ -14,6 +14,7 @@ import {
   type Workspace,
 } from "./state/useServer";
 import { groupWorkspaces } from "./sidebar/groups";
+import { inactiveTranscriptBytes } from "./state/transcriptRetention";
 import { agentQueues, agentState, isAgentActive, pillLabel } from "./workspace/agents";
 import { StopControl } from "./composer/StopControl";
 import { Icon } from "./panels/Icon";
@@ -48,7 +49,8 @@ import { MobileMenuButton } from "./sidebar/MobileMenuButton";
 import { GitBar } from "./workspace/GitBar";
 import { ReportSwitch } from "./workspace/ReportSwitch";
 import { BoardPage, type SessionInfo } from "./project/BoardPage";
-import { HistoryHint } from "./chat/HistoryHint";
+import { ColdHistoryHint, HistoryHint } from "./chat/HistoryHint";
+import { DiagramCacheScope } from "./chat/diagramCache";
 import { isLatestMessageVisible, shouldShowJumpToLatest } from "./chat/jumpLatest";
 import {
   viewportVars,
@@ -72,6 +74,8 @@ import {
   restoreReadingPosition,
   type ReadingPosition,
 } from "./viewport/readingAnchor";
+import { useTranscriptWindow } from "./viewport/useTranscriptWindow";
+import { TranscriptChoiceScope, type TranscriptChoices } from "./chat/transcriptChoices";
 
 // Re-exported for tests and for anyone importing the old single-file layout.
 export { GitBar } from "./workspace/GitBar";
@@ -155,7 +159,30 @@ export async function uploadImage(file: File): Promise<{ name: string; url: stri
 // to go before giving up.
 const JUMP_PAGE = 200;
 const NO_ISSUES: IssueModules = [];
+const NO_MESSAGES: Message[] = [];
 const JUMP_MAX_PAGES = 10;
+
+function createFileOpeners(
+  show: (workspace: string, ref: FileRef, scope: string) => void,
+  active: { current: string | null },
+) {
+  const openers = new Map<string, (ref: string, options?: FileOpenOptions) => void>();
+  return (workspace: string) => {
+    let open = openers.get(workspace);
+    if (!open) {
+      open = (ref, options) => {
+        recordTelemetry("chat.file_link");
+        show(
+          workspace,
+          options?.literalPath ? { path: ref, literalPath: true } : splitFileRef(ref),
+          active.current ?? workspace,
+        );
+      };
+      openers.set(workspace, open);
+    }
+    return open;
+  };
+}
 
 export function App() {
   const {
@@ -165,6 +192,7 @@ export function App() {
     connected,
     snapshotReady,
     connectionEpoch,
+    setActiveTranscript,
     user,
     presets,
     models,
@@ -647,24 +675,7 @@ export function App() {
   const roots = useMemo(() => fileRoots(scope), [scope]);
   // Opens a file named in the chat, relative to a workspace's folder: a
   // message delivered from another session names paths in that session's.
-  const fileOpener = useMemo(() => {
-    const byWs = new Map<string, (ref: string, options?: FileOpenOptions) => void>();
-    return (wsId: string) => {
-      let open = byWs.get(wsId);
-      if (!open) {
-        open = (ref, options) => {
-          recordTelemetry("chat.file_link");
-          showFile(
-            wsId,
-            options?.literalPath ? { path: ref, literalPath: true } : splitFileRef(ref),
-            fileScope,
-          );
-        };
-        byWs.set(wsId, open);
-      }
-      return open;
-    };
-  }, [showFile, fileScope]);
+  const fileOpener = useMemo(() => createFileOpeners(showFile, activeWsIdRef), [showFile]);
   const workspaceIds = useMemo(() => new Set(workspaces.map((w) => w.id)), [workspaces]);
   // Sidebar folder groups; explicit expand/collapse choices persist.
   const wsGroups = useMemo(() => groupWorkspaces(workspaces, projects), [workspaces, projects]);
@@ -911,7 +922,7 @@ export function App() {
   // Merely having the session open does not read a result below the reader.
   const attended = usePageAttended();
   const activeUnread = activeWs?.unread ?? 0;
-  const activeLoaded = activeWs?.messagesLoaded ?? true;
+  const activeLoaded = activeWs ? !!activeWs.messagesLoaded : true;
   useEffect(() => {
     if (
       activeWsId &&
@@ -953,6 +964,42 @@ export function App() {
     pages: number;
     fromSearch: boolean;
   } | null>(null);
+  // Prepending shifts existing rows. Keep the measured, visible anchor
+  // through the window selection on the same commit (including on Safari).
+  const anchorRef = useRef<{
+    wsId: string;
+    firstId: string;
+    height: number;
+    top: number;
+    position: ReadingPosition;
+  } | null>(null);
+  const transcriptMessages = activeWs?.messages ?? NO_MESSAGES;
+  const previousPage = anchorRef.current;
+  const prependAnchor =
+    previousPage &&
+    previousPage.wsId === activeWs?.id &&
+    previousPage.firstId !== transcriptMessages[0]?.id &&
+    previousPage.position.following === false
+      ? previousPage.position.id
+      : undefined;
+  const repliedInputIds = useMemo(
+    () => new Set(transcriptMessages.map((msg) => msg.replyTo)),
+    [transcriptMessages],
+  );
+  const choiceWorkspaceId = activeWs?.id;
+  // A workspace switch used to remount and reset every fold.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const transcriptChoices = useMemo((): TranscriptChoices => new Map(), [choiceWorkspaceId]);
+  const getReadingPosition = useCallback((id: string) => readingPositions.current.get(id), []);
+  const transcript = useTranscriptWindow({
+    workspaceId: activeWs?.id,
+    messages: activeWs?.messagesLoaded ? transcriptMessages : undefined,
+    getReadingPosition,
+    prependAnchor,
+    jumpId: pendingJump && pendingJump.wsId === activeWsId ? `msg-${pendingJump.msgId}` : undefined,
+    scroller: messagesContainerRef,
+  });
+  const { setTarget: setTranscriptTarget, preserve: preserveTranscriptAnchor } = transcript;
   const jumpHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const clearJumpHighlight = useCallback(() => {
     clearTimeout(jumpHighlightTimerRef.current);
@@ -1027,68 +1074,66 @@ export function App() {
     setMentionTarget(restored.match(/(?:^|\s)@(\S+)/)?.[1] ?? null);
   }, [activeWsId]);
 
+  useLayoutEffect(() => setActiveTranscript(activeWsId), [activeWsId, setActiveTranscript]);
+  const [coldPage, setColdPage] = useState<{ id: string; epoch: number; pending: boolean } | null>(
+    null,
+  );
+  const requestNewest = useCallback(
+    (id: string) => {
+      const ws = activeWsRef.current;
+      const sent = loadMessages(id);
+      if (ws?.id === id && !ws.messagesLoaded && !ws.messages.length) {
+        setColdPage({ id, epoch: connectionEpoch, pending: sent });
+      }
+    },
+    [connectionEpoch, loadMessages],
+  );
   // Also on every reconnect: the newest page resyncs in place, without
   // touching the draft or the reader's scroll position.
-  useEffect(() => {
-    if (activeWsId && connected) loadMessages(activeWsId);
-  }, [activeWsId, connected, loadMessages]);
+  useLayoutEffect(() => {
+    if (activeWsId && connected && snapshotReady) requestNewest(activeWsId);
+  }, [activeWsId, connected, snapshotReady, requestNewest]);
+  useLayoutEffect(() => {
+    if (!coldPage) return;
+    if (activeLoaded || transcriptMessages.length || !connected) setColdPage(null);
+    else if (lastError && coldPage.pending) setColdPage({ ...coldPage, pending: false });
+  }, [activeLoaded, transcriptMessages.length, connected, lastError, coldPage]);
 
   // The open workspace dropped its history (archived while in view, e.g. by
   // a project's lead): fetch it again rather than spin until a switch.
   const loadedRef = useRef({ id: activeWsId, loaded: activeLoaded });
-  useEffect(() => {
+  useLayoutEffect(() => {
     const prev = loadedRef.current;
     loadedRef.current = { id: activeWsId, loaded: activeLoaded };
     if (connected && activeWsId && prev.id === activeWsId && prev.loaded && !activeLoaded) {
-      loadMessages(activeWsId);
+      requestNewest(activeWsId);
     }
-  }, [activeWsId, activeLoaded, connected, loadMessages]);
+  }, [activeWsId, activeLoaded, connected, requestNewest]);
 
-  // Prepending a page shifts existing messages down; Safari has no
-  // overflow-anchor, so remember the previous first message's exact offset
-  // relative to the scroller (scrollHeight is integer-rounded and also grows
-  // from bottom streaming, which causes sub-pixel drift or jumps).
-  const anchorRef = useRef<{
-    wsId: string;
-    firstId: string;
-    height: number;
-    top: number;
-    firstOffset: number | null;
-  } | null>(null);
-  const measureAnchorOffset = useCallback((el: HTMLElement, firstId: string): number | null => {
-    const firstEl = document.getElementById(`msg-${firstId}`);
-    if (!firstEl || !el.contains(firstEl)) return null;
-    const rect = firstEl.getBoundingClientRect();
-    // jsdom has zero-sized layout rects; fall back to scrollHeight there.
-    if (rect.height === 0 && rect.width === 0) return null;
-    return rect.top - el.getBoundingClientRect().top;
+  const rememberHistoryAnchor = useCallback((wsId: string, firstId: string) => {
+    const el = messagesContainerRef.current;
+    if (el) {
+      anchorRef.current = {
+        wsId,
+        firstId,
+        height: el.scrollHeight,
+        top: el.scrollTop,
+        position: rememberReadingPosition(el, false),
+      };
+    }
   }, []);
-  const rememberHistoryAnchor = useCallback(
-    (wsId: string, firstId: string) => {
-      const el = messagesContainerRef.current;
-      if (el) {
-        anchorRef.current = {
-          wsId,
-          firstId,
-          height: el.scrollHeight,
-          top: el.scrollTop,
-          firstOffset: measureAnchorOffset(el, firstId),
-        };
-      }
-    },
-    [measureAnchorOffset],
-  );
   const onMessagesScroll = useCallback(() => {
     const el = messagesContainerRef.current;
-    if (!el || !activeWs || readingSession.current !== activeWs.id || activeWs.loadingOlder) return;
-    if (el.scrollTop < 80 && activeWs.hasMore) {
-      const oldest = activeWs.messages[0];
+    const ws = activeWsRef.current;
+    if (!el || !ws || readingSession.current !== ws.id || ws.loadingOlder) return;
+    if (el.scrollTop < 80 && ws.hasMore) {
+      const oldest = ws.messages[0];
       if (oldest) {
-        rememberHistoryAnchor(activeWs.id, oldest.id);
-        loadMessages(activeWs.id, oldest.timestamp);
+        rememberHistoryAnchor(ws.id, oldest.id);
+        loadMessages(ws.id, oldest.timestamp);
       }
     }
-  }, [activeWs, loadMessages, rememberHistoryAnchor]);
+  }, [loadMessages, rememberHistoryAnchor]);
 
   const prevMsgCountRef = useRef(0);
   // Whether a growing reply keeps the view pinned to its end. Any upward
@@ -1110,7 +1155,7 @@ export function App() {
     setLatestVisible(isLatestMessageVisible(el, latestId));
   }, []);
 
-  const onMessagesScrollTrack = useCallback(() => {
+  const onMessagesScrollTrack = () => {
     const el = messagesContainerRef.current;
     if (!el) return;
     const anchor = anchorRef.current;
@@ -1118,7 +1163,7 @@ export function App() {
       // Keep the reader's latest position if they scroll while a page is in flight.
       anchor.height = el.scrollHeight;
       anchor.top = el.scrollTop;
-      anchor.firstOffset = measureAnchorOffset(el, anchor.firstId);
+      anchor.position = rememberReadingPosition(el, false);
     }
     syncLatestVisible();
     // A jump is not a request to reattach to the bottom or load another page.
@@ -1134,9 +1179,11 @@ export function App() {
     }
     lastScrollTopRef.current = el.scrollTop;
     setFollowing(stuckToBottomRef.current);
+    // Commit the visible window before reading an anchor from a spacer.
+    if (transcript.track(el, stuckToBottomRef.current)) return;
     if (moved || wasFollowing !== stuckToBottomRef.current) saveReadingPosition();
     onMessagesScroll();
-  }, [measureAnchorOffset, onMessagesScroll, saveReadingPosition, syncLatestVisible]);
+  };
 
   // The composer growing (a long draft, the command list) takes the
   // transcript's room from below: a reader at the end stays there. Keyed on
@@ -1166,6 +1213,18 @@ export function App() {
           gap > 1
         ) {
           el.scrollTop = el.scrollHeight;
+        } else if (
+          !stuckToBottomRef.current &&
+          Math.abs(el.scrollTop - lastScrollTopRef.current) < 1
+        ) {
+          // Safari may not anchor a row when a deferred detail, font, or
+          // spacer above it changes height. Don't undo an actual native
+          // scroll (including the bottom collapse control's focus jump).
+          const saved = readingPositions.current.get(readingSession.current ?? "");
+          if (saved?.following === false && readingAnchorElement(el, saved.id)) {
+            restoreReadingPosition(el, saved);
+            lastScrollTopRef.current = el.scrollTop;
+          }
         }
       }
       syncLatestVisible();
@@ -1199,7 +1258,7 @@ export function App() {
   // while something streams (or just finished): a reply growing because the
   // reader opened a box must stay where they tapped.
   useLayoutEffect(() => {
-    const msgs = activeWs?.messages ?? [];
+    const msgs = transcriptMessages;
     const el = messagesContainerRef.current;
     if (!el || !activeWs || !activeWs.messagesLoaded) {
       readingSession.current = null;
@@ -1215,13 +1274,13 @@ export function App() {
       activeWs.hasMore &&
       oldest &&
       oldest.timestamp >= saved.timestamp &&
-      !readingAnchorElement(el, saved.id)
+      !transcript.geometry.indexById.has(saved.id ?? "")
     ) {
       readingSession.current = null;
       stuckToBottomRef.current = false;
       setFollowing(false);
       syncLatestVisible();
-      if (connected && !activeWs.loadingOlder)
+      if (connected && snapshotReady && !activeWs.loadingOlder)
         loadMessages(activeWs.id, oldest.timestamp, JUMP_PAGE);
       return;
     }
@@ -1230,6 +1289,7 @@ export function App() {
       setFollowing(saved.following);
       readingSession.current = activeWs.id;
       anchorRef.current = null;
+      transcript.pendingRestore.current = null;
       prevMsgCountRef.current = msgs.length;
       wasStreamingRef.current = msgs.some((m) => m.status === "streaming");
       restoreReadingPosition(el, saved);
@@ -1237,6 +1297,16 @@ export function App() {
       lastScrollTopRef.current = el.scrollTop;
       syncLatestVisible();
       return;
+    }
+    const pending = transcript.pendingRestore.current;
+    if (pending?.workspaceId === activeWs.id) {
+      transcript.pendingRestore.current = null;
+      restoreReadingPosition(el, pending.position);
+      jumpScrollTopRef.current = el.scrollTop;
+      lastScrollTopRef.current = el.scrollTop;
+      saveReadingPosition();
+      syncLatestVisible();
+      if (pending.backfill) onMessagesScroll();
     }
     const prevCount = prevMsgCountRef.current;
     prevMsgCountRef.current = msgs.length;
@@ -1246,18 +1316,38 @@ export function App() {
     const anchor = anchorRef.current;
     if (anchor && el && anchor.wsId === activeWs?.id && msgs[0]?.id !== anchor.firstId) {
       anchorRef.current = null;
-      const nowOffset = measureAnchorOffset(el, anchor.firstId);
-      // Viewport-relative measurements already include native scroll anchoring.
-      el.scrollTop =
-        anchor.firstOffset !== null && nowOffset !== null
-          ? el.scrollTop + (nowOffset - anchor.firstOffset)
-          : anchor.top + (el.scrollHeight - anchor.height);
+      const position = anchor.position;
+      // Relative coordinates include any compensation performed by the browser.
+      if (!position.following && position.id && readingAnchorElement(el, position.id)) {
+        restoreReadingPosition(el, position);
+        // Replacing estimated spacers with newly measured rows can change
+        // the range again. Carry the same measured anchor into that commit.
+        preserveTranscriptAnchor(el, position);
+      } else {
+        el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+      }
+      jumpScrollTopRef.current = el.scrollTop;
+      lastScrollTopRef.current = el.scrollTop;
+      saveReadingPosition();
       syncLatestVisible();
       return;
     }
     if (msgs.length > prevCount || streaming || wasStreaming) followTail(el);
     syncLatestVisible();
-  }, [activeWs, connected, followTail, loadMessages, measureAnchorOffset, syncLatestVisible]);
+  }, [
+    activeWs,
+    connected,
+    followTail,
+    loadMessages,
+    onMessagesScroll,
+    preserveTranscriptAnchor,
+    saveReadingPosition,
+    snapshotReady,
+    syncLatestVisible,
+    transcript.geometry,
+    transcript.pendingRestore,
+    transcriptMessages,
+  ]);
 
   // A starting row can grow the tail without adding a message.
   const onStartingRow = useCallback(
@@ -1290,8 +1380,9 @@ export function App() {
     setHighlightMsgId(null);
     jumpScrollTopRef.current = null;
     anchorRef.current = null;
-    el.scrollTop = el.scrollHeight;
     stuckToBottomRef.current = true;
+    setTranscriptTarget(el, undefined);
+    el.scrollTop = el.scrollHeight;
     lastScrollTopRef.current = el.scrollTop;
     if (activeWsId) readingPositions.current.set(activeWsId, { following: true });
     setFollowing(true);
@@ -1307,11 +1398,12 @@ export function App() {
       return;
     }
     if (!activeWs || !activeWs.messagesLoaded) return;
-    if (activeWs.messages.some((m) => m.id === jump.msgId)) {
-      setPendingJump(null);
+    if (transcript.geometry.indexById.has(`msg-${jump.msgId}`)) {
       const target = document.getElementById(`msg-${jump.msgId}`);
       const scroller = messagesContainerRef.current;
       if (!target || !scroller?.contains(target)) return;
+      setPendingJump(null);
+      setTranscriptTarget(scroller, target.id);
       setHighlightMsgId(jump.msgId);
       stuckToBottomRef.current = false;
       setFollowing(false);
@@ -1326,7 +1418,7 @@ export function App() {
       jumpHighlightTimerRef.current = setTimeout(() => setHighlightMsgId(null), 2000);
       return;
     }
-    if (activeWs.loadingOlder) return;
+    if (!connected || !snapshotReady || activeWs.loadingOlder) return;
     const oldest = activeWs.messages[0];
     if (activeWs.hasMore && oldest && jump.pages < JUMP_MAX_PAGES) {
       // Keep the viewport anchored in case the target never turns up.
@@ -1341,10 +1433,14 @@ export function App() {
     pendingJump,
     activeWsId,
     activeWs,
+    connected,
+    snapshotReady,
     loadMessages,
     rememberHistoryAnchor,
     saveReadingPosition,
+    setTranscriptTarget,
     syncLatestVisible,
+    transcript.geometry,
   ]);
 
   const isAnyRunning = activeWs?.agents.some(isAgentActive) ?? false;
@@ -1690,6 +1786,10 @@ export function App() {
   };
 
   const backgroundAttention = summarizeAttention(workspaces, activeWsId, projects);
+  const inactiveBytes = useMemo(
+    () => inactiveTranscriptBytes(workspaces, activeWsId),
+    [workspaces, activeWsId],
+  );
 
   return (
     <SessionLinkContext.Provider value={sessionLinks}>
@@ -1856,12 +1956,19 @@ export function App() {
               </div>
 
               <div
-                key={activeWs.id}
                 className="messages"
                 ref={messagesContainerRef}
                 onScroll={onMessagesScrollTrack}
+                onKeyDown={transcript.tabAcrossWindow}
               >
-                <div className="messages-content">
+                <div
+                  className="messages-content"
+                  ref={transcript.content}
+                  data-inactive-transcript-bytes={inactiveBytes}
+                  data-loaded-messages={
+                    activeWs.messagesLoaded ? transcriptMessages.length : undefined
+                  }
+                >
                   <SubagentTraceContext.Provider value={traceConnection}>
                     <FileOpenContext.Provider value={fileOpener(activeWs.id)}>
                       <LocalDayProvider>
@@ -1869,6 +1976,18 @@ export function App() {
                           const msgs = activeWs.messages;
                           const total = msgs.length;
                           if (!activeWs.messagesLoaded) {
+                            if (total === 0 && connected && snapshotReady && !lastError) {
+                              // Do not mount an eager hint before the request's layout effect.
+                              if (
+                                coldPage?.id !== activeWs.id ||
+                                coldPage.epoch !== connectionEpoch
+                              )
+                                return null;
+                              if (coldPage.pending)
+                                return (
+                                  <ColdHistoryHint key={`${activeWs.id}:${connectionEpoch}`} />
+                                );
+                            }
                             return (
                               <HistoryHint
                                 hasMore={false}
@@ -1887,7 +2006,20 @@ export function App() {
                               </div>
                             );
                           }
-                          const repliedInputIds = new Set(msgs.map((msg) => msg.replyTo));
+                          let next = 0;
+                          const spacer = (before: number, after: number) =>
+                            before < after ? (
+                              <div
+                                key={`space-${before}`}
+                                aria-hidden="true"
+                                style={{
+                                  height:
+                                    transcript.geometry.offsets[after] -
+                                    transcript.geometry.offsets[before],
+                                  overflowAnchor: "none",
+                                }}
+                              />
+                            ) : null;
                           return (
                             <>
                               <HistoryHint
@@ -1896,49 +2028,71 @@ export function App() {
                                 loaded
                                 count={total}
                               />
-                              {msgs.map((msg, i) => {
-                                const prev = i > 0 ? msgs[i - 1] : null;
-                                const compact =
-                                  !!prev &&
-                                  msg.kind === "agent" &&
-                                  prev.kind === "agent" &&
-                                  !!msg.turnId &&
-                                  msg.turnId === prev.turnId;
-                                const item = (
-                                  <MessageItem
-                                    user={user}
-                                    msg={msg}
-                                    agents={
-                                      msg.status === "streaming" ||
-                                      msg.pendingDelivery === "starting"
-                                        ? activeWs.agents
-                                        : settledAgents
-                                    }
-                                    compact={compact}
-                                    highlight={msg.id === highlightMsgId}
-                                    hasReply={repliedInputIds.has(msg.id)}
-                                    onStartingRow={onStartingRow}
-                                    onQuote={handleQuote}
-                                    onJumpToMessage={jumpToMessageInActiveWs}
-                                    onCancelSubagent={onCancelSubagent}
-                                    onCancelQueued={onCancelQueued}
-                                    onLoadDetails={onLoadDetails}
-                                    onOpenWorkspace={openWorkspace}
-                                  />
-                                );
-                                const from = msg.from?.workspaceId;
-                                return (
-                                  <MessageBoundary key={msg.id} messageId={msg.id}>
-                                    {from && from !== activeWs.id && workspaceIds.has(from) ? (
-                                      <FileOpenContext.Provider value={fileOpener(from)}>
-                                        {item}
-                                      </FileOpenContext.Provider>
-                                    ) : (
-                                      item
-                                    )}
-                                  </MessageBoundary>
-                                );
-                              })}
+                              <DiagramCacheScope workspaceId={activeWs.id}>
+                                {transcript.indices.flatMap((i) => {
+                                  const gap = spacer(next, i);
+                                  next = i + 1;
+                                  const msg = msgs[i];
+                                  const prev = i > 0 ? msgs[i - 1] : null;
+                                  const compact =
+                                    !!prev &&
+                                    msg.kind === "agent" &&
+                                    prev.kind === "agent" &&
+                                    !!msg.turnId &&
+                                    msg.turnId === prev.turnId;
+                                  const item = (
+                                    <MessageItem
+                                      user={user}
+                                      msg={msg}
+                                      agents={
+                                        msg.status === "streaming" ||
+                                        msg.pendingDelivery === "starting"
+                                          ? activeWs.agents
+                                          : settledAgents
+                                      }
+                                      compact={compact}
+                                      highlight={msg.id === highlightMsgId}
+                                      hasReply={repliedInputIds.has(msg.id)}
+                                      onStartingRow={onStartingRow}
+                                      onQuote={handleQuote}
+                                      onJumpToMessage={jumpToMessageInActiveWs}
+                                      onCancelSubagent={onCancelSubagent}
+                                      onCancelQueued={onCancelQueued}
+                                      onLoadDetails={onLoadDetails}
+                                      onOpenWorkspace={openWorkspace}
+                                    />
+                                  );
+                                  const from = msg.from?.workspaceId;
+                                  return [
+                                    gap,
+                                    <div
+                                      key={`${activeWs.id}/${msg.id}`}
+                                      data-transcript-row={`msg-${msg.id}`}
+                                      data-window-first={i === transcript.range.start || undefined}
+                                      data-window-last={i === transcript.range.end - 1 || undefined}
+                                      style={{ display: "flow-root" }}
+                                    >
+                                      <TranscriptChoiceScope
+                                        id={msg.id}
+                                        choices={transcriptChoices}
+                                      >
+                                        <MessageBoundary messageId={msg.id}>
+                                          {from &&
+                                          from !== activeWs.id &&
+                                          workspaceIds.has(from) ? (
+                                            <FileOpenContext.Provider value={fileOpener(from)}>
+                                              {item}
+                                            </FileOpenContext.Provider>
+                                          ) : (
+                                            item
+                                          )}
+                                        </MessageBoundary>
+                                      </TranscriptChoiceScope>
+                                    </div>,
+                                  ];
+                                })}
+                                {spacer(next, total)}
+                              </DiagramCacheScope>
                             </>
                           );
                         })()}
@@ -1984,6 +2138,7 @@ export function App() {
                           {...(canJump && {
                             type: "button" as const,
                             title: "Jump to quoted message",
+                            ...telemetryTarget("chat.quote_jump"),
                             "aria-label": `Jump to quoted message from ${author}: ${preview}`,
                             onClick: () => jumpToMessageInActiveWs(quotedMsg.id),
                           })}

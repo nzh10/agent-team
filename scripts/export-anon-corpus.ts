@@ -267,6 +267,9 @@ const journeyActions = new Set([
   "chat.send",
   "chat.stop",
   "chat.cancel_queued",
+  "chat.quote_jump",
+  "chat.history_page",
+  "chat.diagram_preview",
 ]);
 const journeyKinds = ["user", "agent", "system"] as const;
 type JourneyKind = (typeof journeyKinds)[number];

@@ -68,8 +68,8 @@ function connect(sock: FakeSocket, workspaces = [ws]) {
     });
   });
 }
-async function boot(tail: Message[] = [], workspaces = [ws], hasMore = false, width = 390) {
-  await page.viewport(width, 760);
+async function mountTranscript(workspaces: (typeof ws)[], width: number, height = 760) {
+  await page.viewport(width, height);
   localStorage.clear();
   FakeSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeSocket);
@@ -83,13 +83,23 @@ async function boot(tail: Message[] = [], workspaces = [ws], hasMore = false, wi
   const receive = (frame: object) => {
     act(() => sock.receive({ workspaceId: "w", ...frame }));
   };
+  return { scroll: get(".messages"), sock, receive };
+}
+async function boot(tail: Message[] = [], workspaces = [ws], hasMore = false, width = 390) {
+  const { scroll, sock, receive } = await mountTranscript(workspaces, width);
   receive({ type: "workspace_messages", messages: [...history, ...tail], hasMore });
-  const scroll = get(".messages");
   expect(scroll.clientHeight).toBeGreaterThan(350);
   expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
   await bottom(scroll);
   await nextPaint();
   return { scroll, sock, receive };
+}
+function chooseWorkspace(name: string) {
+  if (window.innerWidth < 768) fireEvent.click(get(".mobile-menu-btn"));
+  const row = [...document.querySelectorAll(".task-item")].find((el) =>
+    el.textContent?.includes(name),
+  );
+  fireEvent.click(row!);
 }
 function move(el: HTMLElement, top: number) {
   el.scrollTop = top;
@@ -101,6 +111,52 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
+});
+
+it("delays only a cold in-flight 25-row mobile page and never holds ready content", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const second = { ...ws, id: "later", name: "Cold conversation" };
+  const failed = { ...ws, id: "failed", name: "Unreadable history" };
+  const next = { ...ws, id: "next", name: "Another cold conversation" };
+  const { scroll, sock, receive } = await mountTranscript([ws, second, failed, next], 390, 844);
+  const hint = () => scroll.querySelector(".history-loading");
+  const tick = (ms: number) => {
+    void act(() => vi.advanceTimersByTime(ms));
+  };
+  expect(sock.frames().at(-1)).toMatchObject({ type: "load_messages", limit: 25 });
+  tick(119);
+  expect(hint()).toBeNull();
+  receive({ type: "workspace_messages", messages: [turn(0)] });
+  tick(1);
+  expect(hint()).toBeNull();
+  expect(get("#msg-m0")).not.toBeNull();
+
+  chooseWorkspace(second.name);
+  expect(get("#msg-m0")).toBeNull();
+  expect(hint()).toBeNull();
+  tick(119);
+  chooseWorkspace(ws.name);
+  tick(1);
+  expect(hint()).toBeNull();
+  expect(get("#msg-m0")).not.toBeNull();
+  chooseWorkspace(second.name);
+  tick(119);
+  expect(hint()).toBeNull();
+  tick(1);
+  expect(hint()?.classList.contains("history-cold-reveal")).toBe(true);
+  receive({ type: "workspace_messages", workspaceId: second.id, messages: [] });
+  expect(hint()).toBeNull();
+  expect(scroll.querySelector(".empty-state")?.textContent).toBe(
+    "Send a message to start working.",
+  );
+
+  chooseWorkspace(failed.name);
+  using _log = vi.spyOn(console, "error").mockImplementation(() => {});
+  receive({ type: "error", message: "History could not be read" });
+  expect(hint()).not.toBeNull();
+  chooseWorkspace(next.name);
+  fireEvent.click(get(".error-toast"));
+  expect(hint()).not.toBeNull();
 });
 
 it.each(["light", "dark"] as const)(
@@ -148,7 +204,14 @@ it.each(["light", "dark"] as const)(
 
 it("follows a growing tail only until the reader moves up, and resumes at the bottom", async () => {
   const live = turn(18, { status: "streaming", content: "Working" });
-  const { scroll, receive } = await boot([live]);
+  const { scroll, receive } = await boot();
+  receive({ type: "new_message", message: live });
+  expect(gap(scroll)).toBeLessThanOrEqual(1);
+  const row = get("#msg-m18");
+  expect(scroll.getAnimations()).toEqual([]);
+  expect(row.getAnimations()).toEqual([]);
+  const content = row.querySelector(".message-content")!;
+  expect(content.getAnimations({ subtree: true })).toEqual([]);
   async function grow() {
     const oldHeight = scroll.scrollHeight;
     receive({
@@ -161,12 +224,30 @@ it("follows a growing tail only until the reader moves up, and resumes at the bo
   }
   await grow();
   await bottom(scroll);
+  expect(content.getAnimations({ subtree: true })).toEqual([]);
+  // A coalesced native scroll has changed scrollTop but not notified App yet.
+  scroll.scrollTop -= 3;
+  const slightlyUp = scroll.scrollTop;
+  receive({
+    type: "stream_event",
+    messageId: live.id,
+    event: { kind: "text_delta", content: "." },
+  });
+  expect(scroll.scrollTop).toBe(slightlyUp);
   for (const top of [scroll.scrollTop - 40, 200]) {
     move(scroll, top);
     await grow();
     expect(scroll.scrollTop).toBe(top);
   }
-  move(scroll, scroll.scrollHeight);
+  fireEvent.click(get(".jump-latest"));
+  scroll.scrollTop -= 220;
+  const beforeSend = scroll.scrollTop;
+  receive({ type: "new_message", message: turn(99) });
+  expect(get("#msg-m99")).toBeTruthy();
+  expect(scroll.scrollTop).toBe(beforeSend);
+  await nextPaint();
+  expect(scroll.scrollTop).toBe(beforeSend);
+  fireEvent.click(get(".jump-latest"));
   await grow();
   await bottom(scroll);
 });
@@ -215,26 +296,6 @@ it("follows a delayed starting row without moving a reader who has scrolled up",
   expect(scroll.scrollTop).toBe(200);
 });
 
-it("pins a new streaming turn immediately without entry or smooth scrolling", async () => {
-  const { scroll, receive } = await boot();
-  const live = turn(99, { status: "streaming" });
-  receive({ type: "new_message", message: live });
-  expect(gap(scroll)).toBeLessThanOrEqual(1);
-  const message = get("#msg-m99");
-  const content = get("#msg-m99 .message-content");
-  expect(scroll.getAnimations()).toEqual([]);
-  expect(message.getAnimations()).toEqual([]);
-  expect(content.getAnimations({ subtree: true })).toEqual([]);
-  receive({
-    type: "stream_event",
-    messageId: live.id,
-    event: { kind: "text_delta", content: "\n\nMore arriving text." },
-  });
-  await nextPaint();
-  expect(gap(scroll)).toBeLessThanOrEqual(1);
-  expect(content.getAnimations({ subtree: true })).toEqual([]);
-});
-
 function reply(i: number, messageId: string) {
   return turn(i, {
     kind: "user",
@@ -254,61 +315,27 @@ function expectInView(scroll: HTMLElement, target: HTMLElement) {
   expect(rect.bottom).toBeLessThanOrEqual(viewport.bottom);
 }
 
-it("jumps within the transcript without clearing search or being pulled back by streaming", async () => {
-  const live = turn(20, { status: "streaming", content: "Working" });
-  const { scroll, sock, receive } = await boot([reply(18, "m3"), reply(19, "m8"), live]);
-  const search = get<HTMLInputElement>('input[placeholder="Search messages…"]');
-  fireEvent.change(search, { target: { value: "keep this search" } });
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  const advance = (ms: number) => {
-    void act(() => vi.advanceTimersByTime(ms));
-  };
-  const first = get("#msg-m3");
-  const second = get("#msg-m8");
-
-  fireEvent.click(get("#msg-m18 .forward-ref-icon"));
-  expect(first.matches(".message-highlight")).toBe(true);
-  expectInView(scroll, first);
-  advance(1_000);
-  fireEvent.click(get("#msg-m19 .forward-ref-preview"));
-  expect(first.matches(".message-highlight")).toBe(false);
-  expect(second.matches(".message-highlight")).toBe(true);
-  expectInView(scroll, second);
-  expect(search.value).toBe("keep this search");
-  expect(sock.frames().filter((frame) => frame.type === "load_messages")).toHaveLength(1);
-
-  await nextPaint();
-  const oldHeight = scroll.scrollHeight;
-  const top = scroll.scrollTop;
-  receive({
-    type: "stream_event",
-    messageId: live.id,
-    event: { kind: "text_delta", content: "\n\nAnother paragraph at the streaming tail." },
-  });
-  await vi.waitFor(() => expect(scroll.scrollHeight).toBeGreaterThan(oldHeight));
-  expect(scroll.scrollTop).toBe(top);
-  advance(1_000); // The first highlight would now have expired.
-  expect(second.matches(".message-highlight")).toBe(true);
-  advance(1_000);
-  expect(second.matches(".message-highlight")).toBe(false);
-});
-
 it.each([
   { width: 390, theme: "dark", motion: "reduce" },
   { width: 1200, theme: "light", motion: "no-preference" },
 ])(
-  "lands immediately and respects the next upward scroll ($width, $theme, $motion)",
+  "lands immediately for search and quotes without stealing search focus ($width, $theme, $motion)",
   async ({ width, theme, motion }) => {
     await cdp().send("Emulation.setEmulatedMedia", {
       features: [{ name: "prefers-reduced-motion", value: motion }],
     });
     try {
-      const { scroll, receive } = await boot([reply(18, "m3")], [ws], false, width);
+      const { scroll, receive, sock } = await boot([reply(18, "m3")], [ws], false, width);
       document.documentElement.dataset.theme = theme;
-      fireEvent.click(get("#msg-m18 .forward-ref"));
-      expect(document.activeElement).toBe(get("#msg-m3"));
-      expectInView(scroll, get("#msg-m3"));
       const search = get<HTMLInputElement>(".search-bar input");
+      fireEvent.change(search, { target: { value: "keep the query" } });
+      fireEvent.click(get("#msg-m18 .forward-ref-icon"));
+      expect(document.activeElement).toBe(get("#msg-m3.message-highlight"));
+      expectInView(scroll, get("#msg-m3"));
+      expect(search.value).toBe("keep the query");
+      expect(sock.frames().filter(({ type }) => type === "load_messages")).toHaveLength(1);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      void act(() => vi.advanceTimersByTime(1000));
       search.focus();
       fireEvent.change(search, { target: { value: "needle" } });
       receive({
@@ -328,35 +355,11 @@ it.each([
       expect([...document.querySelectorAll(".message-highlight")]).toEqual([get("#msg-m7")]);
       expect(document.activeElement).not.toBe(get("#msg-m7"));
       expectInView(scroll, get("#msg-m7"));
+      void act(() => vi.advanceTimersByTime(1000));
+      expect(get("#msg-m7.message-highlight")).not.toBeNull();
       fireEvent.click(get(".jump-latest"));
       expect(gap(scroll)).toBeLessThanOrEqual(1);
       expect(document.querySelector(".message-highlight")).toBeNull();
-      receive({
-        type: "new_message",
-        message: turn(98, { status: "streaming", content: "Working" }),
-      });
-      expect(gap(scroll)).toBeLessThanOrEqual(1);
-      // An inline delta grows text but not row height. Even a tiny upward
-      // move must detach before Chromium delivers its coalesced scroll event.
-      scroll.scrollTop -= 3;
-      const slightlyUp = scroll.scrollTop;
-      receive({
-        type: "stream_event",
-        messageId: "m98",
-        event: { kind: "text_delta", content: "." },
-      });
-      expect(scroll.scrollTop).toBe(slightlyUp);
-      move(scroll, 200);
-      fireEvent.click(get(".jump-latest"));
-      // Deliver the frame before Chromium dispatches the coalesced scroll event.
-      scroll.scrollTop -= 220;
-      const top = scroll.scrollTop;
-      receive({ type: "new_message", message: turn(99) });
-      expect(get("#msg-m99")).toBeTruthy();
-      expect(scroll.scrollTop).toBe(top);
-      await nextPaint();
-      expect(scroll.scrollTop).toBe(top);
-      expect(get(".jump-latest")).toBeTruthy();
     } finally {
       await cdp().send("Emulation.setEmulatedMedia", { features: [] });
     }
@@ -386,17 +389,32 @@ it("pages back to a quote and recovers from a reference missing from history", a
     type: "workspace_messages",
     before: first.timestamp,
     messages: [turn(-2)],
-    hasMore: false,
+    hasMore: true,
   });
   await expect.poll(() => get("#msg-m-2").matches(".message-highlight")).toBe(true);
   await expect.poll(() => scroll.scrollTop).toBe(0);
   expectInView(scroll, get("#msg-m-2"));
 
+  scroll.style.overflowAnchor = "none";
+  move(scroll, 360);
+  fireEvent.click(get("#msg-m19 .forward-ref"));
+  move(scroll, 500);
+  const anchor = get("#msg-m3");
+  const top = anchor.getBoundingClientRect().top;
+  receive({
+    type: "workspace_messages",
+    before: turn(-2).timestamp,
+    messages: [turn(-3)],
+    hasMore: false,
+  });
+  await nextPaint();
+  expect(get("#msg-m-3")).toBeTruthy();
+  expect(anchor.getBoundingClientRect().top).toBeCloseTo(top, 0);
   const sent = sock.frames().length;
   fireEvent.click(get("#msg-m19 .forward-ref"));
   expect(document.querySelector(".message-highlight")).toBeNull();
   expect(sock.frames()).toHaveLength(sent);
-  expect(scroll.scrollTop).toBe(0);
+  expect(anchor.getBoundingClientRect().top).toBeCloseTo(top, 0);
   fireEvent.click(get("#msg-m20 .forward-ref"));
   await expect.poll(() => get("#msg-m3").matches(".message-highlight")).toBe(true);
 });
@@ -420,72 +438,11 @@ it("does not take focus or seek when a paged quote arrives after new reader inpu
   expect(get("#msg-m3").getBoundingClientRect().top).toBeCloseTo(anchor, 0);
 });
 
-it("keeps the visible history anchored when paging cannot find a quote", async () => {
-  const { scroll, receive } = await boot([reply(18, "deleted")], [ws], true);
-  scroll.style.overflowAnchor = "none";
-  move(scroll, 360);
-  fireEvent.click(get("#msg-m18 .forward-ref"));
-  move(scroll, 500);
-  const target = get("#msg-m5");
-  const top = target.getBoundingClientRect().top;
-  receive({
-    type: "workspace_messages",
-    before: history[0].timestamp,
-    messages: [turn(-2), turn(-1)],
-    hasMore: false,
-  });
-  await nextPaint();
-  expect(get("#msg-m-2")).toBeTruthy();
-  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
-  expect(document.querySelector(".message-highlight")).toBeNull();
-});
-
-it("keeps the visible history anchored even if new content grows below while paging", async () => {
-  const { scroll, receive } = await boot([], [ws], true);
-  scroll.style.overflowAnchor = "none";
-  move(scroll, 40);
-  const target = get("#msg-m2");
-  const top = target.getBoundingClientRect().top;
-  receive({
-    type: "new_message",
-    message: turn(99, {
-      content: "Streaming reply growing below while older history loads.\n\n".repeat(12),
-    }),
-  });
-  await nextPaint();
-  expect(get("#msg-m99")).toBeTruthy();
-  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
-  const code = "```ts\nconst long = '" + "abcdef".repeat(90) + "';\n```";
-  receive({
-    type: "workspace_messages",
-    before: history[0].timestamp,
-    messages: [turn(-2, { content: code }), turn(-1)],
-    hasMore: false,
-  });
-  const paged = get("#msg-m-2");
-  const codeScroll = get("#msg-m-2 pre");
-  const codeInner = get("#msg-m-2 pre code");
-  expect(codeScroll.scrollWidth).toBeGreaterThan(codeScroll.clientWidth + 100);
-  expect(scroll.scrollWidth).toBe(scroll.clientWidth);
-  codeScroll.scrollLeft = 100;
-  expect(codeScroll.scrollLeft).toBe(100);
-  codeInner.scrollLeft = 100;
-  expect(codeInner.scrollLeft).toBe(0);
-  expect(paged.getAnimations({ subtree: true })).toEqual([]);
-  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
-  await nextPaint();
-  expect(target.getBoundingClientRect().top).toBeCloseTo(top, 0);
-});
-
 it("keeps a quote from another workspace visible without paging unrelated history", async () => {
   const { sock, receive } = await boot([], [ws, { ...ws, id: "other", name: "Other workspace" }]);
   fireEvent.click(get("#msg-m3 .btn-quote"));
   expect(get("button.quote-bar-content")).toBeTruthy();
-  fireEvent.click(get(".mobile-menu-btn"));
-  const row = [...document.querySelectorAll<HTMLElement>(".task-item")].find((item) =>
-    item.textContent?.includes("Other workspace"),
-  )!;
-  fireEvent.click(row);
+  chooseWorkspace("Other workspace");
   receive({
     type: "workspace_messages",
     workspaceId: "other",
@@ -522,43 +479,6 @@ it("jumps from the composer preview and closes the quote without a second jump",
   expect(document.querySelector(".quote-bar")).toBeNull();
   expect(target.matches(".message-highlight")).toBe(false);
   expect(gap(scroll)).toBeLessThanOrEqual(1);
-});
-
-it("keeps the opened step in view when its details arrive and the composer grows", async () => {
-  const last = turn(18, {
-    detail: "summary",
-    events: [{ kind: "tool_use", content: "**Bash**", toolUseId: "t", contentOffset: 0 }],
-  });
-  const { scroll, sock, receive } = await boot([last]);
-  const step = [...scroll.querySelectorAll<HTMLElement>(".step-header")].at(-1)!;
-  fireEvent.click(step);
-  expect(sock.frames()).toContainEqual(
-    expect.objectContaining({ type: "load_message_details", messageId: last.id }),
-  );
-  await nextPaint();
-  const stepTop = step.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
-  const height = scroll.scrollHeight;
-  receive({
-    type: "message_details",
-    messageId: last.id,
-    events: [
-      {
-        kind: "tool_use",
-        content: "**Bash**\n```bash\n" + "echo x\n".repeat(40) + "```",
-        toolUseId: "t",
-        contentOffset: 0,
-      },
-    ],
-  });
-  await expect.poll(() => scroll.scrollHeight).toBeGreaterThan(height);
-  const client = scroll.clientHeight;
-  fireEvent.change(get("textarea"), { target: { value: "A longer draft\n".repeat(10) } });
-  await expect.poll(() => scroll.clientHeight).toBeLessThan(client);
-  await nextPaint();
-  expect(step.getBoundingClientRect().top - scroll.getBoundingClientRect().top).toBeCloseTo(
-    stepTop,
-    0,
-  );
 });
 
 it("fits the phone header and composer, and keeps the bottom in view while composing", async () => {
@@ -608,41 +528,6 @@ it("fits the phone header and composer, and keeps the bottom in view while compo
   expect(scroll.scrollTop).toBe(200);
 });
 
-it("keeps the scroll position and draft caret across reconnect", async () => {
-  const { scroll, sock } = await boot();
-  move(scroll, 200);
-  const input = get<HTMLTextAreaElement>("textarea");
-  fireEvent.change(input, { target: { value: "half a thought" } });
-  input.setSelectionRange(4, 4);
-  await nextPaint();
-  expect(scroll.scrollTop).toBe(200);
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  act(() => sock.drop());
-  act(() => {
-    vi.advanceTimersByTime(2000);
-  });
-  const next = FakeSocket.instances.at(-1)!;
-  expect(next).not.toBe(sock);
-  connect(next);
-  act(() =>
-    next.receive({
-      type: "workspace_messages",
-      workspaceId: "w",
-      messages: history,
-      hasMore: false,
-    }),
-  );
-  vi.useRealTimers();
-  await nextPaint();
-  expect(get(".messages").scrollTop).toBe(200);
-  const restored = get<HTMLTextAreaElement>("textarea");
-  expect(restored.value).toBe("half a thought");
-  expect(restored.selectionStart).toBe(4);
-  expect(next.frames()).toContainEqual(
-    expect.objectContaining({ type: "load_messages", workspaceId: "w" }),
-  );
-});
-
 it.each(["no-preference", "reduce"])(
   "opens the mobile drawer in place and shields a second tap (%s)",
   async (motion) => {
@@ -681,6 +566,265 @@ it.each(["no-preference", "reduce"])(
     } finally {
       await session.send("Emulation.setEmulatedMedia", { features: [] });
     }
+  },
+);
+
+it("anchors a prepend that crosses into the windowed range after an earlier quote jump", async () => {
+  const { scroll, receive, sock } = await boot([turn(18), turn(19), reply(20, "m19")], [ws], true);
+  scroll.style.overflowAnchor = "none";
+  fireEvent.click(get("#msg-m20 .forward-ref"));
+  expect(document.activeElement?.id).toBe("msg-m19");
+  await nextPaint();
+  move(scroll, 40);
+  expect(sock.frames().at(-1)).toMatchObject({
+    type: "load_messages",
+    before: history[0].timestamp,
+  });
+  const offset = () =>
+    get("#msg-m0").getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+  const before = offset();
+  receive({
+    type: "new_message",
+    message: turn(99, { content: "New content below\n\n".repeat(20) }),
+  });
+  await nextPaint();
+  expect(offset()).toBe(before);
+  const older = Array.from({ length: 50 }, (_, i) => turn(i - 50));
+  older.at(-1)!.content = `\`\`\`ts\nconst long = '${"abcdef".repeat(90)}';\n\`\`\``;
+  receive({
+    type: "workspace_messages",
+    before: history[0].timestamp,
+    messages: older,
+    hasMore: true,
+  });
+  await nextPaint();
+  expect(Math.abs(offset() - before)).toBeLessThanOrEqual(3);
+  const code = get("#msg-m-1 pre");
+  code.scrollLeft = 100;
+  expect(code.scrollLeft).toBe(100);
+  const inner = get("#msg-m-1 pre code");
+  inner.scrollLeft = 100;
+  expect(inner.scrollLeft).toBe(0);
+  expect(scroll.scrollWidth).toBe(scroll.clientWidth);
+  expect(get("#msg-m-1").getAnimations({ subtree: true })).toEqual([]);
+});
+
+it.each([
+  { width: 1280, theme: "light" },
+  { width: 390, theme: "dark" },
+])(
+  "keeps a paged 350+ row reading stream bounded across reader interactions ($width, $theme)",
+  async ({ width, theme }) => {
+    const other = { ...ws, id: "other", name: "Other workspace" };
+    const { scroll, sock, receive } = await mountTranscript([ws, other], width, 844);
+    document.documentElement.dataset.theme = theme;
+    scroll.style.overflowAnchor = "none";
+    const summary = {
+      kind: "tool_use",
+      toolName: "Bash",
+      toolUseId: "test",
+      content: "**Bash**",
+      bodyLength: 2000,
+      resultLength: 2000,
+      contentOffset: 0,
+    };
+    let messages = Array.from({ length: 415 }, (_, index) => {
+      const i = index - 50;
+      return i === 364
+        ? reply(i, "m160")
+        : i === 160
+          ? turn(i, { detail: "summary", events: [summary], content: "**Readable** detail anchor" })
+          : turn(i, {
+              content: `Reply ${i}\n\n${"Variable-height reading text. ".repeat((index % 12) + 1)}`,
+            });
+    });
+    const newestLimit = width < 768 ? 25 : 50;
+    async function servePage(socket: FakeSocket, before?: number, since = 0) {
+      const request = () =>
+        socket
+          .frames()
+          .slice(since)
+          .reverse()
+          .find((frame) => frame.type === "load_messages" && frame.workspaceId === ws.id);
+      const limit = before === undefined ? newestLimit : 50;
+      await expect.poll(() => request()?.limit).toBe(limit);
+      expect(request()?.before).toBe(before);
+      const end =
+        before === undefined ? messages.length : messages.findIndex((m) => m.timestamp === before);
+      const start = Math.max(0, end - limit);
+      act(() =>
+        socket.receive({
+          type: "workspace_messages",
+          workspaceId: ws.id,
+          before: before ?? null,
+          messages: messages.slice(start, before === undefined ? end : end + 1),
+          hasMore: start > 0,
+        }),
+      );
+      await nextPaint();
+      return messages[start];
+    }
+    const bounded = () =>
+      expect(scroll.querySelectorAll("[data-transcript-row]").length).toBeLessThanOrEqual(45);
+    const loaded = () => Number(get(".messages-content").dataset.loadedMessages);
+    const y = (id: string) =>
+      get(`#msg-${id}`).getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+    // Exercise a resize before any scroll notification saves a reading position.
+    const deferScroll = (event: Event) => event.stopImmediatePropagation();
+    if (width >= 768) scroll.addEventListener("scroll", deferScroll, true);
+    let oldest = await servePage(sock);
+    await bottom(scroll);
+    expect(loaded()).toBe(newestLimit);
+    if (width >= 768) {
+      await page.viewport(920, 844);
+      await nextPaint();
+      expect(gap(scroll)).toBeLessThanOrEqual(1);
+      await page.viewport(width, 844);
+      await bottom(scroll);
+      scroll.removeEventListener("scroll", deferScroll, true);
+    }
+    async function prepend(socket: FakeSocket) {
+      const since = socket.frames().length;
+      move(scroll, 0);
+      const before = y(oldest.id);
+      const previous = oldest;
+      oldest = await servePage(socket, oldest.timestamp, since);
+      expect(Math.abs(y(previous.id) - before)).toBeLessThanOrEqual(3);
+      bounded();
+    }
+    for (let i = 0; i < 7; i++) await prepend(sock);
+    expect(loaded()).toBe(newestLimit + 350);
+    fireEvent.click(get(".jump-latest"));
+    await bottom(scroll);
+    expect(get("#msg-m160")).toBeNull();
+    const quote = get("#msg-m364 .forward-ref");
+    quote.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(document.activeElement).toBe(get("#msg-m160"));
+    expectInView(scroll, get("#msg-m160"));
+    bounded();
+
+    const anchor = "m162";
+    move(scroll, scroll.scrollTop + y(anchor) + 9);
+    await nextPaint();
+    const anchored = y(anchor);
+    const steps = () => get<HTMLButtonElement>("#msg-m160 .step-header button");
+    fireEvent.click(steps());
+    expect(sock.frames()).toContainEqual(
+      expect.objectContaining({ type: "load_message_details", messageId: "m160" }),
+    );
+    const events = [
+      {
+        ...summary,
+        content: "**Bash**\n```bash\n" + "echo sample\n".repeat(50) + "```",
+        toolResult: "result",
+      },
+    ];
+    receive({ type: "message_details", messageId: "m160", events });
+    await nextPaint();
+    const expectAnchored = () => expect(Math.abs(y(anchor) - anchored)).toBeLessThanOrEqual(3);
+    expectAnchored();
+    const input = get<HTMLTextAreaElement>("textarea");
+    const height = scroll.clientHeight;
+    const headerY = steps().getBoundingClientRect().top;
+    fireEvent.change(input, { target: { value: "A longer draft\n".repeat(10) } });
+    await expect.poll(() => scroll.clientHeight).toBeLessThan(height);
+    expect(steps().getBoundingClientRect().top).toBeCloseTo(headerY, 0);
+    fireEvent.change(input, { target: { value: "" } });
+    input.focus();
+    const paragraph = get("#msg-m160 .message-content p");
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(scroll.contains(document.activeElement)).toBe(false);
+    move(scroll, scroll.scrollHeight);
+    await expect.poll(() => get("#msg-m162")).toBeNull();
+    expect(get("#msg-m364")).not.toBeNull();
+    expect(get("#msg-m160 .message-content p")).toBe(paragraph);
+    expect(selection.getRangeAt(0)).toBe(range);
+    expect(selection.toString()).toBe("Readable detail anchor");
+    const clipboardData = new DataTransfer();
+    fireEvent(
+      paragraph,
+      new ClipboardEvent("copy", { bubbles: true, cancelable: true, clipboardData }),
+    );
+    expect(clipboardData.getData("text/plain")).toBe("**Readable** detail anchor");
+    selection.removeAllRanges();
+
+    // Close the open trace only after its row has unmounted and remounted.
+    move(scroll, scroll.scrollTop * 0.75);
+    await expect.poll(() => get("#msg-m160")).toBeNull();
+    fireEvent.click(get(".jump-latest"));
+    await bottom(scroll);
+    fireEvent.click(get("#msg-m364 .forward-ref"));
+    await expect.poll(() => steps()?.getAttribute("aria-expanded")).toBe("true");
+    move(scroll, scroll.scrollTop + y(anchor) - anchored);
+    await nextPaint();
+    fireEvent.click(steps());
+    await nextPaint();
+    expectAnchored();
+
+    receive({ type: "message_removed", messageId: "m160" });
+    messages = messages.filter((message) => message.id !== "m160");
+    await nextPaint();
+    expect(get("#msg-m160")).toBeNull();
+    expectAnchored();
+
+    for (const nextWidth of [width === 390 ? 1280 : 390, width]) {
+      const before = get(".messages-content").clientWidth;
+      await page.viewport(nextWidth, 844);
+      await nextPaint();
+      expect(get(".messages-content").clientWidth).not.toBe(before);
+      expectAnchored();
+    }
+
+    chooseWorkspace(other.name);
+    receive({
+      workspaceId: other.id,
+      type: "workspace_messages",
+      messages: [turn(600)],
+      hasMore: false,
+    });
+    expect(get(".messages")).toBe(scroll);
+    const switchRequest = sock.frames().length;
+    chooseWorkspace(ws.name);
+    await servePage(sock, undefined, switchRequest);
+    expect(get(".messages")).toBe(scroll);
+    expectAnchored();
+    fireEvent.change(input, { target: { value: "half a thought" } });
+    input.setSelectionRange(4, 4);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    act(() => sock.drop());
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+    const next = FakeSocket.instances.at(-1)!;
+    expect(next).not.toBe(sock);
+    connect(next, [ws, other]);
+    vi.useRealTimers();
+    await servePage(next);
+    expectAnchored();
+    expect(get("textarea")).toBe(input);
+    expect(input.value).toBe("half a thought");
+    expect(input.selectionStart).toBe(4);
+
+    fireEvent.click(get(".jump-latest"));
+    await bottom(scroll);
+    expect(get("#msg-m364")).not.toBeNull();
+    await prepend(next);
+    expect(loaded()).toBe(messages.length);
+    const first = get<HTMLElement>("[data-window-first] .message");
+    const firstIndex = messages.findIndex((message) => `msg-${message.id}` === first.id);
+    expect(firstIndex).toBeGreaterThan(0);
+    const neighbor = `msg-${messages[firstIndex - 1].id}`;
+    expect(get(`#${neighbor}`)).toBeNull();
+    get<HTMLButtonElement>(`#${first.id} .btn-quote`).focus({ preventScroll: true });
+    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement?.closest(".message")?.id).toBe(neighbor);
+    bounded();
   },
 );
 

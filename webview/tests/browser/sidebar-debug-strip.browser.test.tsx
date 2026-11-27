@@ -90,6 +90,9 @@ afterEach(async () => {
 
 it("unfolds a right-aligned icon desktop strip without layout shift, focus theft, or auto-snapshot", async () => {
   await page.viewport(1280, 800);
+  await cdp().send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "no-preference" }],
+  });
   healthyProbe();
   const onDebugSnapshot = vi.fn(() => Promise.resolve());
   const { container } = render(

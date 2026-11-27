@@ -89,6 +89,7 @@ describe("server telemetry", () => {
       { ...body, events: Array(51).fill(step) },
       ...[
         { path: "/file" },
+        { action: "chat.quote_jump", messageId: "private-message" },
         { ts: "123" },
         { action: "unknown" },
         { layout: "mobile" },
@@ -106,6 +107,9 @@ describe("server telemetry", () => {
       "chat.send",
       "chat.stop",
       "chat.jump_latest",
+      "chat.quote_jump",
+      "chat.history_page",
+      "chat.diagram_preview",
       "chat.cancel_queued",
       "chat.cancel_wakeup",
       "trace.step_toggle",

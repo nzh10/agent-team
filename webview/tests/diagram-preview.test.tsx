@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MdBlock } from "../src/chat/markdown";
+import { DiagramCache } from "../src/chat/diagramCache";
 
 const renderDiagram = vi.hoisted(() => vi.fn());
 vi.mock("../src/chat/diagramRender", () => ({ renderDiagram }));
@@ -13,6 +14,37 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete document.documentElement.dataset.theme;
+});
+
+it("coalesces an off-window render, rejects stale work and charges UTF-16 bytes", async () => {
+  const cache = new DiagramCache();
+  const spec = { language: "mermaid", theme: "light", source: "A" } as const;
+  let finish!: (svg: string) => void;
+  renderDiagram.mockReturnValue(new Promise<string>((resolve) => (finish = resolve)));
+  const offscreen = vi.fn();
+  cache.request("row", spec, offscreen)();
+  const answer = new Promise((resolve) => cache.request("row", spec, resolve));
+  finish(SAFE_SVG);
+  expect(await answer).toEqual({ svg: SAFE_SVG });
+  expect(renderDiagram).toHaveBeenCalledTimes(1);
+  expect(offscreen).not.toHaveBeenCalled();
+
+  const request = (key: string) => new Promise((resolve) => cache.request(key, spec, resolve));
+  const jobs = ["a", "b", "c", "d"].map(request);
+  expect(await request("overflow")).toHaveProperty("error");
+  await Promise.all(jobs);
+  renderDiagram.mockResolvedValue("界".repeat(32_650));
+  for (const key of ["one", "two", "three"]) await request(key);
+  expect(cache.peek("one")).toBeUndefined();
+  expect(cache.peek("two")).toHaveLength(32_650);
+  renderDiagram.mockResolvedValue("界".repeat(32_768));
+  await request("oversized");
+  expect(cache.peek("oversized")).toBeUndefined();
+  cache.request("stale", spec, offscreen);
+  cache.clear();
+  await request("oversized");
+  expect(cache.peek("stale")).toBeUndefined();
+  expect(offscreen).not.toHaveBeenCalled();
 });
 
 describe("diagram preview controls", () => {

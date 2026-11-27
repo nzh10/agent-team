@@ -16,6 +16,7 @@
     "test:browser": "node scripts/run-tests.mjs root browser",
     "test:e2e": "node scripts/run-tests.mjs root e2e",
     "bench:demo": "tsx scripts/bench-demo.ts",
+    "bench:heavy": "tsx scripts/bench-heavy-transcript.ts",
     "test:slow": "node scripts/run-tests.mjs root slow",
     "test:ci": "node scripts/run-tests.mjs root ci",
     "typecheck": "tsc -p tsconfig.json && npm run typecheck --workspaces",

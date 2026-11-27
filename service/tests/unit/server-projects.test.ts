@@ -1939,7 +1939,7 @@ describe("rate limits on the server", () => {
         );
       } finally {
         await s.stop();
-        fs.rmSync(base, { recursive: true, force: true });
+        fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
       }
     },
   );

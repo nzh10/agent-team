@@ -237,7 +237,8 @@ it.each([390, 520, 600, 960])("keeps standalone thinking stable at %ipx", async 
   fireEvent.click(query(".live-thinking summary"));
   expect(details.open).toBe(true);
   void act(() => vi.advanceTimersByTime(1_000));
-  expect(header.textContent).toBe("▾Thinking · 1s");
+  expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  expect(header.textContent).toContain("Thinking · 1s");
   expect(container.querySelectorAll(".chip-live")).toHaveLength(1);
   expect(container.querySelector(".turn-footer")).toBeNull();
   expect(rect(header).height).toBe(headerHeight);
@@ -249,7 +250,7 @@ it.each([390, 520, 600, 960])("keeps standalone thinking stable at %ipx", async 
   expect(toggle.getAttribute("aria-expanded")).toBe("true");
   expect(query(".live-thinking details")).toBe(details);
   expect(details.open).toBe(true);
-  expect(header.textContent).toBe("▾");
+  expect(header.querySelector(".chip-live")).toBeNull();
   expect(container.querySelector(".turn-footer")).toBeNull();
   expect(rect(header).height).toBe(headerHeight);
   expect(rect(box).height).toBe(expandedHeight);
@@ -257,7 +258,7 @@ it.each([390, 520, 600, 960])("keeps standalone thinking stable at %ipx", async 
   flush({ kind: "thinking", content, durationMs: 1_000, waitingSince: Date.now() });
   expect(query(".step-group")).toBe(box);
   expect(toggle.getAttribute("aria-expanded")).toBe("true");
-  expect(header.textContent).toBe("▾1 thinking");
+  expect(header.querySelector(".step-summary")?.textContent).toBe("1 thinking");
   expect(query(".event-thinking details")).toBe(details);
   expect(details.open).toBe(true);
   expect(query(".event-thinking > .event-row .chip-thinking").textContent).toBe("Thought for 1s");

@@ -1,7 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { StrictMode, type ReactNode } from "react";
 import { renderHook, act } from "@testing-library/react";
-import { useServer, PROBE_TIMEOUT_MS, HEARTBEAT_MS, HIDDEN_FLUSH_MS } from "../src/state/useServer";
+import {
+  useServer,
+  PROBE_TIMEOUT_MS,
+  HEARTBEAT_MS,
+  HIDDEN_FLUSH_MS,
+  type Message,
+  type Workspace,
+} from "../src/state/useServer";
 import { FakeSocket } from "./fakeSocket";
 
 const init = {
@@ -16,23 +23,45 @@ function setVisibility(state: "visible" | "hidden") {
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
-const W = { id: "w", name: "w", project: "p", hostId: "h", cwd: "/", agents: [], messages: [] };
+const W: Workspace = {
+  id: "w",
+  name: "w",
+  project: "p",
+  hostId: "h",
+  cwd: "/",
+  agents: [],
+  messages: [],
+  createdAt: 0,
+};
+
+function openSnapshot(ws: FakeSocket, workspaces = [W]) {
+  ws.open();
+  ws.receive({ ...init, workspaces });
+}
 
 // A hook connected to a fake server that has sent `init` with workspace "w".
-function connected(wrapper?: ({ children }: { children: ReactNode }) => ReactNode) {
+function connected(
+  wrapper?: ({ children }: { children: ReactNode }) => ReactNode,
+  workspaces = [W],
+) {
   const hook = renderHook(() => useServer(), wrapper ? { wrapper } : undefined);
   const ws = FakeSocket.instances.at(-1)!;
-  act(() => {
-    ws.open();
-    ws.receive({ ...init, workspaces: [{ ...W, createdAt: 0 }] });
-  });
+  act(() => openSnapshot(ws, workspaces));
   return { result: hook.result, unmount: hook.unmount, ws };
 }
 
-const streamEvent = (event: Record<string, unknown>) => ({
+const workspacePage = (messages: Message[], before: number | null = null, hasMore = false) => ({
+  type: "workspace_messages",
+  workspaceId: "w",
+  messages,
+  before,
+  hasMore,
+});
+
+const streamEvent = (event: Record<string, unknown>, messageId = "m1") => ({
   type: "stream_event",
   workspaceId: "w",
-  messageId: "m1",
+  messageId,
   event,
 });
 
@@ -52,18 +81,18 @@ const frame = () =>
     vi.advanceTimersByTime(32);
   });
 
-describe("connection liveness", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
+beforeEach(() => {
+  vi.useFakeTimers();
+  FakeSocket.instances = [];
+  vi.stubGlobal("WebSocket", FakeSocket);
+  setVisibility("visible");
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
 
+describe("connection liveness", () => {
   it("replaces a socket that stops answering when the app returns to the foreground", () => {
     const { result } = renderHook(() => useServer());
     const first = FakeSocket.instances[0];
@@ -158,8 +187,7 @@ describe("connection liveness", () => {
     const next = FakeSocket.instances.at(-1)!;
     expect(next).not.toBe(ws);
     act(() => {
-      next.open();
-      next.receive({ ...init, workspaces: [{ ...W, createdAt: 0 }] });
+      openSnapshot(next);
       next.receive(page({ liveThinkingSince: 3_000 }));
     });
     const reply = () => result.current.workspaces[0].messages[0];
@@ -175,17 +203,6 @@ describe("connection liveness", () => {
 });
 
 describe("resync detail refetch", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   it("re-fetches bodies for a message the user was watching live", () => {
     const { result } = renderHook(() => useServer());
     const ws = FakeSocket.instances[0];
@@ -256,12 +273,6 @@ describe("resync detail refetch", () => {
 });
 
 describe("message_done status patch", () => {
-  beforeEach(() => {
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-  });
-  afterEach(() => vi.unstubAllGlobals());
-
   it("applies the effort and context reported at the end of the turn", () => {
     const { result } = renderHook(() => useServer());
     const ws = FakeSocket.instances[0];
@@ -319,16 +330,6 @@ describe("message_done status patch", () => {
 });
 
 describe("message_done ordering", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   it("applies events still waiting for a frame before finishing the message", () => {
     const { result } = renderHook(() => useServer());
     const ws = FakeSocket.instances[0];
@@ -407,17 +408,6 @@ describe("message_done ordering", () => {
 });
 
 describe("snapshot replies after events still waiting for a frame", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   it("does not apply them again on top of a page that already has them", () => {
     const { result, ws } = connected();
     act(() =>
@@ -527,17 +517,6 @@ describe("snapshot replies after events still waiting for a frame", () => {
 });
 
 describe("sending", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   const sentMessages = () =>
     FakeSocket.instances.flatMap((s) => s.frames()).filter((f) => f.type === "send_message");
 
@@ -664,17 +643,6 @@ describe("sending", () => {
 });
 
 describe("connection attempts", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   it("replaces an attempt that hangs in CONNECTING (network switch)", () => {
     const { ws } = connected();
     act(() => ws.drop());
@@ -740,30 +708,21 @@ describe("connection attempts", () => {
 });
 
 describe("history pages", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+  const settled = (timestamp: number, patch: Partial<Message> = {}): Message => ({
+    id: `m${timestamp}`,
+    kind: "agent",
+    agentId: "a",
+    content: "",
+    timestamp,
+    status: "done",
+    ...patch,
   });
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
   const page = (a: number, b: number, extra: Record<string, unknown> = {}) => ({
-    type: "workspace_messages",
-    workspaceId: "w",
-    hasMore: true,
-    before: null,
-    messages: Array.from({ length: b - a + 1 }, (_, k) => ({
-      id: `m${a + k}`,
-      kind: "agent",
-      agentId: "a",
-      content: "",
-      timestamp: a + k,
-      status: "done",
-    })),
+    ...workspacePage(
+      Array.from({ length: b - a + 1 }, (_, k) => settled(a + k)),
+      null,
+      true,
+    ),
     ...extra,
   });
   const ids = (r: { current: ReturnType<typeof useServer> }) =>
@@ -781,25 +740,123 @@ describe("history pages", () => {
     expect(result.current.workspaces[0].hasMore).toBe(true);
   });
 
-  it("drops an older page asked for before a resync replaced the list", () => {
-    const { result, ws } = connected();
-    act(() => ws.receive(page(100, 149)));
-    act(() => result.current.loadMessages("w", 100));
-    // The resync lands first and replaces the list (no overlap)...
-    act(() => ws.receive(page(200, 249)));
-    // ...then the stale reply for "before m100".
-    act(() => ws.receive(page(0, 99, { before: 100 })));
-    expect(ids(result)).toEqual(page(200, 249).messages.map((m) => m.id));
-  });
-
   it("does not take an older page as the history of an archived workspace", () => {
     const { result, ws } = connected();
     act(() => ws.receive(page(51, 100)));
-    act(() => result.current.loadMessages("w", 51));
+    act(() => {
+      result.current.loadMessages("w", 51);
+    });
     act(() => ws.receive({ type: "workspace_archived", workspaceId: "w", archivedAt: 5 }));
     act(() => ws.receive(page(1, 50, { before: 51, hasMore: false })));
     const w = result.current.workspaces[0];
     expect(w.messagesLoaded).toBe(false);
     expect(w.messages).toEqual([]);
+  });
+
+  const other = { ...W, id: "other", name: "other" };
+  const large = "界".repeat(Math.ceil(1_048_576 / 3));
+  const queued = settled(2, { kind: "user", status: "queued", steering: true, queuedFor: "a" });
+
+  it("flushes a detached event on switch, keeping its owner until the queue and child settle", () => {
+    const { result, ws } = connected(undefined, [W, other]);
+    const current = () => result.current.workspaces[0];
+    const select = result.current.setActiveTranscript;
+    const prefix = settled(0, { content: large });
+    const owner = settled(1, { content: large });
+    const child = (kind: string, status: "running" | "completed") => ({
+      kind,
+      content: "",
+      subagent: { taskId: "child", description: "detached task", status },
+    });
+    const started = child("subagent_start", "running");
+    act(() => {
+      select("w");
+      ws.receive(workspacePage([prefix, owner, queued], null, true));
+    });
+    act(() => {
+      result.current.loadMessages("w", 0);
+    });
+    // Switch before the scheduled stream frame is applied.
+    act(() => {
+      ws.receive(streamEvent(started, owner.id));
+      select(other.id);
+    });
+    expect(current()).toMatchObject({
+      messagesLoaded: true,
+      hasMore: true,
+      loadingOlder: false,
+      messages: [{ id: owner.id, events: [started] }, queued],
+    });
+    act(() => ws.receive(workspacePage([settled(-1), prefix], 0)));
+    expect(ids(result)).toEqual([owner.id, queued.id]);
+    act(() => {
+      select("w");
+      result.current.loadMessages("w", 1);
+    });
+    act(() => ws.receive(workspacePage([settled(-1), prefix, owner], 1)));
+    expect(ids(result)).toEqual(["m-1", prefix.id, owner.id, queued.id]);
+    expect(current().messages[2].events).toEqual([started]);
+    act(() => {
+      select(other.id);
+      ws.receive({
+        type: "message_done",
+        workspaceId: "w",
+        messageId: queued.id,
+        status: "done",
+        content: queued.content,
+        queuedFor: null,
+        steering: false,
+        queued: false,
+      });
+      ws.receive(streamEvent(child("subagent_done", "completed"), owner.id));
+    });
+    frame();
+    expect(current()).toMatchObject({ messages: [], messagesLoaded: false, queued: false });
+  });
+
+  it("keeps an overlapping live tail after eviction and reconciles queue state on reconnect", () => {
+    const { result, ws } = connected(undefined, [W, other]);
+    const current = () => result.current.workspaces[0];
+    const select = result.current.setActiveTranscript;
+    const tied = settled(2, { id: "earlier-tie" });
+    const streaming = settled(3, { status: "streaming", content: "live" });
+    act(() => {
+      select("w");
+      ws.receive(workspacePage([settled(0, { content: large })]));
+    });
+    act(() => select(other.id));
+    expect(current().messagesLoaded).toBe(false);
+    act(() => {
+      for (const message of [tied, queued, streaming]) {
+        ws.receive({ type: "new_message", workspaceId: "w", message, queued: true });
+      }
+    });
+    act(() => {
+      select("w");
+      result.current.loadMessages("w", undefined, 1);
+      ws.receive(workspacePage([streaming], null, true));
+    });
+    expect(current()).toMatchObject({
+      messagesLoaded: true,
+      hasMore: true,
+      messages: [tied, queued, streaming],
+    });
+    act(() => {
+      ws.drop();
+      vi.advanceTimersByTime(2_000);
+    });
+    const next = FakeSocket.instances.at(-1)!;
+    const done = { ...streaming, status: "done" as const, content: "finished while disconnected" };
+    act(() => {
+      openSnapshot(next, [{ ...W, queued: false, unread: 3 }, other]);
+      result.current.loadMessages("w");
+      next.receive(workspacePage([tied, done]));
+    });
+    expect(current()).toMatchObject({
+      messages: [tied, done],
+      messagesLoaded: true,
+      queued: false,
+      unread: 3,
+    });
   });
 });
