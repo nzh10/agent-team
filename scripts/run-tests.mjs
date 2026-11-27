@@ -30,6 +30,7 @@ async function runRoot() {
   const parallel = async (...runs) => (await Promise.all(runs)).find(Boolean) ?? 0;
   const workers = Math.max(1, Math.min(4, Math.ceil(availableParallelism() / 3)));
   const workerFlag = `--maxWorkers=${workers}`;
+  const tooling = () => runAsync(["--test", "scripts/capture-tooling.test.ts"], repo);
   const browser = () => workspaceRun("webview", "browser", ["--from-suite", workerFlag]);
   const browserE2e = (files) =>
     workspaceRun("service", "e2e", [
@@ -40,7 +41,11 @@ async function runRoot() {
     ]);
   switch (tier) {
     case "unit":
-      return (await workspaceRun("service", tier, args)) || workspaceRun("webview", tier, args);
+      return (
+        (await workspaceRun("service", tier, args)) ||
+        (await workspaceRun("webview", tier, args)) ||
+        (args.length ? 0 : tooling())
+      );
     case "fast": {
       // Preserve CLI behavior (including native reporter stdout) for explicit arguments.
       if (args.length)
@@ -82,6 +87,7 @@ async function runRoot() {
           ]),
           browser(),
           stabilityE2e(),
+          tooling(),
         ),
       );
     }
@@ -98,7 +104,7 @@ async function runRoot() {
         const browserReliability = async () =>
           (await browser()) ||
           (await browserE2e(["demo-browser.test.ts", "journey-", "telemetry-browser.test.ts"]));
-        const common = await parallel(units, browserReliability());
+        const common = await parallel(units, browserReliability(), tooling());
         if (common || process.platform !== "linux") return common;
         // Pi takes a host-level port baseline. Run it after all other test listeners close.
         return workspaceRun("service", "e2e", [

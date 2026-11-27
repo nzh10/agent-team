@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,80 +13,7 @@ import { PiRpcClient } from "../service/src/session/pi-rpc";
 import { PiSession } from "../service/src/session/pi";
 import type { StreamEvent, UiDialogRequest } from "../service/src/session/types";
 
-function processSnapshot() {
-  return execFileSync("ps", ["-ww", "-axo", "pid=,ppid=,lstart=,command="], {
-    encoding: "utf8",
-    maxBuffer: 16 << 20,
-    timeout: 1000,
-  })
-    .split("\n")
-    .flatMap((line) => {
-      const row = /^\s*(\d+)\s+(\d+)\s+(.{24})\s+(.+)$/.exec(line);
-      return row
-        ? [{ pid: Number(row[1]), parent: Number(row[2]), identity: row[3], command: row[4] }]
-        : [];
-    });
-}
-
-export function trackAcceptanceProcesses(markers: string[]) {
-  const baseline = new Map(processSnapshot().map((row) => [row.pid, row.identity]));
-  const owned = new Map<number, string>();
-  function capture() {
-    const rows = processSnapshot();
-    const live = new Map(rows.map(({ pid, identity }) => [pid, identity]));
-    let size: number;
-    do {
-      size = owned.size;
-      for (const { pid, parent, identity, command } of rows) {
-        if (
-          pid === process.pid ||
-          baseline.get(pid) === identity ||
-          /(?:^|\/)ps -ww -axo /.test(command)
-        )
-          continue;
-        if (
-          parent === process.pid ||
-          (live.has(parent) && owned.get(parent) === live.get(parent)) ||
-          markers.some((marker) => command.includes(marker))
-        )
-          owned.set(pid, identity);
-      }
-    } while (size !== owned.size);
-    return rows.filter(({ pid, identity }) => owned.get(pid) === identity).map(({ pid }) => pid);
-  }
-  let samplingError: unknown;
-  const timer = setInterval(() => {
-    try {
-      capture();
-    } catch (error) {
-      samplingError = error;
-    }
-  }, 150);
-  timer.unref();
-  return {
-    capture,
-    observed: () => [...owned.keys()],
-    async release(deadline: number) {
-      clearInterval(timer);
-      let remaining = capture();
-      while (remaining.length && Date.now() < deadline) {
-        await sleep(50);
-        remaining = capture();
-      }
-      // Record the leak before emergency cleanup; it must never count as a pass.
-      for (const pid of remaining) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        }
-      }
-      if (samplingError)
-        throw new Error("Could not sample the acceptance process tree", { cause: samplingError });
-      return remaining;
-    },
-  };
-}
+import { trackAcceptanceProcesses } from "./capture-child";
 
 interface RunReport {
   status: "PASS" | "BLOCKED";

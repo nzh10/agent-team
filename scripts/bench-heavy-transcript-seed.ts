@@ -1,44 +1,33 @@
-import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ObjectiveStore } from "../service/src/project/objectives";
 import { ProjectStore } from "../service/src/project/store";
 import type { StreamEvent } from "../service/src/session/types";
-import { closeHistory, saveIndex, saveWorkspace } from "../service/src/workspace/state";
+import { saveIndex } from "../service/src/workspace/state";
 import { summarizeMessages } from "../service/src/workspace/summary";
-import type { AgentState, Message } from "../service/src/workspace/workspace";
+import type { AgentState, Message, WorkspaceState } from "../service/src/workspace/workspace";
+import { seedCommit, seedGit, seedWorkspaces } from "./seed-corpus";
 
-// Permute the archive size bands so the journey does not visit only small
-// or only large siblings. These are aggregate quantiles, not actual rows.
-function archiveCount(i: number) {
-  const rank = ((i - 8) * 37) % 85;
-  return rank === 0
-    ? 2
-    : rank < 9
-      ? 1
-      : rank < 24
-        ? 3
-        : rank < 53
-          ? 4
-          : rank < 61
-            ? 5
-            : rank < 69
-              ? 7
-              : rank < 77
-                ? 9
-                : rank < 83
-                  ? 10
-                  : rank === 83
-                    ? 19
-                    : 30;
-}
+// [Messages per archive, number of archives] from aggregate quantiles.
+const archiveSizes = [
+  [2, 1],
+  [1, 8],
+  [3, 15],
+  [4, 29],
+  [5, 8],
+  [7, 8],
+  [9, 8],
+  [10, 6],
+  [19, 1],
+  [30, 1],
+].flatMap(([size, count]) => Array<number>(count).fill(size));
 
 export const fixtures = Array.from({ length: 93 }, (_, i) => ({
   id: `bench-ws-${i}`,
   name: i < 3 ? `Benchmark Project ${i + 1}` : `Synthetic session ${i}`,
   project: i < 3 ? i : 0,
   archived: i >= 8,
-  count: [1053, 334, 17, 13, 11, 10, 9, 7][i] ?? archiveCount(i),
+  // Permute the bands so adjacent sessions do not all have similar sizes.
+  count: [1053, 334, 17, 13, 11, 10, 9, 7][i] ?? archiveSizes[((i - 8) * 37) % archiveSizes.length],
 }));
 export type Fixture = (typeof fixtures)[number];
 export const messageId = (ws: Fixture, seq: number) => `${ws.id}-message-${seq}`;
@@ -221,22 +210,9 @@ export function seedHeavyTranscript(base: string) {
   const repos = fixtures.slice(0, 3).map((ws, i) => {
     const root = join(base, `synthetic-repo-${i + 1}`);
     mkdirSync(root);
-    const git = (...args: string[]) =>
-      execFileSync("git", ["-C", root, ...args], { stdio: "pipe" });
-    git("init", "--quiet", "-b", "main");
+    seedGit("-C", root, "init", "--quiet", "-b", "main");
     writeFileSync(join(root, "sample.txt"), "Synthetic source\n");
-    git("add", "sample.txt");
-    git(
-      "-c",
-      "user.name=Benchmark",
-      "-c",
-      "user.email=benchmark@example.invalid",
-      "-c",
-      "commit.gpgsign=false",
-      "commit",
-      "-qm",
-      "Seed synthetic file",
-    );
+    seedCommit(root, "Benchmark", "benchmark@example.invalid", "sample.txt", "Seed synthetic file");
     writeFileSync(join(root, "sample.txt"), "Synthetic source\nSynthetic change\n");
     const id = `bench-project-${i}`;
     projects.save({
@@ -249,21 +225,6 @@ export function seedHeavyTranscript(base: string) {
       lead: { hostId: "local", workspaceId: ws.id },
       createdAt: epoch + i,
     });
-    const board = new ObjectiveStore(projects.objectivesDir(id));
-    for (const j of [1, 2])
-      board.write({
-        id: `sample/phase-${j}`,
-        area: "sample",
-        title: `Synthetic objective ${j}`,
-        goal: "Compare the two seeded samples.",
-        status: "active",
-        priority: "normal",
-        dependsOn: j === 2 ? ["sample/phase-1"] : [],
-        tasks: [],
-        decisions: [],
-        sessions: [],
-        updatedAt: epoch,
-      });
     return root;
   });
   const stats = {
@@ -273,7 +234,7 @@ export function seedHeavyTranscript(base: string) {
     storedBytes: 0,
     summaryBytes: 0,
   };
-  try {
+  function* states(): Iterable<WorkspaceState> {
     for (const [i, ws] of fixtures.entries()) {
       const cwd = repos[ws.project];
       const messages = messagesFor(ws, i);
@@ -299,7 +260,10 @@ export function seedHeavyTranscript(base: string) {
         },
       };
       const lastActivityAt = messages.at(-1)!.timestamp;
-      saveWorkspace(base, {
+      stats.messages += messages.length;
+      stats.storedBytes += Buffer.byteLength(JSON.stringify(messages));
+      stats.summaryBytes += Buffer.byteLength(JSON.stringify(summarizeMessages(messages)));
+      yield {
         id: ws.id,
         name: ws.name,
         project: `Synthetic ${ws.project + 1}`,
@@ -311,17 +275,13 @@ export function seedHeavyTranscript(base: string) {
         lastActivityAt,
         archivedAt: ws.archived ? lastActivityAt + 1000 : null,
         projectLink: { projectId: `bench-project-${ws.project}`, role: i < 3 ? "lead" : "worker" },
-      });
-      stats.messages += messages.length;
-      stats.storedBytes += Buffer.byteLength(JSON.stringify(messages));
-      stats.summaryBytes += Buffer.byteLength(JSON.stringify(summarizeMessages(messages)));
+      };
     }
-    saveIndex(
-      base,
-      fixtures.map(({ id }) => id),
-    );
-  } finally {
-    closeHistory(base);
   }
+  seedWorkspaces(base, states());
+  saveIndex(
+    base,
+    fixtures.map(({ id }) => id),
+  );
   return stats;
 }

@@ -3,28 +3,15 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { parseJsonl, readJsonl, writeJsonl } from "./capture-io.ts";
 import { steerReceipt } from "../service/tests/snap/pi-capture-contract.ts";
 import { moreExcerpts } from "./pi-scenario-excerpts.mjs";
 import { sanitizer } from "./capture-pi.ts";
 import { extractScenarioWidgets } from "./pi-scenario-widgets.mjs";
 import { discoverLocalPiPackages } from "../service/src/session/pi-agent-home.ts";
 
-const rows = (text) =>
-  text
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
-export function extract(dir, snap) {
-  const files = new Map(
-    rows(fs.readFileSync(path.join(dir, "files.ndjson"), "utf8")).map(({ file, data }) => [
-      file,
-      data,
-    ]),
-  );
-  const sessions = fs
-    .readdirSync(dir)
-    .filter((n) => n.endsWith(".jsonl"))
-    .map((n) => rows(fs.readFileSync(path.join(dir, n), "utf8")));
+function extract(sessions, files, snap) {
   moreExcerpts(sessions, snap);
   const lead = sessions.find((rows) =>
     rows.some((r) => r.sent?.message === "pi-e2e-launch:reconcile"),
@@ -37,38 +24,30 @@ export function extract(dir, snap) {
     )
     .filter((r) => r.frame?.type === "response");
   const cleanBoot = sanitizer();
-  fs.writeFileSync(
-    path.join(snap, "pi/messages/startup.jsonl"),
-    [
-      {
-        header: {
-          source: "pi-deterministic E2E / startup RPC",
-          model: "pi-e2e/scenario",
-          recordedAt: new Date(startup[0].at).toISOString(),
-        },
+  writeJsonl(path.join(snap, "pi/messages/startup.jsonl"), [
+    {
+      header: {
+        source: "pi-deterministic E2E / startup RPC",
+        model: "pi-e2e/scenario",
+        recordedAt: new Date(startup[0].at).toISOString(),
       },
-      ...startup.map((r) => ({ frame: cleanBoot(r.frame) })),
-    ]
-      .map((r) => JSON.stringify(r))
-      .join("\n") + "\n",
-  );
+    },
+    ...startup.map((r) => ({ frame: cleanBoot(r.frame) })),
+  ]);
   const steer = lead.find(
     (r) => r.frame?.command === "steer" && r.frame.data?.disposition === "queued",
   );
   if (!steer || steer.frame.success !== true) throw new Error("Missing real steer receipt");
-  fs.writeFileSync(
-    path.join(snap, "pi/messages/steer.jsonl"),
-    JSON.stringify({
+  writeJsonl(path.join(snap, "pi/messages/steer.jsonl"), [
+    {
       header: {
         source: "pi-deterministic E2E / Pi RPC",
         model: "pi-e2e/scenario",
         recordedAt: new Date(steer.at).toISOString(),
       },
-    }) +
-      "\n" +
-      JSON.stringify({ frame: steerReceipt(steer.frame) }) +
-      "\n",
-  );
+    },
+    { frame: steerReceipt(steer.frame) },
+  ]);
   for (const [kind, prompt, description] of [
     [
       "foreground",
@@ -93,7 +72,7 @@ export function extract(dir, snap) {
       for (const s of steps) {
         const file = s.sessionFile;
         const slot = `$child-${Object.keys(artifacts).length + 1}`;
-        const records = rows(files.get(file));
+        const records = parseJsonl(files.get(file));
         const leaf = records.findLast((r) => r.message?.role === "assistant");
         if (records[0].version !== 3 || !leaf) throw new Error("Invalid child artifact");
         slots.set(file, slot);
@@ -183,16 +162,13 @@ export function extract(dir, snap) {
       model: "pi-e2e/scenario",
       recordedAt: new Date(clip.at(-1).at).toISOString(),
     };
-    fs.writeFileSync(
-      path.join(snap, "pi", fixture + ".jsonl"),
-      [{ header }, ...entries].map((r) => JSON.stringify(r)).join("\n") + "\n",
-    );
+    writeJsonl(path.join(snap, "pi", `${fixture}.jsonl`), [{ header }, ...entries]);
   }
 }
 export function captureScenario(snap, widgets = false) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-scenario-"));
   try {
-    const root = path.resolve(snap, "../../..");
+    const root = fileURLToPath(new URL("..", import.meta.url));
     const tap = new URL("./pi-scenario-tap.mjs", import.meta.url);
     execFileSync(
       process.execPath,
@@ -210,6 +186,10 @@ export function captureScenario(snap, widgets = false) {
         stdio: "inherit",
       },
     );
+    const sessions = fs
+      .readdirSync(dir)
+      .filter((name) => name.endsWith(".jsonl"))
+      .map((name) => readJsonl(path.join(dir, name)));
     if (widgets) {
       const { piSubagentsRoot } = discoverLocalPiPackages();
       const cli = execFileSync(process.env.PI_BINARY ?? "pi", ["--version"], {
@@ -218,12 +198,13 @@ export function captureScenario(snap, widgets = false) {
       const { version: piSubagents } = JSON.parse(
         fs.readFileSync(path.join(piSubagentsRoot, "package.json"), "utf8"),
       );
-      const sessions = fs
-        .readdirSync(dir)
-        .filter((n) => n.endsWith(".jsonl"))
-        .map((n) => rows(fs.readFileSync(path.join(dir, n), "utf8")));
       extractScenarioWidgets(sessions, snap, { cli, piSubagents });
-    } else extract(dir, snap);
+    } else {
+      const files = new Map(
+        readJsonl(path.join(dir, "files.ndjson")).map(({ file, data }) => [file, data]),
+      );
+      extract(sessions, files, snap);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

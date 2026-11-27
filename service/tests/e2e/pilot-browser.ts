@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { chromium, type Page } from "playwright";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
+import { ensureWebviewBuilt } from "../../../scripts/browser-harness";
 import type { Server } from "../../src/server/server";
 import type { WorkspaceState } from "../../src/workspace/workspace";
 import { observeBrowserErrors } from "./pilot-assertions";

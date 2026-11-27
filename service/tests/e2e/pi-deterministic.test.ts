@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { WebSocket } from "ws";
 import { expect, it, vi } from "vitest";
-import { trackAcceptanceProcesses } from "../../../scripts/e2e-pi-acp";
+import { trackAcceptanceProcesses } from "../../../scripts/capture-child";
 import {
   TRACE_MAX_BYTES,
   TRACE_MAX_EVENTS,

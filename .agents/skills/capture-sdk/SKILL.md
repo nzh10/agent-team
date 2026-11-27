@@ -27,7 +27,7 @@ One fixture = three files in `service/tests/snap/<backend>/`:
 
 ```bash
 npm run capture -- codex commands                              # writes service/tests/snap/codex/commands.jsonl
-npm run summarize -- service/tests/snap/codex/commands.jsonl   # one line per entry
+npm run summarize -- service/tests/snap/codex/commands.jsonl   # folds consecutive Codex deltas
 ```
 
 - Steps: `send`, `wait`, `end`, `abort`, `interrupt`, `compact` (`thread/compact/start`), and `requeued` (a steered message the stopped turn never read). A `send` while a turn runs is `turn/steer`; `end` stops the app-server and the next step resumes the thread in a new one. `tools` declares client-defined tools (`dynamicTools`) answered with each one's `reply`.
@@ -46,6 +46,7 @@ npm run capture -- pi tools-bash-edit
 
 # Offline deterministic E2E RPC tap (no online account quota):
 npm run capture -- pi scenario
+npm run capture -- pi scenario-widgets
 
 # Offline retry/compaction fault recordings under real Pi CLI:
 npm run capture -- pi compaction-and-retry
@@ -53,6 +54,7 @@ npm run capture -- pi retry-failed
 
 # Passive anonymized get_messages excerpt from an existing Pi v3 session transcript:
 npm run --silent capture -- pi extract ~/.yaat/pi-sessions/<ws>/<file>.jsonl <1-based-line>
+npm run summarize -- service/tests/snap/pi/basic-turn.jsonl   # Pi RPC commands and events
 ```
 
 - **Do not reconstruct RPC deltas** from `~/.yaat/.agent-team/logs/*/stream.jsonl` (Workspace projections) or Pi v3 transcripts (final messages only). Use live `pi --mode rpc`, offline `pi scenario`, or `pi extract` (which restores the redacted entry inside a credential-free offline Pi to serialize its true `get_messages` RPC shape).

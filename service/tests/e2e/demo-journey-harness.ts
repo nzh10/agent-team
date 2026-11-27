@@ -10,7 +10,7 @@ import {
   type Page,
 } from "playwright";
 import { expect } from "vitest";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
+import { ensureWebviewBuilt } from "../../../scripts/browser-harness";
 import { seedDemo, type SeedDemoResult } from "../../../scripts/seed-demo";
 import { Server } from "../../src/server/server";
 import { closeHistory } from "../../src/workspace/state";

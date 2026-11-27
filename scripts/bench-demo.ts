@@ -1,69 +1,29 @@
-// Full-stack Chromium Demo E2E + Performance Benchmark harness.
-//
-// Reuses BOTH:
-//   1. scripts/seed-demo.ts — real git clone + worktrees + project + Lead/Worker
-//      sessions + objectives/issues/notes + archived workspace + history
-//   2. webview/src/dev/replayFixture.ts — Workspace UI 🎬 Replay Demo played
-//      through the live client dispatch pipeline
-//
-// Runs against the real Server (real HostRegistry/LocalHost, real HTTP/WS, real
-// built dist/webview bundle) and real headless Playwright Chromium.
-//
-// Usage:
-//   npm run bench:demo
-//   npm run bench:demo -- --json
-//   npm run bench:demo -- --rebuild
+// Exercise the seeded Demo and the client Replay Demo against a real loopback
+// server and the production bundle. Usage: npm run bench:demo -- [--json] [--rebuild]
 
 import { deepStrictEqual, strictEqual } from "node:assert";
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import { createConnection } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type CDPSession,
-  type Locator,
-  type Page,
-} from "playwright";
-import { Server } from "../service/src/server/server";
+import type { Browser, Locator, Page } from "playwright";
+import type { Server } from "../service/src/server/server";
 import { loadWorkspaceMessages } from "../service/src/workspace/state";
-import { seedDemo, type SeedDemoResult } from "./seed-demo";
-
-function findRepoRoot(): string {
-  const start = typeof __dirname === "string" ? __dirname : process.cwd();
-  let dir = path.resolve(start);
-  for (;;) {
-    if (
-      fs.existsSync(path.join(dir, "package.json")) &&
-      fs.existsSync(path.join(dir, "service")) &&
-      fs.existsSync(path.join(dir, "webview"))
-    ) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return path.resolve(process.cwd());
-    dir = parent;
-  }
-}
-
-const ROOT = findRepoRoot();
-const WEB_DIR = path.join(ROOT, "dist", "webview");
-const WEBVIEW_WATCH_PATHS = [
-  path.join(ROOT, "webview", "src"),
-  path.join(ROOT, "webview", "index.html"),
-  path.join(ROOT, "webview", "vite.config.ts"),
-];
-
-export interface CdpMemorySample {
-  jsHeapUsedMb: number;
-  jsHeapTotalMb: number;
-  domNodes: number;
-  documents: number;
-}
+import {
+  browserViewport,
+  ensureWebviewBuilt,
+  launchChromium,
+  loopbackOrigin,
+  mb,
+  openProfilePage,
+  round,
+  sampleCdpMemory,
+  startLoopbackServer,
+  verifyPortClosed,
+  type CdpMemorySample,
+} from "./browser-harness";
+import { isScriptMain } from "./script-paths.mjs";
+import { seedDemo } from "./seed-demo";
 
 export interface ServerMemorySample {
   rssMb: number;
@@ -116,70 +76,11 @@ export interface DemoSuiteOptions {
   quiet?: boolean;
 }
 
-function round(n: number, digits = 2): number {
-  const f = 10 ** digits;
-  return Math.round(n * f) / f;
-}
-
 function percentile(values: readonly number[], p: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
   return sorted[idx];
-}
-
-function mb(bytes: number): number {
-  return round(bytes / (1024 * 1024), 2);
-}
-
-function latestMtimeMs(targetPath: string): number {
-  if (!fs.existsSync(targetPath)) return 0;
-  const stat = fs.statSync(targetPath);
-  if (!stat.isDirectory()) return stat.mtimeMs;
-  let max = stat.mtimeMs;
-  for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
-    const childMtime = latestMtimeMs(path.join(targetPath, entry.name));
-    if (childMtime > max) max = childMtime;
-  }
-  return max;
-}
-
-export function ensureWebviewBuilt(force = false, quiet = false): void {
-  const indexHtml = path.join(WEB_DIR, "index.html");
-  let needsBuild = force || !fs.existsSync(indexHtml);
-  if (!needsBuild) {
-    const builtMtime = fs.statSync(indexHtml).mtimeMs;
-    const srcMtime = Math.max(...WEBVIEW_WATCH_PATHS.map(latestMtimeMs));
-    if (srcMtime > builtMtime) needsBuild = true;
-  }
-  if (!needsBuild) return;
-  const npm = process.env.npm_execpath;
-  const out = execFileSync(
-    npm ? process.execPath : "npm",
-    [...(npm ? [npm] : []), "run", "build", "-w", "webview"],
-    {
-      cwd: ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  if (!quiet && out.length > 0) {
-    process.stderr.write(out);
-  }
-  if (!fs.existsSync(indexHtml)) {
-    throw new Error(`Webview build did not produce ${indexHtml}`);
-  }
-}
-
-async function sampleCdpMemory(cdp: CDPSession): Promise<CdpMemorySample> {
-  await cdp.send("HeapProfiler.collectGarbage").catch(() => {});
-  const { metrics } = await cdp.send("Performance.getMetrics");
-  const map = new Map(metrics.map((m) => [m.name, m.value]));
-  return {
-    jsHeapUsedMb: mb(map.get("JSHeapUsedSize") ?? 0),
-    jsHeapTotalMb: mb(map.get("JSHeapTotalSize") ?? 0),
-    domNodes: Math.round(map.get("Nodes") ?? 0),
-    documents: Math.round(map.get("Documents") ?? 0),
-  };
 }
 
 function sampleServerMemory(): ServerMemorySample {
@@ -195,19 +96,6 @@ async function measureHorizontalOverflowPx(page: Page): Promise<number> {
   return page.evaluate<number>(
     `(() => Math.max(0, document.documentElement.scrollWidth - window.innerWidth))()`,
   );
-}
-
-async function verifyPortClosed(port: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const socket = createConnection({ host: "127.0.0.1", port });
-    const done = (closed: boolean) => {
-      socket.destroy();
-      resolve(closed);
-    };
-    socket.setTimeout(500, () => done(false));
-    socket.once("connect", () => done(false));
-    socket.once("error", (err: NodeJS.ErrnoException) => done(err.code === "ECONNREFUSED"));
-  });
 }
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -238,46 +126,20 @@ export async function runDemoBrowserSuite(
   const suiteStarted = performance.now();
 
   const tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "yaat-demo-e2e-")));
-  const prevHost = process.env.AGENT_TEAM_HOST;
-  const consoleErrors: string[] = [];
-  const pageErrors: string[] = [];
+  let consoleErrors: string[];
+  let pageErrors: string[];
   const journeysVerified: string[] = [];
 
-  let seeded: SeedDemoResult | undefined;
   let server: Server | undefined;
   let port: number | undefined;
   let browser: Browser | undefined;
-  let context: BrowserContext | undefined;
-  let page: Page | undefined;
-  let cdp: CDPSession | undefined;
-
-  let seedMs = 0;
-  let serverStartMs = 0;
-  let hydrationMs = 0;
-  const workspaceSwitchSamplesMs: number[] = [];
-  let boardOpenMs = 0;
-  let replayStats: ReplayBenchmarkStats | undefined;
-  let clientBeforeReplay: CdpMemorySample | undefined;
-  let clientAfterReplay: CdpMemorySample | undefined;
-  let serverBeforeReplay: ServerMemorySample | undefined;
-  let serverAfterReplay: ServerMemorySample | undefined;
-  let desktopOverflowPx = 0;
-  let mobileOverflowPx = 0;
+  let metrics: Omit<DemoBenchmarkMetrics, "totalDurationMs">;
   let portClosed = false;
 
   let teardownPromise: Promise<void> | null = null;
   const teardown = (): Promise<void> => {
     if (teardownPromise) return teardownPromise;
     teardownPromise = (async () => {
-      if (cdp) {
-        await withTimeout(cdp.detach(), 5_000).catch(() => {});
-      }
-      if (page) {
-        await withTimeout(page.close(), 5_000).catch(() => {});
-      }
-      if (context) {
-        await withTimeout(context.close(), 5_000).catch(() => {});
-      }
       if (browser) {
         await withTimeout(browser.close(), 10_000).catch(() => {});
       }
@@ -287,8 +149,6 @@ export async function runDemoBrowserSuite(
       if (port !== undefined) {
         portClosed = await verifyPortClosed(port);
       }
-      if (prevHost === undefined) delete process.env.AGENT_TEAM_HOST;
-      else process.env.AGENT_TEAM_HOST = prevHost;
       try {
         fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       } catch {
@@ -300,59 +160,46 @@ export async function runDemoBrowserSuite(
   activeTeardown = teardown;
 
   try {
-    // 1. Seed real git repo + worktrees + project + sessions + objectives + issues + notes.
     const tSeed = performance.now();
-    seeded = seedDemo(tmpDir, { quiet: true, writeConfig: true });
-    seedMs = round(performance.now() - tSeed);
+    const seeded = seedDemo(tmpDir, { quiet: true, writeConfig: true });
+    const seedMs = round(performance.now() - tSeed);
 
-    // 2. Start real Server on 127.0.0.1:0 serving real built dist/webview.
     const tServer = performance.now();
-    process.env.AGENT_TEAM_HOST = "127.0.0.1";
-    server = new Server(0, tmpDir, WEB_DIR);
+    server = await startLoopbackServer(tmpDir);
     port = await server.listening;
-    serverStartMs = round(performance.now() - tServer);
+    const serverStartMs = round(performance.now() - tServer);
 
-    // 3. Launch real headless Chromium + CDP session.
-    browser = await chromium.launch({ headless: true });
-    context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
+    browser = await launchChromium();
+    const context = await browser.newContext({
+      viewport: browserViewport,
       permissions: ["clipboard-read", "clipboard-write"],
       colorScheme: "light",
     });
-    page = await context.newPage();
-    cdp = await context.newCDPSession(page);
-    await cdp.send("Performance.enable");
-
-    page.on("console", (msg) => {
-      if (msg.type() === "error") consoleErrors.push(msg.text());
-    });
-    page.on("pageerror", (err) => {
-      pageErrors.push(err.stack ?? err.message);
-    });
+    const profiled = await openProfilePage(context);
+    const { page, cdp } = profiled;
+    ({ consoleErrors, pageErrors } = profiled);
 
     const visible = (locator: Locator, timeout = 5_000) => locator.waitFor({ timeout });
     const lead = page.locator(".ws-group-project .ws-group-label", { hasText: "agent-team" });
-    const worker = (name: string) => page!.locator(".task-item", { hasText: name });
+    const worker = (name: string) => page.locator(".task-item", { hasText: name });
     const transcript = (marker: string) =>
-      visible(page!.locator(".messages", { hasText: marker }), 10_000);
+      visible(page.locator(".messages", { hasText: marker }), 10_000);
 
     // ---- Journey 1: Initial hydration, sidebar tree, git indicators, archives, search ----
     const tHydrate = performance.now();
-    await page.goto(`http://127.0.0.1:${port}/?debug=1&demoPace=raf`, {
+    await page.goto(`${loopbackOrigin(port)}/?debug=1&demoPace=raf`, {
       waitUntil: "domcontentloaded",
     });
     await visible(lead, 15_000);
     await visible(worker("mobile panels"), 10_000);
     await visible(page.locator(".system-status-grid"), 10_000);
     await visible(page.locator(".quota-panel"), 10_000);
-    hydrationMs = round(performance.now() - tHydrate);
+    const hydrationMs = round(performance.now() - tHydrate);
 
-    // Verify seeded project workers are listed under agent-team.
     for (const name of ["mobile panels", "wake-up time", "readme"]) {
       assert(await worker(name).isVisible(), `Sidebar should list worker "${name}"`);
     }
 
-    // Expand project-level Archived toggle ("file routes" and adopted "parser crash").
     const projectArchiveToggle = page.locator(".ws-archive-toggle");
     await visible(projectArchiveToggle);
     await projectArchiveToggle.click();
@@ -370,7 +217,7 @@ export async function runDemoBrowserSuite(
             return (
               url.pathname === "/api/file" &&
               r.request().method() === "GET" &&
-              url.searchParams.get("ws") === seeded!.workspaces.past &&
+              url.searchParams.get("ws") === seeded.workspaces.past &&
               path.normalize(url.searchParams.get("path") ?? "") === file
             );
           },
@@ -432,6 +279,7 @@ export async function runDemoBrowserSuite(
       { target: worker("readme"), marker: "deploy-deferred.sh" },
       { target: lead, marker: "分成两件事" },
     ];
+    const workspaceSwitchSamplesMs: number[] = [];
     const switchRounds = options.switchRounds ?? 2;
     for (let r = 0; r < switchRounds; r++) {
       for (const { target, marker } of switchTargets) {
@@ -472,7 +320,7 @@ export async function runDemoBrowserSuite(
         return [width, height];
       });
     const clipboard = async () =>
-      (await page!.evaluate<string>("navigator.clipboard.readText()")).replaceAll("\r\n", "\n");
+      (await page.evaluate<string>("navigator.clipboard.readText()")).replaceAll("\r\n", "\n");
     const raw = loadWorkspaceMessages(tmpDir, seeded.workspaces.mobile).find((msg) =>
       msg.content.startsWith("sheet 头部已经改好"),
     )?.content;
@@ -480,7 +328,7 @@ export async function runDemoBrowserSuite(
     deepStrictEqual(await size(messageCopy), await size(quote));
     const opacity = (button: Locator) => button.evaluate((el) => getComputedStyle(el).opacity);
     const waitForOpacity = async (button: Locator, value = "1") => {
-      await page!.waitForFunction(({ el, value }) => el && getComputedStyle(el).opacity === value, {
+      await page.waitForFunction(({ el, value }) => el && getComputedStyle(el).opacity === value, {
         el: await button.elementHandle(),
         value,
       });
@@ -491,16 +339,16 @@ export async function runDemoBrowserSuite(
       previous: Locator,
       hoverPeer?: Locator,
     ) => {
-      await page!.mouse.move(0, 0);
+      await page.mouse.move(0, 0);
       await button.blur();
       await waitForOpacity(button, "0");
       await host.hover();
       await waitForOpacity(button);
       if (hoverPeer) await waitForOpacity(hoverPeer);
-      await page!.mouse.move(0, 0);
+      await page.mouse.move(0, 0);
       await previous.focus();
-      await page!.keyboard.press("Tab");
-      await button.and(page!.locator(":focus-visible")).waitFor();
+      await page.keyboard.press("Tab");
+      await button.and(page.locator(":focus-visible")).waitFor();
       await waitForOpacity(button);
       strictEqual(await button.evaluate((el) => getComputedStyle(el).outlineStyle), "solid");
     };
@@ -557,7 +405,7 @@ export async function runDemoBrowserSuite(
           await toggle.click();
         } else {
           await checkDesktopControl(block, toggle, copy, copy);
-          await page!.keyboard.press("Enter");
+          await page.keyboard.press("Enter");
         }
         await preview.locator("svg text", { hasText: label }).waitFor();
         await code.and(block.locator("pre[hidden]")).waitFor({ state: "attached" });
@@ -591,7 +439,7 @@ export async function runDemoBrowserSuite(
     await checkDiagrams();
 
     const themeButton = (pressed: boolean) =>
-      page!.getByRole("button", { name: "Dark theme", pressed });
+      page.getByRole("button", { name: "Dark theme", pressed });
     await themeButton(false).click();
     await themeButton(true).waitFor();
     await checkMessageCopy();
@@ -680,7 +528,6 @@ export async function runDemoBrowserSuite(
     await visible(mobileCard);
     await mobileCard.getByRole("button", { name: "Unfold mobile panels" }).click();
     await visible(mobileCard.locator('select[aria-label$="model"]'));
-    // Close side panel before opening Board.
     await page.locator('aside.side-panel button[aria-label^="Close"]').click();
     await page.locator("aside.side-panel").waitFor({ state: "hidden", timeout: 5_000 });
     journeysVerified.push("side-panels-files-diff-asklines-agents");
@@ -692,7 +539,7 @@ export async function runDemoBrowserSuite(
     const card = (name: string) => board.locator(".bp-card", { hasText: name });
     const phoneCard = card("Panels on phones");
     await visible(phoneCard, 10_000);
-    boardOpenMs = round(performance.now() - tBoard);
+    const boardOpenMs = round(performance.now() - tBoard);
 
     const boardButton = (group: string, name: string | RegExp) =>
       board.getByRole("group", { name: group, exact: true }).getByRole("button", { name });
@@ -733,8 +580,8 @@ export async function runDemoBrowserSuite(
     journeysVerified.push("board-objectives-graph-issues-notes");
 
     // ---- Journey 5: Workspace 🎬 Replay Demo — Desktop (1280x800) & Mobile (390x844) ----
-    clientBeforeReplay = await sampleCdpMemory(cdp);
-    serverBeforeReplay = sampleServerMemory();
+    const clientBeforeReplay = await sampleCdpMemory(cdp);
+    const serverBeforeReplay = sampleServerMemory();
 
     await page.getByRole("button", { name: "Replay demo", exact: true }).click();
 
@@ -768,7 +615,7 @@ export async function runDemoBrowserSuite(
       rawReplay && rawReplay.dispatchedFrames === rawReplay.totalFrames,
       "Replay did not finish all frames",
     );
-    replayStats = {
+    const replayStats = {
       totalFrames: rawReplay.totalFrames,
       dispatchedFrames: rawReplay.dispatchedFrames,
       durationMs: round(rawReplay.durationMs),
@@ -788,7 +635,6 @@ export async function runDemoBrowserSuite(
     await standaloneArchive.click();
     await oldExperiment.waitFor({ state: "hidden", timeout: 5_000 });
 
-    // Assert key rendered elements from replayFixture.
     for (const marker of [
       "Markdown torture test",
       "多智能体编排面板",
@@ -813,10 +659,9 @@ export async function runDemoBrowserSuite(
     await page.getByRole("button", { name: /^Jump to quoted message from Demo:/ }).click();
     await page.locator("#msg-demo-msg-1.message-highlight").waitFor();
 
-    // Check desktop horizontal overflow & capture post-replay metrics.
-    desktopOverflowPx = await measureHorizontalOverflowPx(page);
-    clientAfterReplay = await sampleCdpMemory(cdp);
-    serverAfterReplay = sampleServerMemory();
+    const desktopOverflowPx = await measureHorizontalOverflowPx(page);
+    const clientAfterReplay = await sampleCdpMemory(cdp);
+    const serverAfterReplay = sampleServerMemory();
 
     // Mobile viewport check (390x844): Replay Demo + mobile sidebar drawer + seeded worker.
     await page.setViewportSize({ width: 390, height: 844 });
@@ -834,36 +679,32 @@ export async function runDemoBrowserSuite(
     await waitForOpacity(messageCopy);
     await checkDiagrams(true);
     const workerMobileOverflow = await measureHorizontalOverflowPx(page);
-    mobileOverflowPx = Math.max(replayMobileOverflow, workerMobileOverflow);
     journeysVerified.push("replay-demo-cancel-desktop-and-mobile");
+    metrics = {
+      seedMs,
+      serverStartMs,
+      hydrationMs,
+      workspaceSwitchSamplesMs,
+      workspaceSwitchP50Ms: round(percentile(workspaceSwitchSamplesMs, 50)),
+      workspaceSwitchP95Ms: round(percentile(workspaceSwitchSamplesMs, 95)),
+      workspaceSwitchMaxMs: round(Math.max(0, ...workspaceSwitchSamplesMs)),
+      boardOpenMs,
+      replay: replayStats,
+      clientBeforeReplay,
+      clientAfterReplay,
+      clientHeapDeltaMb: round(clientAfterReplay.jsHeapUsedMb - clientBeforeReplay.jsHeapUsedMb),
+      clientDomNodesDelta: clientAfterReplay.domNodes - clientBeforeReplay.domNodes,
+      serverBeforeReplay,
+      serverAfterReplay,
+      desktopOverflowPx,
+      mobileOverflowPx: Math.max(replayMobileOverflow, workerMobileOverflow),
+    };
   } finally {
     await teardown();
     if (activeTeardown === teardown) activeTeardown = null;
   }
-
-  const metrics: DemoBenchmarkMetrics = {
-    seedMs,
-    serverStartMs,
-    hydrationMs,
-    workspaceSwitchSamplesMs,
-    workspaceSwitchP50Ms: round(percentile(workspaceSwitchSamplesMs, 50)),
-    workspaceSwitchP95Ms: round(percentile(workspaceSwitchSamplesMs, 95)),
-    workspaceSwitchMaxMs: round(Math.max(0, ...workspaceSwitchSamplesMs)),
-    boardOpenMs,
-    replay: replayStats,
-    clientBeforeReplay,
-    clientAfterReplay,
-    clientHeapDeltaMb: round(clientAfterReplay.jsHeapUsedMb - clientBeforeReplay.jsHeapUsedMb),
-    clientDomNodesDelta: clientAfterReplay.domNodes - clientBeforeReplay.domNodes,
-    serverBeforeReplay,
-    serverAfterReplay,
-    desktopOverflowPx,
-    mobileOverflowPx,
-    totalDurationMs: round(performance.now() - suiteStarted),
-  };
-
   return {
-    metrics,
+    metrics: { ...metrics, totalDurationMs: round(performance.now() - suiteStarted) },
     consoleErrors,
     pageErrors,
     journeysVerified,
@@ -925,18 +766,7 @@ export function formatBenchmarkTable(result: DemoSuiteResult): string {
   return lines.join("\n");
 }
 
-function isMainModule(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  const self = path.join(ROOT, "scripts", "bench-demo.ts");
-  try {
-    return fs.realpathSync(entry) === fs.realpathSync(self);
-  } catch {
-    return path.resolve(entry) === path.resolve(self);
-  }
-}
-
-if (isMainModule()) {
+if (isScriptMain("bench-demo.ts")) {
   const jsonOnly = process.argv.includes("--json");
   const rebuildWebview = process.argv.includes("--rebuild");
   const rawLog = console.log.bind(console);

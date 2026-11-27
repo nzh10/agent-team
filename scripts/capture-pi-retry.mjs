@@ -5,18 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { createRequire } from "node:module";
-import { execFileSync, spawn } from "node:child_process";
-import { once } from "node:events";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { localPiBinary, localPiSdkAnchor } from "../service/tests/local-pi.ts";
+import { trackCaptureChild } from "./capture-child.ts";
+import { jsonLine, parseJsonLine, readJsonl, writeJsonl } from "./capture-io.ts";
 import { sanitizer } from "./capture-pi.ts";
 
 export async function captureRetry(snap, fail = false) {
-  const file = (name) =>
-    fs
-      .readFileSync(name, "utf8")
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l));
-  const frames = file(path.join(snap, "pi/tools-bash-edit.jsonl"))
+  const frames = readJsonl(path.join(snap, "pi/tools-bash-edit.jsonl"))
     .map((r) => r.frame)
     .filter(Boolean);
   const start = frames.findLastIndex(
@@ -24,21 +21,21 @@ export async function captureRetry(snap, fail = false) {
   );
   const recovery = frames.slice(start).find((f) => f.type === "message_end").message;
   const deltas = frames.slice(start).flatMap((f) => f.assistantMessageEvent ?? []);
-  const compact = file(path.join(snap, "../unit/fixtures/pi-compact-overflow.jsonl")).filter((f) =>
-    f.type.startsWith("compaction_"),
+  const compact = readJsonl(path.join(snap, "../unit/fixtures/pi-compact-overflow.jsonl")).filter(
+    (f) => f.type.startsWith("compaction_"),
   );
   const model = "capture-retry/scenario",
     reason = "503 fixture service unavailable";
-  const binary = fs.realpathSync(execFileSync("which", ["pi"], { encoding: "utf8" }).trim());
-  const req = createRequire(binary);
-  const pkg = req.resolve
-    .paths("@earendil-works/pi-ai")
-    .map((dir) => path.join(dir, "@earendil-works/pi-ai/package.json"))
+  if (!localPiBinary || !localPiSdkAnchor)
+    throw new Error("Offline capture requires Pi on PATH or via PI_BINARY");
+  const pkg = createRequire(localPiSdkAnchor)
+    .resolve.paths("@earendil-works/pi-ai")
+    ?.map((dir) => path.join(dir, "@earendil-works/pi-ai/package.json"))
     .find((f) => fs.existsSync(f));
-  const sdk = path.resolve(
-    path.dirname(pkg),
-    JSON.parse(fs.readFileSync(pkg, "utf8")).exports["."].import,
-  );
+  if (!pkg) throw new Error("The Pi installation does not contain @earendil-works/pi-ai");
+  const sdk = pathToFileURL(
+    path.resolve(path.dirname(pkg), JSON.parse(fs.readFileSync(pkg, "utf8")).exports["."].import),
+  ).href;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "capture-pi-retry-"));
   try {
     fs.writeFileSync(
@@ -56,7 +53,7 @@ export async function captureRetry(snap, fail = false) {
       }});}`,
     );
     const child = spawn(
-      binary,
+      localPiBinary,
       [
         "--mode",
         "rpc",
@@ -78,9 +75,9 @@ export async function captureRetry(snap, fail = false) {
         stdio: ["pipe", "pipe", "ignore"],
       },
     );
-    const closed = once(child, "close"),
-      timer = setTimeout(() => child.kill("SIGKILL"), 12000),
-      clean = sanitizer();
+    const closeChild = trackCaptureChild(child, 12_000);
+    const clean = sanitizer();
+    const rows = readline.createInterface({ input: child.stdout });
     const entries = [],
       base = Date.now();
     let index = 0,
@@ -90,13 +87,13 @@ export async function captureRetry(snap, fail = false) {
     const step = (s) => add({ step: { i: index++, ...s } });
     const send = (sent) => {
       add({ sent });
-      child.stdin.write(JSON.stringify(sent) + "\n");
+      child.stdin.write(jsonLine(sent));
     };
     try {
       step({ op: "send", text: "Retry a sample." });
       send({ type: "prompt", message: "Retry a sample." });
-      for await (const line of readline.createInterface({ input: child.stdout })) {
-        const f = JSON.parse(line);
+      for await (const line of rows) {
+        const f = parseJsonLine(line);
         const frame = clean(f);
         if (f.type === "auto_retry_start") {
           if ((retried && !fail) || !f.errorMessage.includes(reason))
@@ -143,12 +140,10 @@ export async function captureRetry(snap, fail = false) {
               model,
               recordedAt: new Date().toISOString(),
             };
-            fs.writeFileSync(
-              path.join(snap, "pi/messages/retry-failed.jsonl"),
-              [{ header }, ...entries.filter((e) => e.frame)]
-                .map((e) => JSON.stringify(e))
-                .join("\n") + "\n",
-            );
+            writeJsonl(path.join(snap, "pi/messages/retry-failed.jsonl"), [
+              { header },
+              ...entries.filter((e) => e.frame),
+            ]);
             return;
           }
           if (
@@ -167,18 +162,14 @@ export async function captureRetry(snap, fail = false) {
               "pi --mode rpc; injected 503, recorded overflow events during retry, missing context telemetry",
             recordedAt: new Date().toISOString(),
           };
-          fs.writeFileSync(
-            path.join(snap, "pi/compaction-and-retry.jsonl"),
-            [{ header }, ...entries].map((e) => JSON.stringify(e)).join("\n") + "\n",
-          );
+          writeJsonl(path.join(snap, "pi/compaction-and-retry.jsonl"), [{ header }, ...entries]);
           return;
         }
       }
       throw Error("Pi exited before recovery");
     } finally {
-      child.stdin.end();
-      await closed;
-      clearTimeout(timer);
+      rows.close();
+      await closeChild();
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
