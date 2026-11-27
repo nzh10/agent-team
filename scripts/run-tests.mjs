@@ -95,13 +95,29 @@ async function runRoot() {
       const npm = process.env.npm_execpath;
       if (!npm || args.length) throw new Error("Use npm run test:ci without filters.");
       return timed("ci", async () => {
+        // Overlap Playwright's slow Windows Server Media Foundation install with
+        // build and unit suites that do not launch Chromium.
+        const chromiumReady =
+          process.env.YAAT_CI_INSTALL_CHROMIUM === "1"
+            ? (() => {
+                const require = createRequire(join(repo, "package.json"));
+                const cli = join(dirname(require.resolve("playwright/package.json")), "cli.js");
+                return timed("playwright-install", () =>
+                  runAsync([cli, "install", "--with-deps", "chromium"], repo),
+                );
+              })()
+            : Promise.resolve(0);
         const build = await runAsync([npm, "run", "build"], repo);
-        if (build) return build;
+        if (build) {
+          await chromiumReady;
+          return build;
+        }
         const units = parallel(
           workspaceRun("service", "unit", [workerFlag, "--tagsFilter=!shutdown-stress"]),
           workspaceRun("webview", "unit", [workerFlag]),
         );
         const browserReliability = async () =>
+          (await chromiumReady) ||
           (await browser()) ||
           (await browserE2e(["demo-browser.test.ts", "journey-", "telemetry-browser.test.ts"]));
         const common = await parallel(units, browserReliability(), tooling());
