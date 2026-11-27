@@ -1,13 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
-import { Workspace, Message, WorkspaceCallbacks } from "../../src/workspace/workspace";
+import { Workspace, WorkspaceCallbacks } from "../../src/workspace/workspace";
 import { HostRegistry } from "../../src/session/host";
 import { StreamEvent } from "../../src/session/types";
 import { FakeHost, FakeSession } from "./fakes";
 
-function makeWorkspace(model = "gpt-5.6-terra", extraCb: Partial<WorkspaceCallbacks> = {}) {
-  const host = new FakeHost();
+function fakeRegistry(host = new FakeHost()) {
   const registry = new HostRegistry();
   registry.register(host);
+  return registry;
+}
+
+const restoreWorkspace = (state: ReturnType<Workspace["getState"]>, host?: FakeHost) =>
+  Workspace.fromState(state, fakeRegistry(host));
+
+function makeWorkspace(
+  model = "gpt-5.6-terra",
+  extraCb: Partial<WorkspaceCallbacks> = {},
+  agentOptions: Parameters<Workspace["addAgent"]>[4] = {
+    backend: model.startsWith("gpt-") ? "codex" : "claude",
+  },
+) {
+  const host = new FakeHost();
+  const registry = fakeRegistry(host);
   const done: Array<{ msgId: string; status: string }> = [];
   // What clients are told, in order.
   const log: string[] = [];
@@ -23,20 +37,28 @@ function makeWorkspace(model = "gpt-5.6-terra", extraCb: Partial<WorkspaceCallba
     ...extraCb,
   };
   const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-  const agentInfo = ws.addAgent("A", model, "🤖", "#888", {
-    backend: model.startsWith("gpt-") ? "codex" : "claude",
-  });
+  const agentInfo = ws.addAgent("A", model, "🤖", "#888", agentOptions);
   const session = host.lastSession!;
   const emit = (e: Partial<StreamEvent>) => session.emit("event", e);
-  const agentMsgs = () => ws.messages.filter((m): m is Message => m.kind === "agent");
-  return { ws, emit, done, log, agentMsgs, agentInfo, session, host };
+  const agentMsgs = () => ws.messages.filter((m) => m.kind === "agent");
+  const finishTurn = () => {
+    session.isRunning = false;
+    emit({ kind: "result", content: "" });
+  };
+  return { ws, emit, done, log, agentMsgs, agentInfo, session, host, finishTurn, registry };
 }
 
-const subagentStart = (taskId: string): Partial<StreamEvent> => ({
+const subagentStart = (taskId: string): StreamEvent => ({
   kind: "subagent_start",
   content: "desc",
   toolUseId: `tool-${taskId}`,
   subagent: { taskId, description: "desc", status: "running", events: [] },
+});
+
+const subagentProgress = (taskId: string, innerEvent: StreamEvent): StreamEvent => ({
+  kind: "subagent_progress",
+  content: "",
+  subagent: { taskId, description: "", _innerEvent: innerEvent },
 });
 
 describe("unread results", () => {
@@ -60,9 +82,7 @@ describe("unread results", () => {
     expect(updates).toHaveBeenLastCalledWith(ws.id, 1, "done");
     emit({ kind: "error", content: "failed" });
     expect(updates).toHaveBeenLastCalledWith(ws.id, 2, "failed");
-    const registry = new HostRegistry();
-    registry.register(host);
-    const back = Workspace.fromState(ws.getState(), registry);
+    const back = restoreWorkspace(ws.getState(), host);
     expect(back.getInfo(false)).toMatchObject({ unread: 2, lastResult: "failed" });
   });
 
@@ -78,9 +98,7 @@ describe("unread results", () => {
     expect(updates).toHaveBeenCalledTimes(1);
     expect(updates).toHaveBeenCalledWith(ws.id, 1, undefined);
     expect(ws.getInfo(false)).toMatchObject({ unread: 1, lastResult: undefined });
-    const registry = new HostRegistry();
-    registry.register(host);
-    const back = Workspace.fromState(ws.getState(), registry);
+    const back = restoreWorkspace(ws.getState(), host);
     expect(back.getInfo(false)).toMatchObject({ unread: 1, lastResult: undefined });
   });
 
@@ -169,28 +187,12 @@ describe("Workspace event aggregation", () => {
   it("merges the subagent lifecycle onto the start event", () => {
     const { emit, agentMsgs } = makeWorkspace();
     emit(subagentStart("task-1"));
-    emit({
-      kind: "subagent_progress",
-      content: "",
-      subagent: {
-        taskId: "task-1",
-        description: "",
-        _innerEvent: { kind: "tool_use", content: "Grep foo", toolUseId: "inner-1" },
-      },
-    });
-    emit({
-      kind: "subagent_progress",
-      content: "",
-      subagent: {
-        taskId: "task-1",
-        description: "",
-        _innerEvent: {
-          kind: "tool_result",
-          content: "matches",
-          toolUseId: "inner-1",
-        },
-      },
-    });
+    emit(
+      subagentProgress("task-1", { kind: "tool_use", content: "Grep foo", toolUseId: "inner-1" }),
+    );
+    emit(
+      subagentProgress("task-1", { kind: "tool_result", content: "matches", toolUseId: "inner-1" }),
+    );
     emit({
       kind: "subagent_done",
       content: "",
@@ -296,7 +298,7 @@ describe("message queue", () => {
   });
 
   it("queues messages for a busy agent and drains FIFO on idle", async () => {
-    const { ws, emit, session, agentMsgs } = makeWorkspace();
+    const { ws, session, agentMsgs, finishTurn } = makeWorkspace();
     session.isRunning = true;
     await ws.sendMessage("second");
     await ws.sendMessage("third");
@@ -308,16 +310,14 @@ describe("message queue", () => {
 
     // The running turn ends: only the first queued message dispatches,
     // because dispatch marks the session busy again.
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(session.sent).toEqual(["second"]);
     expect(ws.messages.filter((m) => m.status === "queued")).toHaveLength(1);
     expect(ws.messages.find((m) => m.content === "second")!.status).toBe("done");
 
     // Second turn ends: the next one drains.
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(session.sent).toEqual(["second", "third"]);
     expect(ws.messages.filter((m) => m.status === "queued")).toHaveLength(0);
@@ -348,7 +348,7 @@ describe("message queue", () => {
   });
 
   it("cancelQueued removes a pending message so it never runs", async () => {
-    const { ws, emit, session } = makeWorkspace();
+    const { ws, session, finishTurn } = makeWorkspace();
     session.isRunning = true;
     await ws.sendMessage("doomed");
     const queued = ws.messages.find((m) => m.status === "queued")!;
@@ -356,22 +356,20 @@ describe("message queue", () => {
     expect(ws.cancelQueued(queued.id)).toBe(false);
     expect(ws.messages.find((m) => m.id === queued.id)).toBeUndefined();
 
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(session.sent).toEqual([]);
   });
 
   it("preserves the built prompt for queued messages with quotes", async () => {
-    const { ws, emit, session } = makeWorkspace();
+    const { ws, session, finishTurn } = makeWorkspace();
     session.isRunning = true;
     await ws.sendMessage("follow-up", undefined, undefined, {
       messageId: "m0",
       agentId: null,
       content: "original text",
     });
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(session.sent).toHaveLength(1);
     expect(session.sent[0]).toContain("original text");
@@ -414,14 +412,13 @@ describe("rate-limit retry mechanics", () => {
   });
 
   it("pauseAgent holds the queue until the deadline, retryLast clears it", async () => {
-    const { ws, emit, session } = makeWorkspace();
+    const { ws, session, finishTurn } = makeWorkspace();
     const agentId = ws.getState().agents[0].id;
     session.isRunning = true;
     await ws.sendMessage("queued work");
 
     ws.pauseAgent(agentId, Date.now() + 60_000, true);
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     // Paused: the queued message must NOT dispatch.
     expect(session.sent).toEqual([]);
@@ -481,78 +478,66 @@ describe("banners, retries and activity", () => {
     expect(events[0].contentOffset).toBe(2);
   });
 
-  it("clears a retry on recovery, failure, or turn end", () => {
-    const progress: Array<Partial<StreamEvent>> = [
-      { kind: "text_delta", content: "recovered" },
-      { kind: "thinking_delta", content: "thinking" },
-      { kind: "thinking", content: "thought" },
-      { kind: "tool_use", content: "**Read** `/a`", toolUseId: "read" },
-      subagentStart("recovered-task"),
-    ];
-    for (const event of progress) {
+  const recoveryEvents: StreamEvent[] = [
+    { kind: "text_delta", content: "recovered" },
+    { kind: "thinking_delta", content: "thinking" },
+    { kind: "thinking", content: "thought" },
+    { kind: "tool_use", content: "**Read** `/a`", toolUseId: "read" },
+    subagentStart("recovered-task"),
+    { kind: "result", content: "" },
+  ];
+  it.each(recoveryEvents)("clears a retry on $kind", (event) => {
+    const { emit, agentMsgs, session } = makeWorkspace();
+    session.isRunning = true;
+    emit({ kind: "retry", content: "Retrying" });
+    emit(event);
+    expect(agentMsgs()[0].events?.some((e) => e.kind === "retry")).toBe(false);
+  });
+
+  it.each([
+    { event: { kind: "retry", content: "" }, kinds: [] },
+    { event: { kind: "error", content: "final failure" }, kinds: ["error"] },
+  ] satisfies { event: StreamEvent; kinds: string[] }[])(
+    "clears a retry on $event.kind",
+    ({ event, kinds }) => {
       const { emit, agentMsgs, session } = makeWorkspace();
       session.isRunning = true;
       emit({ kind: "retry", content: "Retrying" });
       emit(event);
-      expect(
-        agentMsgs()[0].events?.some((e) => e.kind === "retry"),
-        event.kind,
-      ).toBe(false);
-    }
-
-    const explicit = makeWorkspace();
-    explicit.session.isRunning = true;
-    explicit.emit({ kind: "retry", content: "Retrying" });
-    explicit.emit({ kind: "retry", content: "" });
-    expect(explicit.agentMsgs()[0].events).toEqual([]);
-
-    const finished = makeWorkspace();
-    finished.session.isRunning = true;
-    finished.emit({ kind: "retry", content: "Retrying" });
-    finished.emit({ kind: "result", content: "" });
-    expect(finished.agentMsgs()[0].events?.some((e) => e.kind === "retry")).toBe(false);
-
-    const failed = makeWorkspace();
-    failed.session.isRunning = true;
-    failed.emit({ kind: "retry", content: "Retrying" });
-    failed.emit({ kind: "error", content: "final failure" });
-    expect(failed.agentMsgs()[0].events?.map((e) => e.kind)).toEqual(["error"]);
-  });
+      expect(agentMsgs()[0].events?.map((e) => e.kind)).toEqual(kinds);
+    },
+  );
 
   it("forwards session activity to the callback and exposes it on getInfo", () => {
-    const host = new FakeHost();
-    const registry = new HostRegistry();
-    registry.register(host);
     const seen: Array<[string, string | null]> = [];
-    const cb: WorkspaceCallbacks = {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      onAgentActivity: (_ws, agentId, activity) => seen.push([agentId, activity]),
-    };
-    const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-    const agent = ws.addAgent("A", "gpt-5.6-terra", "🤖", "#888", {});
-    host.lastSession!.emit("activity", "compacting context");
+    const {
+      ws,
+      session,
+      agentInfo: agent,
+    } = makeWorkspace(
+      "gpt-5.6-terra",
+      {
+        onAgentActivity: (_ws, agentId, activity) => seen.push([agentId, activity]),
+      },
+      {},
+    );
+    session.emit("activity", "compacting context");
     expect(seen).toEqual([[agent.id, "compacting context"]]);
     expect(ws.getInfo(false).agents[0].activity).toBe("compacting context");
-    host.lastSession!.emit("activity", null);
+    session.emit("activity", null);
     expect(ws.getInfo(false).agents[0].activity).toBeNull();
   });
 
   it("forwards unhandled SDK messages for logging", () => {
-    const host = new FakeHost();
-    const registry = new HostRegistry();
-    registry.register(host);
     const seen: unknown[] = [];
-    const cb: WorkspaceCallbacks = {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      onUnhandled: (_ws, _agent, msg) => seen.push(msg),
-    };
-    const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-    ws.addAgent("A", "gpt-5.6-terra", "🤖", "#888", {});
-    host.lastSession!.emit("unhandled", { type: "mystery" });
+    const { session } = makeWorkspace(
+      "gpt-5.6-terra",
+      {
+        onUnhandled: (_ws, _agent, msg) => seen.push(msg),
+      },
+      {},
+    );
+    session.emit("unhandled", { type: "mystery" });
     expect(seen).toEqual([{ type: "mystery" }]);
   });
 
@@ -560,9 +545,7 @@ describe("banners, retries and activity", () => {
     const { ws } = makeWorkspace();
     const state = ws.getState();
     state.agents[0].account = "work";
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState(state, registry);
+    const restored = restoreWorkspace(state);
     expect(restored.getInfo(false).agents[0].account).toBe("work");
   });
 });
@@ -587,19 +570,17 @@ describe("archiving", () => {
   });
 
   it("is idle only when no agent runs and nothing is queued", async () => {
-    const { ws, emit, session } = makeWorkspace();
+    const { ws, session, finishTurn } = makeWorkspace();
     expect(ws.isIdle).toBe(true);
     await ws.sendMessage("go");
     expect(ws.isIdle).toBe(false);
     await ws.sendMessage("and this");
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     // The queued message is still pending until the next tick dispatches it.
     expect(ws.isIdle).toBe(false);
     await tick();
     expect(session.isRunning).toBe(true);
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(ws.isIdle).toBe(true);
   });
@@ -611,9 +592,7 @@ describe("archiving", () => {
     ws.lastActivityAt = 456;
     const state = ws.getState();
     expect(state).toMatchObject({ archivedAt: 123, lastActivityAt: 456 });
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState({ ...state, messages: undefined }, registry);
+    const restored = restoreWorkspace({ ...state, messages: undefined });
     expect(restored.isArchived).toBe(true);
     expect(restored.lastActivityAt).toBe(456);
     expect(restored.getInfo(false).archivedAt).toBe(123);
@@ -624,9 +603,7 @@ describe("archiving", () => {
     emit({ kind: "text_delta", content: "x" });
     const state = ws.getState();
     delete state.lastActivityAt;
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState(state, registry);
+    const restored = restoreWorkspace(state);
     expect(restored.lastActivityAt).toBe(state.messages![state.messages!.length - 1].timestamp);
   });
 });
@@ -649,28 +626,29 @@ describe("error events", () => {
 
 describe("effort on the wire", () => {
   it("exposes the session's effort level and announces /effort changes", async () => {
-    const host = new FakeHost();
-    const registry = new HostRegistry();
-    registry.register(host);
     const updates: Array<{ id: string; effort: string | null }> = [];
-    const cb: WorkspaceCallbacks = {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      onAgentUpdated: (_ws, a) => updates.push({ id: a.id, effort: a.effort }),
-    };
-    const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-    const agent = ws.addAgent("A", "gpt-5.6-sol", "🤖", "#888", { effort: "high" });
+    const {
+      ws,
+      session,
+      agentInfo: agent,
+    } = makeWorkspace(
+      "gpt-5.6-sol",
+      {
+        onAgentUpdated: (_ws, a) => updates.push({ id: a.id, effort: a.effort }),
+      },
+      { effort: "high" },
+    );
     expect(ws.getInfo(false).agents[0]).toMatchObject({
       effort: "high",
       // What /effort takes, for the panel to offer.
       effortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     });
 
-    const session = host.lastSession! as FakeSession & { setEffort?: (l: string) => void };
-    session.setEffort = (l: string) => {
-      (session.getState().config as { effort?: string }).effort = l;
-    };
+    Object.assign(session, {
+      setEffort(level: string) {
+        session.getState().config.effort = level;
+      },
+    });
     await ws.sendMessage("/effort max");
     expect(updates).toEqual([{ id: agent.id, effort: "max" }]);
     expect(ws.getInfo(false).agents[0].effort).toBe("max");
@@ -679,19 +657,15 @@ describe("effort on the wire", () => {
 
 describe("per-message effort and context", () => {
   it("stamps the effort on new agent messages and the context on completion", async () => {
-    const host = new FakeHost();
-    const registry = new HostRegistry();
-    registry.register(host);
     const patches: unknown[] = [];
-    const cb: WorkspaceCallbacks = {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: (_ws, _id, _status, _content, _events, patch) => patches.push(patch),
-    };
-    const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-    ws.addAgent("A", "gpt-5.6-sol", "🤖", "#888", { effort: "xhigh" });
+    const { ws, session, registry } = makeWorkspace(
+      "gpt-5.6-sol",
+      {
+        onMessageDone: (_ws, _id, _status, _content, _events, patch) => patches.push(patch),
+      },
+      { effort: "xhigh" },
+    );
     await ws.sendMessage("hi");
-    const session = host.lastSession!;
     session.emit("event", { kind: "text_delta", content: "yo" });
     session.emit("event", {
       kind: "result",
@@ -740,28 +714,24 @@ describe("per-message effort and context", () => {
 
 describe("agent run state on the wire", () => {
   it("exposes the session state, falls back to busy, and blocks archiving while waiting", () => {
-    const host = new FakeHost();
-    const registry = new HostRegistry();
-    registry.register(host);
     const seen: string[] = [];
-    const cb: WorkspaceCallbacks = {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      onAgentState: (_ws, _id, state) => seen.push(state),
-    };
-    const ws = new Workspace("ws-1", "test", "proj", "local", "/tmp", registry, cb);
-    ws.addAgent("A", "gpt-5.6-sol", "🤖", "#888", {});
+    const { ws, session } = makeWorkspace(
+      "gpt-5.6-sol",
+      {
+        onAgentState: (_ws, _id, state) => seen.push(state),
+      },
+      {},
+    );
     expect(ws.getInfo(false).agents[0].state).toBe("idle");
-    host.lastSession!.isRunning = true;
+    session.isRunning = true;
     expect(ws.getInfo(false).agents[0].state).toBe("working");
-    host.lastSession!.isRunning = false;
+    session.isRunning = false;
 
-    host.lastSession!.emit("runState", "waiting");
+    session.emit("runState", "waiting");
     expect(seen).toEqual(["waiting"]);
     expect(ws.getInfo(false).agents[0].state).toBe("waiting");
     expect(ws.isIdle).toBe(false);
-    host.lastSession!.emit("runState", "idle");
+    session.emit("runState", "idle");
     expect(ws.isIdle).toBe(true);
   });
 });
@@ -804,6 +774,19 @@ describe("fast mode and goal commands", () => {
 });
 
 describe("events between turns and late results", () => {
+  const seedStreamingReply = (ws: Workspace, agentId: string, content: string) =>
+    ws.setMessages([
+      {
+        id: "stale",
+        kind: "agent",
+        agentId,
+        content,
+        timestamp: 1,
+        status: "streaming",
+        events: [],
+      },
+    ]);
+
   it("turns a banner that arrives while idle into a system line, not a streaming bubble", () => {
     const { ws, emit, session } = makeWorkspace();
     session.isRunning = false;
@@ -885,17 +868,7 @@ describe("events between turns and late results", () => {
 
   it("a stop finishes every reply of the agent still streaming, so it can be archived", async () => {
     const { ws, session, agentInfo, done } = makeWorkspace();
-    ws.setMessages([
-      {
-        id: "stale",
-        kind: "agent",
-        agentId: agentInfo.id,
-        content: "card only",
-        timestamp: 1,
-        status: "streaming",
-        events: [],
-      },
-    ]);
+    seedStreamingReply(ws, agentInfo.id, "card only");
     await ws.sendMessage("go");
     ws.abortAgent(agentInfo.id);
     session.isRunning = false;
@@ -912,17 +885,7 @@ describe("events between turns and late results", () => {
     const { ws, session, agentInfo } = makeWorkspace();
     const interrupt = vi.fn(() => Promise.resolve(true));
     Object.assign(session, { interrupt, interruptPending: false });
-    ws.setMessages([
-      {
-        id: "stale",
-        kind: "agent",
-        agentId: agentInfo.id,
-        content: "card only",
-        timestamp: 1,
-        status: "streaming",
-        events: [],
-      },
-    ]);
+    seedStreamingReply(ws, agentInfo.id, "card only");
     await ws.interruptAgent(agentInfo.id);
     expect(interrupt).not.toHaveBeenCalled();
     expect(ws.messages[0].status).toBe("done");
@@ -949,17 +912,7 @@ describe("events between turns and late results", () => {
 
   it("finishes every reply left streaming when the context is cleared", () => {
     const { ws, emit, session, agentInfo, agentMsgs, done } = makeWorkspace();
-    ws.setMessages([
-      {
-        id: "stale",
-        kind: "agent",
-        agentId: agentInfo.id,
-        content: "",
-        timestamp: 1,
-        status: "streaming",
-        events: [],
-      },
-    ]);
+    seedStreamingReply(ws, agentInfo.id, "");
     session.isRunning = false;
     emit({ kind: "text_delta", content: "stray" });
     expect(ws.clearContext(agentInfo.id)).toBe(true);
@@ -988,42 +941,15 @@ describe("events between turns and late results", () => {
     const { ws, emit, agentMsgs } = makeWorkspace();
     await ws.sendMessage("go");
     emit(subagentStart("outer"));
-    emit({
-      kind: "subagent_progress",
-      content: "",
-      subagent: {
-        taskId: "outer",
-        description: "",
-        _innerEvent: subagentStart("inner") as StreamEvent,
-      },
-    });
-    emit({
-      kind: "subagent_progress",
-      content: "",
-      subagent: {
-        taskId: "outer",
-        description: "",
-        _innerEvent: {
-          kind: "subagent_progress",
-          content: "",
-          subagent: {
-            taskId: "inner",
-            description: "",
-            _innerEvent: { kind: "tool_use", content: "**Read** `/a`", toolUseId: "r1" },
-          },
-        },
-      },
-    });
+    emit(subagentProgress("outer", subagentStart("inner")));
+    emit(
+      subagentProgress(
+        "outer",
+        subagentProgress("inner", { kind: "tool_use", content: "**Read** `/a`", toolUseId: "r1" }),
+      ),
+    );
     // A carrier for a task nobody started: dropped, no phantom card.
-    emit({
-      kind: "subagent_progress",
-      content: "",
-      subagent: {
-        taskId: "ghost",
-        description: "",
-        _innerEvent: { kind: "thinking", content: "…" },
-      },
-    });
+    emit(subagentProgress("ghost", { kind: "thinking", content: "…" }));
     const events = agentMsgs()[0].events!;
     expect(events.map((e) => e.kind)).toEqual(["subagent_start"]);
     const inner = events[0].subagent!.events!;
@@ -1045,7 +971,7 @@ describe("messages delivered from a project", () => {
   });
 
   it("queues behind a busy agent and dispatches the prompt", async () => {
-    const { ws, session, emit } = makeWorkspace();
+    const { ws, session, finishTurn } = makeWorkspace();
     session.isRunning = true;
     const worker = { workspaceId: "ws-w", name: "parser fix", role: "worker" as const };
     expect(ws.deliver("done: see branch fix/parser", worker, "[From parser fix]\n\ndone")).toBe(
@@ -1053,8 +979,7 @@ describe("messages delivered from a project", () => {
     );
     expect(session.sent).toEqual([]);
     expect(ws.messages.find((m) => m.kind === "user")!.status).toBe("queued");
-    session.isRunning = false;
-    emit({ kind: "result", content: "" });
+    finishTurn();
     await tick();
     expect(session.sent).toEqual(["[From parser fix]\n\ndone"]);
   });
@@ -1062,9 +987,7 @@ describe("messages delivered from a project", () => {
   it("keeps the project link across a restart", () => {
     const { ws } = makeWorkspace();
     ws.projectLink = { projectId: "proj-1", role: "worker" };
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState(ws.getState(), registry);
+    const restored = restoreWorkspace(ws.getState());
     expect(restored.getInfo(false).projectLink).toEqual({ projectId: "proj-1", role: "worker" });
   });
 });
@@ -1206,9 +1129,7 @@ describe("interrupting a workspace", () => {
     expect(live[other.id].context).toEqual({ tokens: 12_000, window: 200_000 });
     expect(ws.messages.at(-1)).not.toHaveProperty("context");
 
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState(ws.getState(), registry);
+    const restored = restoreWorkspace(ws.getState());
     const fresh = Object.fromEntries(restored.getInfo(false).agents.map((a) => [a.id, a]));
     expect(fresh[agentInfo.id].context).toBeUndefined();
     expect(fresh[agentInfo.id]).not.toHaveProperty("context");
@@ -1226,9 +1147,7 @@ describe("interrupting a workspace", () => {
     const state = ws.getState();
     const legacyClear = state.messages!.find((m) => m.content.includes("context cleared"))!;
     legacyClear.context = null;
-    const registry = new HostRegistry();
-    registry.register(new FakeHost());
-    const restored = Workspace.fromState(state, registry);
+    const restored = restoreWorkspace(state);
     const fresh = restored.getInfo(false).agents[0];
     expect(fresh.context).toBeUndefined();
     expect(fresh).not.toHaveProperty("context");

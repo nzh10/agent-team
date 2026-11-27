@@ -2,11 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { JourneyEvent, UsageObservation } from "../../../shared/usage";
+import { replayWithUsage } from "./usage-replay";
 import { CodexSession } from "../../src/session/codex";
 type RecordedNotification = { method: string; params: Record<string, unknown> };
 import { readLifecycle } from "../../src/usage/lifecycle";
-import { loadFixture, readRecording, recordingPath, replay, type Backend } from "./harness";
+import { readRecording, recordingPath, type Backend } from "./harness";
 
 beforeEach(() => vi.useFakeTimers({ toFake: ["Date"] }));
 afterEach(() => vi.useRealTimers());
@@ -19,22 +19,11 @@ async function fixture(
   const dir = mkdtempSync(join(tmpdir(), "yaat-lifecycle-"));
   try {
     expect(readLifecycle(dir, "ws")).toEqual([]);
-    const rec = readRecording(recordingPath(backend, name));
-    modify?.(rec);
-    const journey: JourneyEvent[] = [];
-    const usage: UsageObservation[] = [];
-    const result = await replay(
-      backend,
-      rec,
-      await loadFixture(backend, name),
-      undefined,
-      { recordUsage: (row) => usage.push(row), recordJourney: (row) => journey.push(row) },
-      dir,
-    );
+    const replayed = await replayWithUsage(backend, name, modify, dir);
     const rows = readLifecycle(dir, "ws");
     expect(readLifecycle(dir, "unrelated-workspace")).toEqual([]);
     expect(rows.map(({ at }) => at)).toEqual(rows.map(({ at }) => at).sort((a, b) => a - b));
-    return { rows, journey, usage, result, rec };
+    return { rows, ...replayed };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

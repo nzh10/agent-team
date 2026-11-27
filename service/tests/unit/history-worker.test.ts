@@ -9,6 +9,7 @@ import { Worker } from "worker_threads";
 import { buildSync } from "esbuild";
 import { HistoryDb } from "../../src/workspace/history-db";
 import { HistoryService } from "../../src/workspace/history-service";
+import { historyMessage as msg } from "./helpers/history";
 import type { Message } from "../../src/workspace/workspace";
 
 let out: string;
@@ -60,21 +61,6 @@ function setup() {
   const worker = () => (threaded as unknown as Internals).worker;
   return { threaded, local, save, worker };
 }
-
-const msg = (
-  id: string,
-  content: string,
-  timestamp: number,
-  over: Partial<Message> = {},
-): Message => ({
-  id,
-  kind: "agent",
-  agentId: "a",
-  content,
-  timestamp,
-  status: "done",
-  ...over,
-});
 
 const w1 = {
   id: "w1",

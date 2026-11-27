@@ -1,52 +1,16 @@
 // The history in history.db, its search index, and what a workspace marks
 // as changed for the next save.
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
+import { historyMessage as msg, setupHistory as setup } from "./helpers/history";
 import { DatabaseSync } from "node:sqlite";
 import { entriesOf } from "../../src/workspace/history-index";
 import { HistoryService, sidebarHits } from "../../src/workspace/history-service";
-import { closeHistory, historyFile, historyIndexFile, historyOf } from "../../src/workspace/state";
-import { Workspace, type Message, type WorkspaceState } from "../../src/workspace/workspace";
+import { historyIndexFile, historyOf } from "../../src/workspace/state";
+import { Workspace, type WorkspaceState } from "../../src/workspace/workspace";
 import { HostRegistry } from "../../src/session/host";
 import type { StreamEvent } from "../../src/session/types";
 import { FakeHost } from "./fakes";
-
-const cleanups: Array<() => Promise<void> | void> = [];
-afterEach(async () => {
-  for (const c of cleanups.splice(0)) await c();
-});
-
-function setup() {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-history-"));
-  const history = new HistoryService(historyIndexFile(base), historyFile(base));
-  cleanups.push(
-    () => history.close(),
-    () => closeHistory(base),
-    () => fs.rmSync(base, { recursive: true, force: true }),
-  );
-  const save = (session: string, messages: Message[]) => {
-    historyOf(base).save(session, messages, "all");
-    history.changed();
-  };
-  return { base, history, save };
-}
-
-const msg = (
-  id: string,
-  content: string,
-  timestamp: number,
-  over: Partial<Message> = {},
-): Message => ({
-  id,
-  kind: "agent",
-  agentId: "a",
-  content,
-  timestamp,
-  status: "done",
-  ...over,
-});
 
 describe("the sidebar's search", () => {
   const sessions = [

@@ -2,12 +2,12 @@
 // in-memory stand-ins, so no CLI is spawned.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs";
-import * as os from "os";
+import { savedAgent, serverDirectories, watchClient } from "./helpers/seeded-server";
 import * as path from "path";
 import { createHash } from "crypto";
 import { DatabaseSync } from "node:sqlite";
 import WebSocket from "ws";
-import type { AgentState, Message, WorkspaceState } from "../../src/workspace/workspace";
+import type { Message, WorkspaceState } from "../../src/workspace/workspace";
 
 import { Server } from "../../src/server/server";
 import { LocalHost } from "../../src/session/host";
@@ -44,29 +44,6 @@ const until = async (cond: () => boolean, what: string) => {
   if (!cond()) throw new Error(`timed out waiting for ${what}`);
 };
 
-function agent(id: string, cwd: string): AgentState {
-  return {
-    id,
-    name: "A",
-    model: "gpt-6-astra",
-    avatar: "A",
-    color: "#fff",
-    isDefault: true,
-    session: {
-      sessionId: null,
-      config: { cwd, backend: "codex", model: "gpt-6-astra" },
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        turns: 0,
-        duration_ms: 0,
-      },
-    },
-  };
-}
-
 // Recent, or the sweep at start archives them.
 const T0 = Date.now() - 60_000;
 const msg = (
@@ -87,16 +64,9 @@ const msg = (
 // Workspaces as the server saves them: <id>.json, and the history in
 // history.db.
 function seed(workspaces: Array<{ state: WorkspaceState; messages: Message[] }>) {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-server-history-"));
-  bases.push(base);
-  const root = path.join(base, "repo");
-  const web = path.join(base, "web");
-  fs.mkdirSync(root, { recursive: true });
-  fs.mkdirSync(web, { recursive: true });
-  fs.mkdirSync(path.join(base, "home"));
-  fs.writeFileSync(path.join(web, "index.html"), "<html></html>");
-  fs.writeFileSync(path.join(base, "config.toml"), "");
-  process.env.HOME = path.join(base, "home");
+  const { base, root, web } = serverDirectories("agent-team-server-history-", (dir) =>
+    bases.push(dir),
+  );
   const dir = path.join(base, ".agent-team", "cache", "workspaces");
   fs.mkdirSync(dir, { recursive: true });
   const db = new HistoryDb(historyFile(base));
@@ -119,7 +89,7 @@ const ws = (id: string, messages: Message[], archivedAt: number | null = null) =
     project: "repo",
     hostId: "local",
     cwd: "",
-    agents: [agent("a-1", "")],
+    agents: [savedAgent("a-1", "A", "")],
     createdAt: T0,
     archivedAt,
   } as WorkspaceState,
@@ -130,14 +100,7 @@ async function start(base: string, web: string) {
   const server = new Server(0, base, web);
   const port = await server.listening;
   const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
-  const frames: Array<Record<string, unknown>> = [];
-  ws.on("message", (raw: Buffer) => frames.push(JSON.parse(raw.toString()) as never));
-  await new Promise<void>((resolve, reject) => {
-    ws.once("open", () => resolve());
-    ws.once("error", reject);
-  });
-  await until(() => frames.some((f) => f.type === "init"), "init");
-  const send = (m: Record<string, unknown>) => ws.send(JSON.stringify(m));
+  const { frames, send } = await watchClient(ws, until);
   const search = async (query: string) => {
     const seen = frames.length;
     send({ type: "search", query });
@@ -625,11 +588,7 @@ describe("a real server saving histories", () => {
         expect(clearMessage.message).not.toHaveProperty("context");
 
         freshWs = new WebSocket(`ws://127.0.0.1:${port}/`);
-        const freshFrames: Array<Record<string, unknown>> = [];
-        freshWs.on("message", (raw: Buffer) =>
-          freshFrames.push(JSON.parse(raw.toString()) as never),
-        );
-        await until(() => freshFrames.some((f) => f.type === "init"), "fresh client init");
+        const { frames: freshFrames } = await watchClient(freshWs, until);
         const init2 = freshFrames.find((f) => f.type === "init") as {
           workspaces: Array<{ id: string; agents: Array<Record<string, unknown>> }>;
         };
@@ -666,9 +625,7 @@ describe("a real server saving histories", () => {
         "archived history loaded",
       );
       freshWs = new WebSocket(`ws://127.0.0.1:${port}/`);
-      const freshFrames: Array<Record<string, unknown>> = [];
-      freshWs.on("message", (raw: Buffer) => freshFrames.push(JSON.parse(raw.toString()) as never));
-      await until(() => freshFrames.some((f) => f.type === "init"), "fresh archived client init");
+      const { frames: freshFrames } = await watchClient(freshWs, until);
       const freshInit = freshFrames.find((f) => f.type === "init") as {
         workspaces: Array<{ id: string; agents: Array<Record<string, unknown>> }>;
       };

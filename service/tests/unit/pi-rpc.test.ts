@@ -4,13 +4,14 @@ import { piFrame } from "../snap/pi-wire";
 import { waitForState } from "../e2e/pilot-assertions";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PassThrough, Writable } from "node:stream";
+import type { WritableOptions } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   discoverLocalPiPackages,
   inspectPiAcpProfile,
   prepareControlledPiAgentHome,
   type PiPackageEntry,
+  type PrepareControlledPiAgentHomeOptions,
 } from "../../src/session/pi-agent-home";
 import {
   LfJsonLineDecoder,
@@ -20,6 +21,7 @@ import {
   runBudgetedShutdown,
   verifyPidCommand,
 } from "../../src/session/pi-rpc";
+import { createPiWireTransport } from "./helpers/pi-wire-harness";
 
 function frameError(run: () => unknown): PiRpcFrameError {
   try {
@@ -31,18 +33,28 @@ function frameError(run: () => unknown): PiRpcFrameError {
   throw new Error("expected a frame error");
 }
 
-function makeClient(options: { highWaterMark?: number } = {}) {
-  const stdout = new PassThrough();
+function recordingClient() {
   const writes: Buffer[] = [];
-  const stdin = new Writable({
-    highWaterMark: options.highWaterMark,
+  const { stdin, stdout, emit } = createPiWireTransport({
     write(chunk, _encoding, callback) {
       writes.push(Buffer.from(chunk as Uint8Array));
       callback();
     },
   });
   const client = new PiRpcClient({ stdin, stdout }, { requestTimeoutMs: 2_000 });
-  return { client, stdin, stdout, writes };
+  return { client, stdout, emit, writes };
+}
+
+function capturedResponse(command: "get_session_stats" | "prompt" | "steer", id: string) {
+  return { ...piFrame("response", { command }), id };
+}
+
+const pngImages = () => [{ type: "image" as const, data: "AAAA", mimeType: "image/png" }];
+
+function backpressuredClient(write: WritableOptions["write"]) {
+  const { stdin, stdout } = createPiWireTransport({ highWaterMark: 1, write });
+  const client = new PiRpcClient({ stdin, stdout }, { requestTimeoutMs: 5_000 });
+  return { stdin, stdout, client };
 }
 
 async function flushWrites(): Promise<void> {
@@ -92,7 +104,7 @@ describe("LfJsonLineDecoder", () => {
 
 describe("PiRpcClient", () => {
   it("matches out-of-order responses and drains concurrent stdout messages synchronously", async () => {
-    const { client, stdout, writes } = makeClient();
+    const { client, stdout, emit, writes } = recordingClient();
     const first = client.prompt("one");
     const second = client.getSessionStats();
     await flushWrites();
@@ -105,46 +117,40 @@ describe("PiRpcClient", () => {
     void first.finally(() => {
       firstSettled = true;
     });
-    const stats = piFrame("response", { command: "get_session_stats" });
-    stdout.write(JSON.stringify({ ...stats, id: "req-2" }) + "\n");
+    const stats = capturedResponse("get_session_stats", "req-2");
+    emit(stats);
     await expect(second).resolves.toEqual(stats.data);
     expect(firstSettled).toBe(false);
 
-    const prompt = piFrame("response", { command: "prompt" });
+    const prompt = capturedResponse("prompt", "req-1");
     const settled = piFrame("agent_settled");
     const events: unknown[] = [];
     client.on("event", (e) => events.push(e));
-    stdout.write(
-      [{ ...prompt, id: "req-1" }, settled].map((e) => JSON.stringify(e)).join("\n") + "\n",
-    );
+    emit(prompt, settled);
     expect(events).toEqual([settled]);
     await expect(first).resolves.toEqual(prompt.data);
     stdout.end();
   });
 
   it("writes a steer with image blocks, returning acceptance rather than delivery", async () => {
-    const { client, stdout, writes } = makeClient();
-    const images = [{ type: "image" as const, data: "AAAA", mimeType: "image/png" }];
-    const result = client.steer("follow", { images });
+    const { client, stdout, emit, writes } = recordingClient();
+    const result = client.steer("follow", { images: pngImages() });
     await flushWrites();
     expect(JSON.parse(writes[0].toString())).toEqual({
       type: "steer",
       id: "req-1",
       message: "follow",
-      images,
+      images: pngImages(),
     });
-    stdout.write(
-      JSON.stringify({ ...piFrame("response", { command: "steer" }), id: "req-1" }) + "\n",
-    );
+    emit(capturedResponse("steer", "req-1"));
     await expect(result).resolves.toEqual({ disposition: "queued" });
     stdout.end();
   });
 
   it("runs onBeforeWrite synchronously immediately before prompt bytes and preserves images", async () => {
     const order: string[] = [];
-    const stdout = new PassThrough();
     let resolveWrite: (() => void) | undefined;
-    const stdin = new Writable({
+    const { stdin, stdout, emit } = createPiWireTransport({
       write(chunk, _encoding, callback) {
         const command = JSON.parse(Buffer.from(chunk).toString()) as {
           id: string;
@@ -153,10 +159,8 @@ describe("PiRpcClient", () => {
         };
         order.push("write");
         expect(command.message).toBe("hello");
-        expect(command.images).toEqual([{ type: "image", data: "AAAA", mimeType: "image/png" }]);
-        stdout.write(
-          JSON.stringify({ ...piFrame("response", { command: "prompt" }), id: command.id }) + "\n",
-        );
+        expect(command.images).toEqual(pngImages());
+        emit(capturedResponse("prompt", command.id));
         callback();
         resolveWrite?.();
       },
@@ -166,7 +170,7 @@ describe("PiRpcClient", () => {
       resolveWrite = resolve;
     });
     const result = client.prompt("hello", {
-      images: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+      images: pngImages(),
       onBeforeWrite: () => order.push("before"),
     });
     await written;
@@ -176,15 +180,10 @@ describe("PiRpcClient", () => {
   });
 
   it("rejects both a backpressured request and queued writes on stdin error", async () => {
-    const stdout = new PassThrough();
     let finishWrite: (() => void) | undefined;
-    const stdin = new Writable({
-      highWaterMark: 1,
-      write(_chunk, _encoding, callback) {
-        finishWrite = () => callback();
-      },
+    const { stdin, stdout, client } = backpressuredClient((_chunk, _encoding, callback) => {
+      finishWrite = () => callback();
     });
-    const client = new PiRpcClient({ stdin, stdout }, { requestTimeoutMs: 5_000 });
     const pending = client.getState();
     await flushWrites();
     const queued = client.sendExtensionUIResponse({
@@ -200,14 +199,9 @@ describe("PiRpcClient", () => {
   });
 
   it("wakes pending requests and drain waiters on a clean stdin close", async () => {
-    const stdout = new PassThrough();
-    const stdin = new Writable({
-      highWaterMark: 1,
-      write(_chunk, _encoding, _callback) {
-        // Keep the write unfinished so the client is waiting for drain.
-      },
+    const { stdin, stdout, client } = backpressuredClient(() => {
+      // Keep the write unfinished so the client is waiting for drain.
     });
-    const client = new PiRpcClient({ stdin, stdout }, { requestTimeoutMs: 5_000 });
     const pending = client.getCommands();
     await flushWrites();
     stdin.destroy();
@@ -367,7 +361,21 @@ describe("prepareControlledPiAgentHome", () => {
         defaultModel: "model",
       }),
     );
-    return { sourceAgentDir, sourceGeminiDir, dataDir: path.join(root, "data") };
+    const dataDir = path.join(root, "data");
+    const runtime = (
+      options?: Omit<PrepareControlledPiAgentHomeOptions, "mode" | "sourceAgentDir" | "dataDir">,
+    ) => prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir, ...options });
+    return { sourceAgentDir, sourceGeminiDir, dataDir, runtime };
+  }
+
+  function readRuntimeSettings(home: { settingsPath: string }) {
+    return JSON.parse(fs.readFileSync(home.settingsPath, "utf8")) as {
+      defaultProjectTrust?: string;
+      packages: PiPackageEntry[];
+      enabledModels?: string[];
+      defaultProvider?: string;
+      defaultModel?: string;
+    };
   }
 
   function expectNoSymlinks(directory: string): void {
@@ -416,24 +424,20 @@ describe("prepareControlledPiAgentHome", () => {
   }
 
   function expectIsolatedRouting(home: { settingsPath: string; piAgentDir: string }): void {
-    expect(JSON.parse(fs.readFileSync(home.settingsPath, "utf8"))).not.toHaveProperty("subagents");
+    expect(readRuntimeSettings(home)).not.toHaveProperty("subagents");
     expect(fs.readdirSync(home.piAgentDir)).not.toContain("agents");
   }
 
   it("reflects host routing and agent definitions in the persistent runtime home", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = { mode: "runtime" as const, sourceAgentDir, dataDir };
-    const home = prepareControlledPiAgentHome(options);
-    expect(JSON.parse(fs.readFileSync(home.settingsPath, "utf8"))).toHaveProperty(
-      "subagents",
-      subagents,
-    );
+    const { sourceAgentDir, runtime } = makeSource();
+    const home = runtime();
+    expect(readRuntimeSettings(home)).toHaveProperty("subagents", subagents);
     const agents = path.join(sourceAgentDir, "agents");
     expect(fs.readlinkSync(path.join(home.piAgentDir, "agents"))).toBe(agents);
 
     fs.rmdirSync(agents);
     fs.unlinkSync(path.join(sourceAgentDir, "settings.json"));
-    expectIsolatedRouting(prepareControlledPiAgentHome(options));
+    expectIsolatedRouting(runtime());
   });
 
   const networkSettings = {
@@ -445,21 +449,20 @@ describe("prepareControlledPiAgentHome", () => {
   };
 
   it("forwards runtime retry and network settings and drops them when removed from the source", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const sourcePath = path.join(sourceAgentDir, "settings.json");
     fs.writeFileSync(sourcePath, JSON.stringify({ ...networkSettings, subagents, theme: "dark" }));
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
-    const { settingsPath } = prepareControlledPiAgentHome(options);
+    const home = runtime();
     const managedDefaults = { defaultProjectTrust: "always", packages: [] };
-    expect(JSON.parse(fs.readFileSync(settingsPath, "utf8"))).toEqual({
+    expect(readRuntimeSettings(home)).toEqual({
       ...managedDefaults,
       ...networkSettings,
       subagents,
     });
 
     fs.writeFileSync(sourcePath, JSON.stringify({ subagents }));
-    prepareControlledPiAgentHome(options);
-    expect(JSON.parse(fs.readFileSync(settingsPath, "utf8"))).toEqual({
+    runtime();
+    expect(readRuntimeSettings(home)).toEqual({
       ...managedDefaults,
       subagents,
     });
@@ -473,7 +476,7 @@ describe("prepareControlledPiAgentHome", () => {
       const home = prepareControlledPiAgentHome({ mode, sourceAgentDir });
       temporaryDirectories.push(home.piAgentDir, home.env.PI_SUBAGENTS_TEMP_ROOT);
       if (home.geminiHome) temporaryDirectories.push(home.geminiHome);
-      expect(JSON.parse(fs.readFileSync(home.settingsPath, "utf8"))).toEqual({
+      expect(readRuntimeSettings(home)).toEqual({
         defaultProjectTrust: "always",
         packages: [],
       });
@@ -481,13 +484,12 @@ describe("prepareControlledPiAgentHome", () => {
   );
 
   it("links the user model catalog but only seeds the managed model cache once", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const catalog = path.join(sourceAgentDir, "models.json");
     const hostCache = path.join(sourceAgentDir, "models-store.json");
     fs.writeFileSync(catalog, "{}\n");
     fs.writeFileSync(hostCache, '{"source":true}');
-    const options = { mode: "runtime" as const, sourceAgentDir, dataDir };
-    const { piAgentDir } = prepareControlledPiAgentHome(options);
+    const { piAgentDir } = runtime();
     const managed = path.join(piAgentDir, "models-store.json");
     const link = path.join(piAgentDir, "models.json");
     expect(fs.readlinkSync(link)).toBe(catalog);
@@ -495,22 +497,21 @@ describe("prepareControlledPiAgentHome", () => {
     expect(fs.lstatSync(managed).isFile()).toBe(true);
     expect(fs.readFileSync(managed, "utf8")).toBe('{"source":true}');
     fs.writeFileSync(managed, '{"managed":true}');
-    prepareControlledPiAgentHome(options);
+    runtime();
     expect(fs.readFileSync(managed, "utf8")).toBe('{"managed":true}');
     expect(fs.readFileSync(hostCache, "utf8")).toBe('{"source":true}');
     expect(fs.lstatSync(link).ino).toBe(inode);
     fs.unlinkSync(catalog);
-    prepareControlledPiAgentHome(options);
+    runtime();
     expect(fs.lstatSync(link, { throwIfNoEntry: false })).toBeUndefined();
   });
 
   it("maps the first host ACP login and sees a subsequent relogin without preparing a new release", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
+    const { sourceAgentDir, runtime } = makeSource();
     const providerDir = "antigravity-acp-provider";
     const tokenPath = "gemini/antigravity-acp/acp_token.json";
     const host = path.join(sourceAgentDir, providerDir);
-    const initial = prepareControlledPiAgentHome(options);
+    const initial = runtime();
     const managed = path.join(initial.piAgentDir, providerDir);
     expect(fs.existsSync(path.join(managed, "gemini"))).toBe(false);
     fs.mkdirSync(path.join(managed, "gemini")); // Legacy empty store can be replaced safely.
@@ -521,7 +522,7 @@ describe("prepareControlledPiAgentHome", () => {
     fs.writeFileSync(path.join(sourceAgentDir, "unowned.json"), "private host file");
     fs.writeFileSync(path.join(managed, "sessions.json"), "managed sessions");
 
-    const next = prepareControlledPiAgentHome(options);
+    const next = runtime();
     expect(next.piAcpAuthError).toBeUndefined();
     expect(next.resolvedPackages.piAntigravityEntryPath).toBe(
       initial.resolvedPackages.piAntigravityEntryPath,
@@ -541,7 +542,7 @@ describe("prepareControlledPiAgentHome", () => {
     const link = fs.lstatSync(path.join(managed, "gemini"));
     fs.writeFileSync(path.join(host, tokenPath + ".new"), '{"refresh_token":"fake-next"}');
     fs.renameSync(path.join(host, tokenPath + ".new"), path.join(host, tokenPath));
-    const latest = prepareControlledPiAgentHome(options);
+    const latest = runtime();
     expect(latest.piAcpAuthError).toBeUndefined();
     expect(fs.lstatSync(path.join(managed, "gemini")).ino).toBe(link.ino);
     expect(fs.readFileSync(path.join(managed, tokenPath), "utf8")).toBe(
@@ -552,8 +553,7 @@ describe("prepareControlledPiAgentHome", () => {
   it.each(["different credentials", "identical credentials", "runtime subdirectories"])(
     "leaves a separate nonempty managed ACP store intact with %s",
     (contents) => {
-      const { sourceAgentDir, dataDir } = makeSource();
-      const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
+      const { sourceAgentDir, dataDir, runtime } = makeSource();
       const relative = "antigravity-acp-provider/gemini/antigravity-acp";
       const host = path.join(sourceAgentDir, relative);
       const managed = path.join(dataDir, "pi-agent-home", relative);
@@ -567,7 +567,7 @@ describe("prepareControlledPiAgentHome", () => {
       if (contents === "runtime subdirectories") fs.mkdirSync(path.join(managed, "conversations"));
       else fs.writeFileSync(path.join(managed, file), managedToken);
 
-      const home = prepareControlledPiAgentHome(options);
+      const home = runtime();
       expect(home.piAcpAuthError).toContain("separate");
       expect(home.piAcpAuthError).toContain("move the managed gemini directory");
       expect(home.resolvedPackages.piAntigravityEntryPath).toBeUndefined();
@@ -606,14 +606,13 @@ describe("prepareControlledPiAgentHome", () => {
   );
 
   it("preserves existing runtime agent definitions when switching to host agents", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, dataDir, runtime } = makeSource();
     const piAgentDir = path.join(dataDir, "pi-agent-home");
     const agents = path.join(piAgentDir, "agents");
     fs.mkdirSync(agents, { recursive: true });
     fs.writeFileSync(path.join(agents, "local.md"), "local definition");
-    const options = { mode: "runtime" as const, sourceAgentDir, dataDir };
-    prepareControlledPiAgentHome(options);
-    prepareControlledPiAgentHome(options);
+    runtime();
+    runtime();
     expect(fs.readlinkSync(agents)).toBe(path.join(sourceAgentDir, "agents"));
     const backups = fs.readdirSync(piAgentDir).filter((name) => name.startsWith("agents-backup-"));
     expect(backups).toHaveLength(1);
@@ -637,7 +636,7 @@ describe("prepareControlledPiAgentHome", () => {
     expectIsolatedRouting(home);
     expectNoSymlinks(home.piAgentDir);
     expectNoSymlinks(home.geminiHome!);
-    expect(JSON.parse(fs.readFileSync(home.settingsPath, "utf8"))).toEqual({
+    expect(readRuntimeSettings(home)).toEqual({
       defaultProjectTrust: "always",
       packages: [],
     });
@@ -647,19 +646,17 @@ describe("prepareControlledPiAgentHome", () => {
   });
 
   it("atomically applies the managed ACP profile without changing unrelated or standalone settings", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const standalone = path.join(sourceAgentDir, "antigravity-acp-provider", "config.json");
     fs.mkdirSync(path.dirname(standalone), { recursive: true });
     fs.writeFileSync(standalone, '{"runtimeUpdates":"automatic"}');
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
-    const home = prepareControlledPiAgentHome(options);
+    const home = runtime();
     const profile = path.join(home.piAgentDir, "antigravity-acp-provider", "config.json");
     fs.writeFileSync(profile, '{"toolActivity":"full","nested":{"sample":true}}');
     const configured = {
-      ...options,
       piAcp: { permissions: "auto_edit", runtime_updates: "notify" },
     } as const;
-    prepareControlledPiAgentHome(configured);
+    runtime(configured);
     expect(JSON.parse(fs.readFileSync(profile, "utf8"))).toEqual({
       toolActivity: "full",
       nested: { sample: true },
@@ -668,24 +665,21 @@ describe("prepareControlledPiAgentHome", () => {
     });
     expect(fs.readdirSync(path.dirname(profile))).toEqual(["config.json"]);
     const previous = fs.statSync(profile);
-    prepareControlledPiAgentHome(configured);
+    runtime(configured);
     expect(fs.statSync(profile).mtimeMs).toBe(previous.mtimeMs);
     expect(fs.statSync(profile).ino).toBe(previous.ino);
     expect(fs.readFileSync(standalone, "utf8")).toBe('{"runtimeUpdates":"automatic"}');
   });
 
   it.skipIf(process.platform === "win32")("does not follow a managed ACP profile symlink", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
-    const home = prepareControlledPiAgentHome(options);
+    const { sourceAgentDir, runtime } = makeSource();
+    const home = runtime();
     const profile = path.join(home.piAgentDir, "antigravity-acp-provider", "config.json");
     const standalone = path.join(sourceAgentDir, "config.json");
     fs.writeFileSync(standalone, "{}");
     fs.unlinkSync(profile);
     fs.symlinkSync(standalone, profile);
-    expect(
-      prepareControlledPiAgentHome(options).resolvedPackages.piAntigravityEntryPath,
-    ).toBeUndefined();
+    expect(runtime().resolvedPackages.piAntigravityEntryPath).toBeUndefined();
     expect(inspectPiAcpProfile(home.piAgentDir)).toEqual({
       path: profile,
       status: "invalid",
@@ -700,18 +694,17 @@ describe("prepareControlledPiAgentHome", () => {
     { contents: '{"permissions":"unexpected"}', reason: "invalid permissions mode" },
     { contents: "[]", reason: "expected a JSON object" },
   ])("quarantines only ACP when the managed profile has $reason", ({ contents, reason }) => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
+    const { dataDir, runtime } = makeSource();
     const agentDir = path.join(dataDir, "pi-agent-home");
     const profile = path.join(agentDir, "antigravity-acp-provider", "config.json");
     expect(inspectPiAcpProfile(agentDir)).toEqual({ path: profile, status: "missing" });
     expect(fs.existsSync(agentDir)).toBe(false);
-    const initial = prepareControlledPiAgentHome(options);
+    const initial = runtime();
     expect(inspectPiAcpProfile(agentDir)).toEqual({ path: profile, status: "valid" });
     fs.writeFileSync(profile, contents);
     expect(inspectPiAcpProfile(agentDir)).toEqual({ path: profile, status: "invalid", reason });
 
-    const broken = prepareControlledPiAgentHome(options);
+    const broken = runtime();
     expect(broken.piAcpProfileError).toContain(profile);
     expect(broken.resolvedPackages.piAntigravityEntryPath).toBeUndefined();
     expect(broken.resolvedPackages.piSubagentsRoot).toBe(initial.resolvedPackages.piSubagentsRoot);
@@ -721,8 +714,7 @@ describe("prepareControlledPiAgentHome", () => {
     expect(fs.readFileSync(profile, "utf8")).toBe(contents);
 
     fs.writeFileSync(profile, '{"permissions":"default","runtimeUpdates":"manual"}');
-    const repaired = prepareControlledPiAgentHome({
-      ...options,
+    const repaired = runtime({
       piAcp: { permissions: "default" },
     });
     expect(repaired.piAcpProfileError).toBeUndefined();
@@ -735,7 +727,7 @@ describe("prepareControlledPiAgentHome", () => {
   });
 
   it("identifies a renamed ACP checkout by its manifest before starting Pi", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const alias = path.join(sourceAgentDir, "google-acp");
     fs.renameSync(packageRoot(sourceAgentDir, providerSource), alias);
     fs.writeFileSync(
@@ -746,22 +738,19 @@ describe("prepareControlledPiAgentHome", () => {
       }),
     );
     const options = {
-      mode: "runtime",
       packages: [alias],
       offline: false,
-      sourceAgentDir,
-      dataDir,
     } as const;
-    const home = prepareControlledPiAgentHome(options);
+    const home = runtime(options);
     expect(home.resolvedPackages.piAntigravityEntryPath).toBe(
       fs.realpathSync(path.join(alias, "extensions/index.ts")),
     );
     expect(inspectPiAcpProfile(home.piAgentDir).status).toBe("valid");
-    const excluded = prepareControlledPiAgentHome({
+    const excluded = runtime({
       ...options,
       excludePackages: ["pi-antigravity-acp-provider"],
     });
-    expect(JSON.parse(fs.readFileSync(excluded.settingsPath, "utf8"))).toMatchObject({
+    expect(readRuntimeSettings(excluded)).toMatchObject({
       packages: [],
     });
   });
@@ -769,9 +758,8 @@ describe("prepareControlledPiAgentHome", () => {
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
     "checks directory access only when staging a managed profile is necessary",
     () => {
-      const { sourceAgentDir, dataDir } = makeSource();
-      const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
-      const home = prepareControlledPiAgentHome(options);
+      const { runtime } = makeSource();
+      const home = runtime();
       const profile = inspectPiAcpProfile(home.piAgentDir);
       const dir = path.dirname(profile.path);
       fs.chmodSync(dir, 0o500);
@@ -779,9 +767,7 @@ describe("prepareControlledPiAgentHome", () => {
         expect(inspectPiAcpProfile(home.piAgentDir).status).toBe("valid");
         const policy = { permissions: "default" } as const;
         expect(inspectPiAcpProfile(home.piAgentDir, policy).status).toBe("invalid");
-        expect(
-          prepareControlledPiAgentHome({ ...options, piAcp: policy }).piAcpProfileError,
-        ).toBeDefined();
+        expect(runtime({ piAcp: policy }).piAcpProfileError).toBeDefined();
       } finally {
         fs.chmodSync(dir, 0o700);
       }
@@ -796,28 +782,20 @@ describe("prepareControlledPiAgentHome", () => {
   );
 
   it("ignores a malformed profile when the ACP package is excluded", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = {
-      mode: "runtime",
-      sourceAgentDir,
-      dataDir,
-      excludePackages: [providerSource],
-    } as const;
-    const home = prepareControlledPiAgentHome(options);
+    const { runtime } = makeSource();
+    const options = { excludePackages: [providerSource] };
+    const home = runtime(options);
     const { path: profile } = inspectPiAcpProfile(home.piAgentDir);
     expect(fs.existsSync(path.dirname(profile))).toBe(false);
     fs.mkdirSync(path.dirname(profile));
     fs.writeFileSync(profile, "{");
-    expect(prepareControlledPiAgentHome(options).piAcpProfileError).toBeUndefined();
+    expect(runtime(options).piAcpProfileError).toBeUndefined();
     expect(fs.readFileSync(profile, "utf8")).toBe("{");
   });
 
   it("discovers local packages when packages is empty", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const home = prepareControlledPiAgentHome({
-      mode: "runtime",
-      sourceAgentDir,
-      dataDir,
+    const { runtime } = makeSource();
+    const home = runtime({
       packages: [],
     });
     expectControlledSettings(home.settingsPath);
@@ -828,7 +806,7 @@ describe("prepareControlledPiAgentHome", () => {
   it.each(["auto-discovered", "explicit", "explicit object-form"])(
     "excludes %s packages by package name",
     (selection) => {
-      const { sourceAgentDir, dataDir } = makeSource();
+      const { sourceAgentDir, runtime } = makeSource();
       const packageSources = [
         "./nzh10-skills",
         "./nzh10-skills/packages/pi-skillful",
@@ -836,10 +814,7 @@ describe("prepareControlledPiAgentHome", () => {
         "npm:pi-antigravity-acp-provider",
         "npm:pi-btw",
       ];
-      const home = prepareControlledPiAgentHome({
-        mode: "runtime",
-        sourceAgentDir,
-        dataDir,
+      const home = runtime({
         packages:
           selection === "auto-discovered"
             ? undefined
@@ -854,9 +829,7 @@ describe("prepareControlledPiAgentHome", () => {
           "pi-autoresearch",
         ],
       });
-      const settings = JSON.parse(fs.readFileSync(home.settingsPath, "utf8")) as {
-        packages: unknown;
-      };
+      const settings = readRuntimeSettings(home);
       const retainedSources = packageSources
         .slice(0, 2)
         .map((source) => fs.realpathSync.native(path.resolve(sourceAgentDir, source)));
@@ -871,12 +844,9 @@ describe("prepareControlledPiAgentHome", () => {
   );
 
   it("sets PI_OFFLINE by default but omits it when offline is false", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    const options = { mode: "runtime", sourceAgentDir, dataDir } as const;
-    expect(prepareControlledPiAgentHome(options).env.PI_OFFLINE).toBe("1");
-    expect(prepareControlledPiAgentHome({ ...options, offline: false }).env).not.toHaveProperty(
-      "PI_OFFLINE",
-    );
+    const { runtime } = makeSource();
+    expect(runtime().env.PI_OFFLINE).toBe("1");
+    expect(runtime({ offline: false }).env).not.toHaveProperty("PI_OFFLINE");
   });
 
   it("handles minimal fresh-machine Pi homes without source settings", () => {
@@ -898,21 +868,16 @@ describe("prepareControlledPiAgentHome", () => {
   });
 
   it("preserves object-form filters and deduplicates by resolved package source", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const provider = { source: "npm:pi-antigravity-acp-provider", extensions: [] };
     const subagents = { source: "npm:pi-subagents", skills: ["foo"], prompts: ["bar"] };
     const providerDir = "npm/node_modules/pi-antigravity-acp-provider";
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({ packages: [provider, subagents, `./${providerDir}`, "./nzh10-skills"] }),
-    );
+    writePackages(sourceAgentDir, provider, subagents, `./${providerDir}`, "./nzh10-skills");
 
-    const home = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
+    const home = runtime();
     const realSource = (relative: string) =>
       fs.realpathSync.native(path.join(sourceAgentDir, relative));
-    const settings = JSON.parse(fs.readFileSync(home.settingsPath, "utf8")) as {
-      packages: unknown;
-    };
+    const settings = readRuntimeSettings(home);
     expect(settings.packages).toEqual([
       realSource("nzh10-skills"),
       { ...subagents, source: realSource("npm/node_modules/pi-subagents") },
@@ -923,66 +888,51 @@ describe("prepareControlledPiAgentHome", () => {
   });
 
   it("omits piSubagentsRoot when object-form settings disable extensions", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({ packages: [{ source: "npm:pi-subagents", extensions: [] }] }),
-    );
-    const home = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
+    const { sourceAgentDir, runtime } = makeSource();
+    writePackages(sourceAgentDir, { source: subagentsSource, extensions: [] });
+    const home = runtime();
     expect(home.resolvedPackages.piSubagentsRoot).toBeUndefined();
   });
 
   it("evaluates non-empty extension filter globs for piAntigravityEntryPath", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const providerDir = "npm/node_modules/pi-antigravity-acp-provider";
     const expectedEntry = fs.realpathSync.native(
       path.join(sourceAgentDir, providerDir, "extensions", "index.ts"),
     );
 
-    const negated = {
-      source: "npm:pi-antigravity-acp-provider",
-      extensions: ["extensions/*.ts", "!extensions/index.ts"],
-    };
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({ packages: [negated] }),
-    );
-    const negatedHome = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
-    expect(negatedHome.resolvedPackages.piAntigravityEntryPath).toBeUndefined();
-    expect(
-      (JSON.parse(fs.readFileSync(negatedHome.settingsPath, "utf8")) as { packages: unknown })
-        .packages,
-    ).toEqual([
-      { ...negated, source: fs.realpathSync.native(path.join(sourceAgentDir, providerDir)) },
-    ]);
-
-    const otherOnly = {
-      source: "npm:pi-antigravity-acp-provider",
-      extensions: ["extensions/other.ts"],
-    };
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({ packages: [otherOnly] }),
-    );
-    const otherHome = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
-    expect(otherHome.resolvedPackages.piAntigravityEntryPath).toBeUndefined();
-
-    const matchingGlob = {
-      source: "npm:pi-antigravity-acp-provider",
-      extensions: ["extensions/*.ts"],
-    };
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({ packages: [matchingGlob] }),
-    );
-    const matchedHome = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
-    expect(matchedHome.resolvedPackages.piAntigravityEntryPath).toBe(expectedEntry);
+    for (const { extensions, expected, assertRetainedFilter } of [
+      {
+        extensions: ["extensions/*.ts", "!extensions/index.ts"],
+        expected: undefined,
+        assertRetainedFilter: true,
+      },
+      { extensions: ["extensions/other.ts"], expected: undefined },
+      { extensions: ["extensions/*.ts"], expected: expectedEntry },
+    ]) {
+      const provider = { source: providerSource, extensions };
+      writePackages(sourceAgentDir, provider);
+      const home = runtime();
+      expect(home.resolvedPackages.piAntigravityEntryPath).toBe(expected);
+      if (assertRetainedFilter) {
+        const settings = readRuntimeSettings(home);
+        expect(settings.packages).toEqual([
+          { ...provider, source: fs.realpathSync.native(path.join(sourceAgentDir, providerDir)) },
+        ]);
+      }
+    }
   });
+
+  function discoverProvider(sourceAgentDir: string, entry: PiPackageEntry = providerSource) {
+    writePackages(sourceAgentDir, entry);
+    return discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath;
+  }
 
   it("applies basename exclusions to the provider entrypoint", () => {
     const { sourceAgentDir } = makeSource();
-    writePackages(sourceAgentDir, { source: providerSource, extensions: ["!index.ts"] });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBeUndefined();
+    expect(
+      discoverProvider(sourceAgentDir, { source: providerSource, extensions: ["!index.ts"] }),
+    ).toBeUndefined();
   });
 
   it("does not treat a bare directory filter as an extension path prefix", () => {
@@ -1004,10 +954,8 @@ describe("prepareControlledPiAgentHome", () => {
     const { sourceAgentDir } = makeSource();
     const root = packageRoot(sourceAgentDir, providerSource);
     const entry = fs.realpathSync.native(path.join(root, "extensions", "index.ts"));
-    const resolve = (...extensions: string[]) => {
-      writePackages(sourceAgentDir, { source: providerSource, extensions });
-      return discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath;
-    };
+    const resolve = (...extensions: string[]) =>
+      discoverProvider(sourceAgentDir, { source: providerSource, extensions });
     expect(resolve("!index.ts", "+index.ts", "+extensions/*.ts")).toBeUndefined();
     expect(resolve("!index.ts", "+./extensions/index.ts")).toBe(entry);
     expect(resolve(`-${entry}`, "+extensions/index.ts", "!index.ts")).toBeUndefined();
@@ -1018,10 +966,8 @@ describe("prepareControlledPiAgentHome", () => {
     const { sourceAgentDir } = makeSource();
     const root = packageRoot(sourceAgentDir, providerSource);
     const entry = fs.realpathSync.native(path.join(root, "extensions", "index.ts"));
-    const resolve = (extensions?: string[]) => {
-      writePackages(sourceAgentDir, { source: providerSource, autoload: false, extensions });
-      return discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath;
-    };
+    const resolve = (extensions?: string[]) =>
+      discoverProvider(sourceAgentDir, { source: providerSource, autoload: false, extensions });
     expect(resolve()).toBeUndefined();
     expect(resolve(["!other.ts"])).toBeUndefined();
     expect(resolve(["+extensions/index.ts", "!index.ts"])).toBeUndefined();
@@ -1047,24 +993,15 @@ describe("prepareControlledPiAgentHome", () => {
       "-./entry/entry-b2.ts",
     ]);
 
-    writePackages(sourceAgentDir, providerSource);
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(first);
-    writePackages(sourceAgentDir, {
-      source: providerSource,
-      extensions: ["worker/**", "index.js"],
-    });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(literal);
-    writePackages(sourceAgentDir, {
-      source: providerSource,
-      extensions: ["+entry/entry-b2.ts", "+entry/entry-z1.ts", "entry-a3.ts"],
-    });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBeUndefined();
+    expect(discoverProvider(sourceAgentDir)).toBe(first);
+    const filtered = (...extensions: string[]) =>
+      discoverProvider(sourceAgentDir, { source: providerSource, extensions });
+    expect(filtered("worker/**", "index.js")).toBe(literal);
+    expect(filtered("+entry/entry-b2.ts", "+entry/entry-z1.ts", "entry-a3.ts")).toBeUndefined();
 
     writeExtensionManifest(root, ["./entry/**/entry-[ab]?.ts", "./extensions/index.ts"]);
-    writePackages(sourceAgentDir, { source: providerSource, extensions: ["entry-b2.ts"] });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(direct);
-    writePackages(sourceAgentDir, providerSource);
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(
+    expect(filtered("entry-b2.ts")).toBe(direct);
+    expect(discoverProvider(sourceAgentDir)).toBe(
       fs.realpathSync.native(path.join(root, "extensions", "index.ts")),
     );
   });
@@ -1113,14 +1050,13 @@ describe("prepareControlledPiAgentHome", () => {
     const root = packageRoot(sourceAgentDir, providerSource);
     const entry = fs.realpathSync.native(path.join(root, "extensions", "index.ts"));
     fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ pi: { skills: [] } }));
-    writePackages(sourceAgentDir, providerSource);
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBeUndefined();
-    writePackages(sourceAgentDir, { source: providerSource });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(entry);
+    expect(discoverProvider(sourceAgentDir)).toBeUndefined();
+    expect(discoverProvider(sourceAgentDir, { source: providerSource })).toBe(entry);
     writeExtensionManifest(root, []);
     expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBeUndefined();
-    writePackages(sourceAgentDir, { source: providerSource, extensions: ["index.ts"] });
-    expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBe(entry);
+    expect(
+      discoverProvider(sourceAgentDir, { source: providerSource, extensions: ["index.ts"] }),
+    ).toBe(entry);
     writeExtensionManifest(root, ["./missing.ts"]);
     expect(discoverLocalPiPackages(sourceAgentDir).piAntigravityEntryPath).toBeUndefined();
   });
@@ -1141,25 +1077,18 @@ describe("prepareControlledPiAgentHome", () => {
   });
 
   it("prefers a filtered object over an earlier bare string for duplicate package sources", () => {
-    const { sourceAgentDir, dataDir } = makeSource();
+    const { sourceAgentDir, runtime } = makeSource();
     const providerDir = "npm/node_modules/pi-antigravity-acp-provider";
     const filteredProvider = {
       source: "npm:pi-antigravity-acp-provider",
       extensions: ["!extensions/index.ts"],
     };
-    fs.writeFileSync(
-      path.join(sourceAgentDir, "settings.json"),
-      JSON.stringify({
-        packages: ["./nzh10-skills", `./${providerDir}`, filteredProvider],
-      }),
-    );
+    writePackages(sourceAgentDir, "./nzh10-skills", `./${providerDir}`, filteredProvider);
 
-    const home = prepareControlledPiAgentHome({ mode: "runtime", sourceAgentDir, dataDir });
+    const home = runtime();
     const realSource = (relative: string) =>
       fs.realpathSync.native(path.join(sourceAgentDir, relative));
-    const settings = JSON.parse(fs.readFileSync(home.settingsPath, "utf8")) as {
-      packages: unknown;
-    };
+    const settings = readRuntimeSettings(home);
     expect(settings.packages).toEqual([
       realSource("nzh10-skills"),
       { ...filteredProvider, source: realSource(providerDir) },

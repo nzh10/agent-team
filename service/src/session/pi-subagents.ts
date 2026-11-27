@@ -54,6 +54,18 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function* jsonlObjects(lines: Iterable<string>): Generator<Record<string, unknown>> {
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const row = objectValue(JSON.parse(line));
+      if (row) yield row;
+    } catch {
+      // One malformed record does not invalidate the surrounding artifact.
+    }
+  }
+}
+
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
@@ -210,6 +222,7 @@ function projectAssistantMessage(
   message: Record<string, unknown>,
   bridgeOwnedTools: ReadonlySet<string> | undefined,
   includeToolCalls: boolean,
+  seenToolUses?: Set<string>,
 ): StreamEvent[] {
   const content = message.content;
   if (typeof content === "string") return content ? [{ kind: "text", content }] : [];
@@ -223,11 +236,15 @@ function projectAssistantMessage(
     } else if (block.type === "text" && typeof block.text === "string" && block.text) {
       events.push({ kind: "text", content: block.text });
     } else if (includeToolCalls && block.type === "toolCall" && typeof block.name === "string") {
+      const id = stringValue(block.id);
+      if (id && seenToolUses?.has(id)) continue;
+      if (id) seenToolUses?.add(id);
       const formatted = formatPiToolUse(block.name, objectValue(block.arguments), bridgeOwnedTools);
       events.push({
         kind: "tool_use",
         ...formatted,
-        ...(typeof block.id === "string" ? { toolUseId: block.id } : {}),
+        // Complete session artifacts retain even an explicitly empty id.
+        ...(id !== undefined && (id || !seenToolUses) ? { toolUseId: id } : {}),
       });
     }
   }
@@ -288,22 +305,13 @@ export function decodePiSessionV3Tree(
     return { ok: false, reason: "not_session_v3", events: [] };
   }
 
-  const entries: Record<string, unknown>[] = [];
-  for (const line of lines.slice(1)) {
-    if (!line.trim()) continue;
-    try {
-      const entry = objectValue(JSON.parse(line));
-      if (entry) entries.push(entry);
-    } catch {
-      // A malformed entry cannot contribute to the active branch, but valid
-      // preceding entries remain useful artifact data.
-    }
-  }
   const byId = new Map<string, Record<string, unknown>>();
-  for (const entry of entries) {
-    if (typeof entry.id === "string") byId.set(entry.id, entry);
+  let leaf: Record<string, unknown> | undefined;
+  for (const entry of jsonlObjects(lines.slice(1))) {
+    if (typeof entry.id !== "string") continue;
+    byId.set(entry.id, entry);
+    leaf = entry;
   }
-  const leaf = [...entries].reverse().find((entry) => typeof entry.id === "string");
   const branch: Record<string, unknown>[] = [];
   const visited = new Set<string>();
   let current = leaf;
@@ -398,15 +406,7 @@ export function decodeChildTranscriptArtifact(
     warnings.push(transcriptWarning(`Child transcript error: ${meta.transcriptError}`));
   }
 
-  for (const line of source.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let record: Record<string, unknown> | undefined;
-    try {
-      record = objectValue(JSON.parse(line));
-    } catch {
-      continue;
-    }
-    if (!record) continue;
+  for (const record of jsonlObjects(source.split(/\r?\n/))) {
     if (record.recordType === "truncated") {
       warnings.push(
         transcriptWarning(
@@ -559,17 +559,7 @@ export function readIncrementalJsonlRecords(
   const complete = combined.subarray(0, lastNewline);
   cursor.carry = Buffer.from(combined.subarray(lastNewline + 1));
 
-  const records: Record<string, unknown>[] = [];
-  for (const line of complete.toString("utf8").split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = objectValue(JSON.parse(line));
-      if (parsed) records.push(parsed);
-    } catch {
-      // Malformed line cannot yield an event; skip cleanly and continue.
-    }
-  }
-  return records;
+  return [...jsonlObjects(complete.toString("utf8").split(/\r?\n/))];
 }
 
 export interface SubagentProjectionState {
@@ -611,37 +601,26 @@ function mergeProjectionExecution(
   return changed;
 }
 
-function projectAssistantBlocksIncremental(
-  message: Record<string, unknown>,
+// Both native session entries and runner message_end frames carry a Pi message.
+function projectLivePiMessage(
+  raw: unknown,
   state: SubagentProjectionState,
-  bridgeOwnedTools: ReadonlySet<string> | undefined,
-  includeToolCalls: boolean,
-): StreamEvent[] {
-  if (!includeToolCalls) return projectAssistantMessage(message, bridgeOwnedTools, false);
-  const content = message.content;
-  if (typeof content === "string") return content ? [{ kind: "text", content }] : [];
-  if (!Array.isArray(content)) return [];
-  const events: StreamEvent[] = [];
-  for (const rawBlock of content) {
-    const block = objectValue(rawBlock);
-    if (!block) continue;
-    if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
-      events.push({ kind: "thinking", content: block.thinking });
-    } else if (block.type === "text" && typeof block.text === "string" && block.text) {
-      events.push({ kind: "text", content: block.text });
-    } else if (block.type === "toolCall" && typeof block.name === "string") {
-      const toolUseId = typeof block.id === "string" && block.id ? block.id : undefined;
-      if (toolUseId && state.seenToolUses.has(toolUseId)) continue;
-      if (toolUseId) state.seenToolUses.add(toolUseId);
-      const formatted = formatPiToolUse(block.name, objectValue(block.arguments), bridgeOwnedTools);
-      events.push({
-        kind: "tool_use",
-        ...formatted,
-        ...(toolUseId ? { toolUseId } : {}),
-      });
+  bridgeOwnedTools?: ReadonlySet<string>,
+): ProjectedRecordBatch {
+  const message = objectValue(raw);
+  if (message?.role === "assistant") {
+    const executionChanged = mergeProjectionExecution(state, assistantExecution(message));
+    const events = projectAssistantMessage(message, bridgeOwnedTools, true, state.seenToolUses);
+    return { events, executionChanged };
+  }
+  if (message?.role === "toolResult" || message?.role === "tool_result") {
+    const id = stringValue(message.toolCallId);
+    if (!id || !state.seenToolResults.has(id)) {
+      if (id) state.seenToolResults.add(id);
+      return { events: [projectToolResult(message)], executionChanged: false };
     }
   }
-  return events;
+  return { events: [], executionChanged: false };
 }
 
 /** Project one line from an async runner `events.jsonl` incrementally without duplicates. */
@@ -652,23 +631,7 @@ export function projectAsyncEventRecord(
 ): ProjectedRecordBatch {
   const type = stringValue(record.type);
   if (type === "message_end") {
-    const message = objectValue(record.message);
-    if (!message) return { events: [], executionChanged: false };
-    const role = stringValue(message.role);
-    if (role === "assistant") {
-      const executionChanged = mergeProjectionExecution(state, assistantExecution(message));
-      const events = projectAssistantBlocksIncremental(message, state, bridgeOwnedTools, true);
-      return { events, executionChanged };
-    }
-    if (role === "toolResult" || role === "tool_result") {
-      const toolUseId = stringValue(message.toolCallId);
-      if (toolUseId && state.seenToolResults.has(toolUseId)) {
-        return { events: [], executionChanged: false };
-      }
-      if (toolUseId) state.seenToolResults.add(toolUseId);
-      return { events: [projectToolResult(message)], executionChanged: false };
-    }
-    return { events: [], executionChanged: false };
+    return projectLivePiMessage(record.message, state, bridgeOwnedTools);
   }
   if (type === "tool_execution_start") {
     const toolName = stringValue(record.toolName);
@@ -764,7 +727,7 @@ export function projectTranscriptArtifactRecord(
   const role = record.role ?? message.role;
   if (role === "assistant") {
     const executionChanged = mergeProjectionExecution(state, assistantExecution(message));
-    const events = projectAssistantBlocksIncremental(message, state, bridgeOwnedTools, false);
+    const events = projectAssistantMessage(message, bridgeOwnedTools, false);
     return { events, executionChanged };
   }
   if (role === "toolResult" || role === "tool_result") {
@@ -805,22 +768,7 @@ export function projectSessionV3Record(
     };
   }
   if (record.type !== "message") return { events: [], executionChanged: false };
-  const message = objectValue(record.message);
-  if (!message) return { events: [], executionChanged: false };
-  if (message.role === "assistant") {
-    const executionChanged = mergeProjectionExecution(state, assistantExecution(message));
-    const events = projectAssistantBlocksIncremental(message, state, bridgeOwnedTools, true);
-    return { events, executionChanged };
-  }
-  if (message.role === "toolResult" || message.role === "tool_result") {
-    const toolUseId = stringValue(message.toolCallId);
-    if (toolUseId && state.seenToolResults.has(toolUseId)) {
-      return { events: [], executionChanged: false };
-    }
-    if (toolUseId) state.seenToolResults.add(toolUseId);
-    return { events: [projectToolResult(message)], executionChanged: false };
-  }
-  return { events: [], executionChanged: false };
+  return projectLivePiMessage(record.message, state, bridgeOwnedTools);
 }
 
 export function resolveWorkflowStepIndex(

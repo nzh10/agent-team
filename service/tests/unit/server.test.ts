@@ -10,6 +10,7 @@ import * as os from "os";
 import * as path from "path";
 import { pathToFileURL } from "url";
 import WebSocket from "ws";
+import { loopbackRequest, type RequestOptions } from "./helpers/loopback-request";
 import type { Message, WorkspaceState } from "../../src/workspace/workspace";
 import { closeHistory, saveIndex, saveWorkspace } from "../../src/workspace/state";
 
@@ -25,34 +26,9 @@ let remote: http.Server;
 let remotePort: number;
 let cookie: string;
 
-function request(
-  pathname: string,
-  opts: { method?: string; headers?: Record<string, string>; body?: string | Buffer } = {},
-): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: pathname,
-        method: opts.method ?? "GET",
-        headers: opts.headers,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () =>
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: res.headers,
-            body: Buffer.concat(chunks).toString(),
-          }),
-        );
-      },
-    );
-    req.on("error", reject);
-    req.end(opts.body);
-  });
+async function request(pathname: string, opts?: RequestOptions) {
+  const res = await loopbackRequest(port, pathname, opts);
+  return { ...res, body: res.body.toString() };
 }
 
 function connect(): Promise<{

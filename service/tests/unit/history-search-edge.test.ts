@@ -3,42 +3,14 @@
 // index file that cannot be read.
 import { describe, it, expect, afterEach, vi } from "vitest";
 import * as fs from "fs";
-import * as os from "os";
+import { historyMessage as msg, setupHistory as setup } from "./helpers/history";
 import * as path from "path";
 import { HistoryService, sidebarHits } from "../../src/workspace/history-service";
 import type { SearchQuery } from "../../src/workspace/history-index";
-import { closeHistory, historyFile, historyIndexFile, historyOf } from "../../src/workspace/state";
+import { historyIndexFile } from "../../src/workspace/state";
 import type { Message } from "../../src/workspace/workspace";
 
-const cleanups: Array<() => Promise<void> | void> = [];
-afterEach(async () => {
-  vi.restoreAllMocks();
-  for (const c of cleanups.splice(0)) await c();
-});
-
-function setup() {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-search-edge-"));
-  const history = new HistoryService(historyIndexFile(base), historyFile(base));
-  cleanups.push(
-    () => history.close(),
-    () => closeHistory(base),
-    () => fs.rmSync(base, { recursive: true, force: true }),
-  );
-  const save = (session: string, messages: Message[]) => {
-    historyOf(base).save(session, messages, "all");
-    history.changed();
-  };
-  return { base, history, save };
-}
-
-const msg = (id: string, content: string, timestamp: number): Message => ({
-  id,
-  kind: "agent",
-  agentId: "a",
-  content,
-  timestamp,
-  status: "done",
-});
+afterEach(() => vi.restoreAllMocks());
 
 describe("a short word over many sessions", () => {
   it("finds the newest of the sessions asked for, as over a few", async () => {

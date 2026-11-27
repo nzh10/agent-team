@@ -1,14 +1,14 @@
 // A project's board reads and opens files of its notes and repository only:
 // the path rules, api/file with a project, api/open, and VS Code's CLI found
 // and pointed at a live window.
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, onTestFinished, vi } from "vitest";
 import * as fs from "fs";
 import * as http from "http";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { Auth } from "../../src/server/auth";
-import { HttpHandler } from "../../src/server/http";
+import { HttpHandler, type ProjectPaths } from "../../src/server/http";
 import { execFileSync } from "child_process";
 import { boardRef, findBySuffix, resolveProjectPath } from "../../src/project/paths";
 import { openInVSCode, VSCodeUnavailable } from "../../src/repo/vscode";
@@ -123,46 +123,67 @@ describe("a path missing from the repository", () => {
   });
 });
 
+async function serveProjectFiles({
+  cwdOf,
+  projectOf,
+  openFile,
+  notesOf,
+}: {
+  cwdOf?: (workspaceId: string) => string | undefined;
+  projectOf?: (projectId: string) => ProjectPaths | undefined;
+  openFile?: (file: string, line: number | undefined) => Promise<void>;
+  notesOf?: (workspaceId: string) => string | undefined;
+}) {
+  const handler = new HttpHandler(
+    new Auth(() => null),
+    base,
+    base,
+    base,
+    cwdOf,
+    undefined,
+    projectOf,
+    openFile,
+    notesOf,
+  );
+  const server = http.createServer((req, res) => handler.handle(req, res));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+  const json = async (route: string, init?: RequestInit) => {
+    const response = await fetch(url + route, init);
+    return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+  };
+  return {
+    url,
+    get: (query: string) => json(`/api/file?${query}`),
+    open: (body: unknown, type = "application/json") =>
+      json("/api/open", {
+        method: "POST",
+        headers: { "Content-Type": type },
+        body: JSON.stringify(body),
+      }),
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
 describe("api/file and api/open for a project", () => {
-  let server: http.Server;
-  let port: number;
+  let files: Awaited<ReturnType<typeof serveProjectFiles>>;
   const opened: Array<[string, number | undefined]> = [];
   let fail: Error | null = null;
 
   beforeAll(async () => {
-    const handler = new HttpHandler(
-      new Auth(() => null),
-      base,
-      base,
-      base,
-      () => undefined,
-      () => undefined,
-      (id) => (id === "p1" ? { root, notesDir: notes } : undefined),
-      (file, line) => {
+    files = await serveProjectFiles({
+      projectOf: (id) => (id === "p1" ? { root, notesDir: notes } : undefined),
+      openFile: (file, line) => {
         if (fail) return Promise.reject(fail);
         opened.push([file, line]);
         return Promise.resolve();
       },
-    );
-    server = http.createServer((req, res) => handler.handle(req, res));
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    port = (server.address() as net.AddressInfo).port;
+    });
   });
-  afterAll(() => new Promise<void>((r) => server.close(() => r())));
-
-  const get = (q: string) =>
-    fetch(`http://127.0.0.1:${port}/api/file?${q}`).then(async (r) => ({
-      status: r.status,
-      body: (await r.json()) as Record<string, unknown>,
-    }));
-  const open = (body: unknown, type = "application/json") =>
-    fetch(`http://127.0.0.1:${port}/api/open`, {
-      method: "POST",
-      headers: { "Content-Type": type },
-      body: JSON.stringify(body),
-    }).then(async (r) => ({ status: r.status, body: (await r.json()) as Record<string, unknown> }));
+  afterAll(() => files.close());
 
   it("read a note, list the notes, and refuse what lies outside", async () => {
+    const { get, url } = files;
     const note = await get("project=p1&path=notes/rules/cli.md");
     expect(note).toMatchObject({
       status: 200,
@@ -184,11 +205,12 @@ describe("api/file and api/open for a project", () => {
     expect((await get(`project=p1&path=${encodeURIComponent(base)}/secret.txt`)).status).toBe(403);
     expect((await get("project=nope&path=notes")).status).toBe(404);
     expect((await get(`project=p1&path=${"a/".repeat(3000)}`)).status).toBe(400);
-    const raw = await fetch(`http://127.0.0.1:${port}/api/file/raw?project=p1&path=../secret.txt`);
+    const raw = await fetch(`${url}/api/file/raw?project=p1&path=../secret.txt`);
     expect(raw.status).toBe(403);
   });
 
   it("open a file of the project in VS Code, and say when it cannot", async () => {
+    const { open } = files;
     expect(await open({ project: "p1", path: "src/a.cpp", line: 3 })).toEqual({
       status: 200,
       body: { opened: path.join(root, "src", "a.cpp") },
@@ -216,168 +238,134 @@ describe("api/file for a project whose folder is gone", () => {
   it("answers, and the server stays up", async () => {
     const file = path.join(base, "not-a-dir");
     fs.writeFileSync(file, "");
-    const handler = new HttpHandler(
-      new Auth(() => null),
-      base,
-      base,
-      base,
-      () => undefined,
-      () => undefined,
-      () => ({ root: file, notesDir: path.join(file, "notes") }),
-    );
-    const server = http.createServer((req, res) => handler.handle(req, res));
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    const { port } = server.address() as net.AddressInfo;
+    const files = await serveProjectFiles({
+      projectOf: () => ({ root: file, notesDir: path.join(file, "notes") }),
+    });
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/file?project=p&path=x.cpp`, {
+      const res = await fetch(`${files.url}/api/file?project=p&path=x.cpp`, {
         signal: AbortSignal.timeout(3000),
       });
       expect(res.status).toBeGreaterThanOrEqual(400);
     } finally {
-      await new Promise<void>((r) => server.close(() => r()));
+      await files.close();
     }
   });
 });
+
+function vscodeCLI(
+  script: (paths: { dir: string; log: string }) => string,
+  ...runtimeNames: string[]
+) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
+  onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const serverDir = path.join(dir, "server");
+  const cli = path.join(serverDir, "bin", "abc", "bin", "remote-cli", "code");
+  const log = path.join(dir, "log");
+  fs.mkdirSync(path.dirname(cli), { recursive: true });
+  fs.writeFileSync(cli, `#!/bin/sh\n${script({ dir, log })}`, { mode: 0o755 });
+  const runtimeDirs = runtimeNames.map((name) => path.join(dir, name));
+  for (const runtime of runtimeDirs) fs.mkdirSync(runtime);
+  return { dir, log, env: { serverDir, runtimeDirs } };
+}
+
+async function listenUnixSocket(file: string, onConnection?: (socket: net.Socket) => void) {
+  const server = net.createServer(onConnection);
+  await new Promise<void>((resolve) => server.listen(file, resolve));
+  return () => new Promise<void>((resolve) => server.close(() => resolve()));
+}
 
 describe("VS Code's CLI", () => {
   it.skipIf(process.platform === "win32")(
     "is called with the hook of a live window, the newest live socket first",
     async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-      try {
-        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-        fs.mkdirSync(path.dirname(cli), { recursive: true });
-        const log = path.join(dir, "log");
-        fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI $*" > ${log}\n`, {
-          mode: 0o755,
-        });
-        const run = path.join(dir, "run");
-        fs.mkdirSync(run);
-        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
+      const { log, env } = vscodeCLI(
+        ({ log }) => `echo "$VSCODE_IPC_HOOK_CLI $*" > ${log}\n`,
+        "run",
+      );
+      const [run] = env.runtimeDirs;
 
-        await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toBeInstanceOf(VSCodeUnavailable);
+      await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toBeInstanceOf(VSCodeUnavailable);
 
-        const live = path.join(run, "vscode-ipc-live.sock");
-        const window = net.createServer((c) => c.end());
-        await new Promise<void>((r) => window.listen(live, r));
-        // Left behind by a closed window, and newer.
-        const dead = path.join(run, "vscode-ipc-dead.sock");
-        const gone = net.createServer();
-        await new Promise<void>((r) => gone.listen(dead, r));
-        await new Promise<void>((r) => gone.close(() => r()));
-        fs.writeFileSync(dead, "");
-        fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const live = path.join(run, "vscode-ipc-live.sock");
+      const closeWindow = await listenUnixSocket(live, (socket) => socket.end());
+      // Left behind by a closed window, and newer.
+      const dead = path.join(run, "vscode-ipc-dead.sock");
+      const closeGoneWindow = await listenUnixSocket(dead);
+      await closeGoneWindow();
+      fs.writeFileSync(dead, "");
+      fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
 
-        await openInVSCode("/repo/a.cpp", 3, env);
-        expect(fs.readFileSync(log, "utf-8").trim()).toBe(`${live} --goto /repo/a.cpp:3`);
-        await new Promise<void>((r) => window.close(() => r()));
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
+      await openInVSCode("/repo/a.cpp", 3, env);
+      expect(fs.readFileSync(log, "utf-8").trim()).toBe(`${live} --goto /repo/a.cpp:3`);
+      await closeWindow();
     },
   );
 
   it.skipIf(process.platform === "win32")(
     "finds a window's socket in any of the runtime dirs",
     async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-      try {
-        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-        fs.mkdirSync(path.dirname(cli), { recursive: true });
-        const log = path.join(dir, "log");
-        fs.writeFileSync(cli, `#!/bin/sh\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`, { mode: 0o755 });
-        const [run, tmp] = ["run", "tmp"].map((d) => path.join(dir, d));
-        fs.mkdirSync(run);
-        fs.mkdirSync(tmp);
-        const live = path.join(tmp, "vscode-ipc-live.sock");
-        const window = net.createServer((c) => c.end());
-        await new Promise<void>((r) => window.listen(live, r));
-        // The hook the server was started with, of a window closed since.
-        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run, tmp], hook: "/gone" };
-        await openInVSCode("/repo/a.cpp", undefined, env);
-        expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
-        await new Promise<void>((r) => window.close(() => r()));
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
+      const { log, env } = vscodeCLI(
+        ({ log }) => `echo "$VSCODE_IPC_HOOK_CLI" > ${log}\n`,
+        "run",
+        "tmp",
+      );
+      const [, tmp] = env.runtimeDirs;
+      const live = path.join(tmp, "vscode-ipc-live.sock");
+      const closeWindow = await listenUnixSocket(live, (socket) => socket.end());
+      // The hook the server was started with, of a window closed since.
+      await openInVSCode("/repo/a.cpp", undefined, { ...env, hook: "/gone" });
+      expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
+      await closeWindow();
     },
   );
 
   it.skipIf(process.platform === "win32")(
     "moves on from a window that does not answer, leaving nothing behind",
     async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-      try {
-        const run = path.join(dir, "run");
-        fs.mkdirSync(run);
-        const hung = path.join(run, "vscode-ipc-hung.sock");
-        const live = path.join(run, "vscode-ipc-live.sock");
-        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-        fs.mkdirSync(path.dirname(cli), { recursive: true });
-        const log = path.join(dir, "log");
-        const pid = path.join(dir, "pid");
-        fs.writeFileSync(
-          cli,
-          `#!/bin/sh\nif [ "$VSCODE_IPC_HOOK_CLI" = "${hung}" ]; then sleep 30 & echo $! > ${pid}; wait; fi\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`,
-          { mode: 0o755 },
-        );
-        const servers = [hung, live].map(() => net.createServer(() => {}));
-        await Promise.all(
-          servers.map((srv, i) => new Promise<void>((r) => srv.listen([hung, live][i], r))),
-        );
-        fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const hungSocket = (dir: string) => path.join(dir, "run", "vscode-ipc-hung.sock");
+      const pidFile = (dir: string) => path.join(dir, "pid");
+      const { dir, log, env } = vscodeCLI(
+        ({ dir, log }) =>
+          `if [ "$VSCODE_IPC_HOOK_CLI" = "${hungSocket(dir)}" ]; then sleep 30 & echo $! > ${pidFile(dir)}; wait; fi\necho "$VSCODE_IPC_HOOK_CLI" > ${log}\n`,
+        "run",
+      );
+      const hung = hungSocket(dir);
+      const live = path.join(env.runtimeDirs[0], "vscode-ipc-live.sock");
+      const closeWindows = await Promise.all(
+        [hung, live].map((file) => listenUnixSocket(file, () => {})),
+      );
+      fs.utimesSync(live, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
 
-        await openInVSCode("/repo/a.cpp", undefined, {
-          serverDir: path.join(dir, "server"),
-          runtimeDirs: [run],
-          timeoutMs: 300,
-        });
-        expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
-        const sleeper = Number(fs.readFileSync(pid, "utf-8"));
-        await vi.waitFor(() => expect(() => process.kill(sleeper, 0)).toThrow(), {
-          timeout: 1000,
-          interval: 10,
-        });
-        await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
+      await openInVSCode("/repo/a.cpp", undefined, { ...env, timeoutMs: 300 });
+      expect(fs.readFileSync(log, "utf-8").trim()).toBe(live);
+      const sleeper = Number(fs.readFileSync(pidFile(dir), "utf-8"));
+      await vi.waitFor(() => expect(() => process.kill(sleeper, 0)).toThrow(), {
+        timeout: 1000,
+        interval: 10,
+      });
+      await Promise.all(closeWindows.map((close) => close()));
     },
   );
 
   it.skipIf(process.platform === "win32")(
     "is run once when it fails by itself, and without --goto for no line",
     async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-team-vsc-"));
-      try {
-        const run = path.join(dir, "run");
-        fs.mkdirSync(run);
-        const cli = path.join(dir, "server", "bin", "abc", "bin", "remote-cli", "code");
-        fs.mkdirSync(path.dirname(cli), { recursive: true });
-        const log = path.join(dir, "log");
-        fs.writeFileSync(
-          cli,
-          `#!/bin/sh\necho "$*" >> ${log}\n[ "$1" = "--goto" ] || exit 0\nexit 1\n`,
-          {
-            mode: 0o755,
-          },
-        );
-        const socks = ["a", "b", "c"].map((n) => path.join(run, `vscode-ipc-${n}.sock`));
-        const servers = socks.map(() => net.createServer((c) => c.end()));
-        await Promise.all(
-          servers.map((srv, i) => new Promise<void>((r) => srv.listen(socks[i], r))),
-        );
-        const env = { serverDir: path.join(dir, "server"), runtimeDirs: [run] };
+      const { log, env } = vscodeCLI(
+        ({ log }) => `echo "$*" >> ${log}\n[ "$1" = "--goto" ] || exit 0\nexit 1\n`,
+        "run",
+      );
+      const [run] = env.runtimeDirs;
+      const socks = ["a", "b", "c"].map((n) => path.join(run, `vscode-ipc-${n}.sock`));
+      const closeWindows = await Promise.all(
+        socks.map((file) => listenUnixSocket(file, (socket) => socket.end())),
+      );
 
-        await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toThrow();
-        expect(fs.readFileSync(log, "utf-8").trim().split("\n")).toEqual(["--goto /repo/a.cpp:3"]);
-        fs.rmSync(log);
-        await openInVSCode("/repo/a:3", undefined, env);
-        expect(fs.readFileSync(log, "utf-8").trim()).toBe("/repo/a:3");
-        await Promise.all(servers.map((srv) => new Promise<void>((r) => srv.close(() => r()))));
-      } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
+      await expect(openInVSCode("/repo/a.cpp", 3, env)).rejects.toThrow();
+      expect(fs.readFileSync(log, "utf-8").trim().split("\n")).toEqual(["--goto /repo/a.cpp:3"]);
+      fs.rmSync(log);
+      await openInVSCode("/repo/a:3", undefined, env);
+      expect(fs.readFileSync(log, "utf-8").trim()).toBe("/repo/a:3");
+      await Promise.all(closeWindows.map((close) => close()));
     },
   );
 
@@ -389,63 +377,46 @@ describe("VS Code's CLI", () => {
 });
 
 describe("api/file for a session of a project", () => {
-  let server: http.Server;
-  let port: number;
+  let files: Awaited<ReturnType<typeof serveProjectFiles>>;
   let worktree: string;
 
   beforeAll(async () => {
     worktree = path.join(base, "worktree");
     fs.mkdirSync(path.join(worktree, "own", "notes"), { recursive: true });
     fs.writeFileSync(path.join(worktree, "own", "notes", "todo.md"), "mine\n");
-    const handler = new HttpHandler(
-      new Auth(() => null),
-      base,
-      base,
-      base,
-      (id) => ({ w1: worktree, w2: path.join(worktree, "own") })[id],
-      () => undefined,
-      () => undefined,
-      undefined,
-      (id) => (id === "w1" || id === "w2" ? notes : undefined),
-    );
-    server = http.createServer((req, res) => handler.handle(req, res));
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    port = (server.address() as net.AddressInfo).port;
+    files = await serveProjectFiles({
+      cwdOf: (id) => ({ w1: worktree, w2: path.join(worktree, "own") })[id],
+      notesOf: (id) => (id === "w1" || id === "w2" ? notes : undefined),
+    });
   });
-  afterAll(() => new Promise<void>((r) => server.close(() => r())));
-
-  const get = (q: string) =>
-    fetch(`http://127.0.0.1:${port}/api/file?${q}`).then(async (r) => ({
-      status: r.status,
-      body: (await r.json()) as Record<string, unknown>,
-    }));
+  afterAll(() => files.close());
 
   it("read notes/... from the project's notes, unless the workspace has that file itself", async () => {
-    expect((await get("ws=w1&path=notes/rules/cli.md")).body).toMatchObject({
+    expect((await files.get("ws=w1&path=notes/rules/cli.md")).body).toMatchObject({
       kind: "text",
       content: "# CLI\n",
       path: path.join(notes, "rules", "cli.md"),
       ref: "notes/rules/cli.md",
     });
-    expect((await get("ws=w1&path=notes")).body).toMatchObject({
+    expect((await files.get("ws=w1&path=notes")).body).toMatchObject({
       kind: "dir",
       path: notes,
       ref: "notes",
     });
     // A note opened by its full path still says which note it is.
     expect(
-      (await get(`ws=w1&path=${encodeURIComponent(path.join(notes, "rules"))}`)).body,
+      (await files.get(`ws=w1&path=${encodeURIComponent(path.join(notes, "rules"))}`)).body,
     ).toMatchObject({ kind: "dir", ref: "notes/rules" });
-    const own = (await get("ws=w2&path=notes/todo.md")).body;
+    const own = (await files.get("ws=w2&path=notes/todo.md")).body;
     expect(own).toMatchObject({ content: "mine\n" });
     expect(own.ref).toBeUndefined();
-    expect((await get("ws=w2&path=notes/rules/cli.md")).body).toMatchObject({
+    expect((await files.get("ws=w2&path=notes/rules/cli.md")).body).toMatchObject({
       ref: "notes/rules/cli.md",
     });
-    expect((await get("ws=w1&path=notes/nope.md")).body).toMatchObject({
+    expect((await files.get("ws=w1&path=notes/nope.md")).body).toMatchObject({
       error: "No such file or directory",
       path: path.join(notes, "nope.md"),
     });
-    expect((await get("ws=w1&path=./notes/rules/cli.md")).status).toBe(404);
+    expect((await files.get("ws=w1&path=./notes/rules/cli.md")).status).toBe(404);
   });
 });

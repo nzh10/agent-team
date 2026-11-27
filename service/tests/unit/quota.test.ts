@@ -23,6 +23,7 @@ import * as codexRpc from "../../src/session/codex-rpc";
 import { QuotaAdapterRegistry } from "../../src/session/quota/registry";
 import type { PiQuotaContext } from "../../src/session/quota/pi-context";
 type Reader = () => Promise<QuotaSnapshot>;
+const unavailableCodexReader: Reader = () => Promise.resolve(unavailable(NATIVE_CODEX));
 class TestQuotaMonitor extends Monitor<(Reader | undefined)[]> {
   constructor(changed: (state: QuotaState) => void = () => {}) {
     super(
@@ -46,15 +47,21 @@ function monitor() {
   };
 }
 
-function fixture(
-  modelRegistry: PiQuotaContext["modelRegistry"] = {
+type AcpQuotaRequest = { reply: (raw: unknown) => void };
+type PanelQuotaRefresh = {
+  provider: string;
+  reply: (snapshot: QuotaSnapshot) => void;
+  force?: boolean;
+};
+
+function piQuotaFixture() {
+  const modelRegistry: PiQuotaContext["modelRegistry"] = {
     getProvider: () => true,
     getAll: () => [],
     isUsingOAuth: () => false,
     getProviderAuthStatus: () => ({ configured: false }),
     getProviderAuth: () => Promise.resolve(undefined),
-  },
-) {
+  };
   const events = new EventEmitter();
   let command!: Parameters<Parameters<typeof piQuota>[0]["registerCommand"]>[1];
   const notify = vi.fn();
@@ -70,14 +77,30 @@ function fixture(
   });
   const snapshots: QuotaSnapshot[] = [];
   events.on(SNAPSHOT_EVENT, (s) => snapshots.push(s as QuotaSnapshot));
+  const requestEvent = "antigravity-acp:quota:request";
   return {
-    events,
+    onAcpRequest: (handler: (request: AcpQuotaRequest) => void) => events.on(requestEvent, handler),
+    replyToNextAcpRequest: (raw: unknown) =>
+      events.once(requestEvent, ({ reply }: AcpQuotaRequest) => reply(raw)),
+    emitPanelRefresh: (request: PanelQuotaRefresh) => events.emit(REFRESH_EVENT, request),
+    refreshFromPanel: (request: PanelQuotaRefresh): unknown =>
+      events.listeners(REFRESH_EVENT)[0](request),
     notify,
     snapshots,
     run: (provider = ACP as string) =>
       command.handler("", { modelRegistry, model: { provider }, ui: { notify } }),
   };
 }
+function availableAcpReply() {
+  return {
+    ok: true,
+    quota: {
+      at: Date.now(),
+      groups: [{ displayName: "A", buckets: [{ window: "5h", remainingFraction: 0.2 }] }],
+    },
+  };
+}
+
 let runtimeDir: string;
 beforeEach(() => {
   runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-quota-test-"));
@@ -95,40 +118,29 @@ afterEach(() => {
 it("skips unavailable ACP quota on both routes and retries on the same Pi once the runtime appears", async () => {
   const runtime = path.join(runtimeDir, "later");
   vi.stubEnv("AGY_ACP_BIN", runtime);
-  const { events, notify, run } = fixture();
-  const request = vi.fn(({ reply }: { reply: (value: unknown) => void }) =>
-    reply({
-      ok: true,
-      quota: {
-        at: Date.now(),
-        groups: [{ displayName: "A", buckets: [{ window: "5h", remainingFraction: 0.2 }] }],
-      },
-    }),
-  );
-  events.on("antigravity-acp:quota:request", request);
-  const refresh = events.listeners(REFRESH_EVENT)[0] as (request: unknown) => Promise<void>;
+  const { onAcpRequest, refreshFromPanel, notify, run } = piQuotaFixture();
+  const request = vi.fn(({ reply }: AcpQuotaRequest) => reply(availableAcpReply()));
+  onAcpRequest(request);
   const reply = vi.fn();
   await run();
-  await refresh({ provider: ACP, reply });
+  await refreshFromPanel({ provider: ACP, reply });
   expect(request).not.toHaveBeenCalled();
   expect(notify).toHaveBeenCalledWith(expect.stringContaining(ACP_PREPARE_STEP), "warning");
   expect(reply).toHaveBeenLastCalledWith(expect.objectContaining({ availability: "unavailable" }));
 
   fs.writeFileSync(runtime, "not run", { mode: 0o700 });
-  await refresh({ provider: ACP, reply });
+  await refreshFromPanel({ provider: ACP, reply });
   expect(request).toHaveBeenCalledOnce();
   expect(reply).toHaveBeenLastCalledWith(expect.objectContaining({ availability: "available" }));
 });
 
 it("shares the provider read between command, panel control and cached requests, publishing only quota fields", async () => {
-  const { events, run, notify, snapshots } = fixture();
-  const requests: { reply: (v: unknown) => void }[] = [];
-  events.on("antigravity-acp:quota:request", (req) =>
-    requests.push(req as (typeof requests)[number]),
-  );
+  const { emitPanelRefresh, onAcpRequest, run, notify, snapshots } = piQuotaFixture();
+  const requests: AcpQuotaRequest[] = [];
+  onAcpRequest((req) => requests.push(req));
   const cmd = run();
   const ack = vi.fn();
-  events.emit(REFRESH_EVENT, { provider: ACP, reply: ack });
+  emitPanelRefresh({ provider: ACP, reply: ack });
   await Promise.resolve();
   const at = Date.now();
   const reset = "2027-01-01T10:00:00Z";
@@ -161,20 +173,10 @@ it("shares the provider read between command, panel control and cached requests,
   expect(notify).toHaveBeenCalledWith(expect.stringContaining("Gemini · 5h: 21% used"), "info");
 });
 it("does not bypass provider cache invalidation after logout", async () => {
-  const f = fixture();
+  const f = piQuotaFixture();
   let loggedIn = true;
-  f.events.on("antigravity-acp:quota:request", ({ reply }: { reply: (raw: unknown) => void }) =>
-    reply(
-      loggedIn
-        ? {
-            ok: true,
-            quota: {
-              at: Date.now(),
-              groups: [{ displayName: "A", buckets: [{ window: "5h", remainingFraction: 0.2 }] }],
-            },
-          }
-        : { ok: false, error: "signed out" },
-    ),
+  f.onAcpRequest(({ reply }) =>
+    reply(loggedIn ? availableAcpReply() : { ok: false, error: "signed out" }),
   );
   await f.run();
   loggedIn = false;
@@ -186,10 +188,8 @@ it("does not bypass provider cache invalidation after logout", async () => {
 });
 it("reports unsupported providers without probing; errors, missing listeners and malformed fractions are unavailable", async () => {
   vi.useFakeTimers();
-  const f = fixture();
-  f.events.once("antigravity-acp:quota:request", ({ reply }: { reply: (v: unknown) => void }) =>
-    reply({ ok: false }),
-  );
+  const f = piQuotaFixture();
+  f.replyToNextAcpRequest({ ok: false });
   await f.run("unknown-provider");
   expect(f.snapshots.find((s) => s.provider === "unknown-provider")).toMatchObject({
     provider: "unknown-provider",
@@ -210,9 +210,7 @@ it("reports unsupported providers without probing; errors, missing listeners and
     },
   ]) {
     await vi.advanceTimersByTimeAsync(QUOTA_AUTO_REFRESH_INTERVAL);
-    f.events.once("antigravity-acp:quota:request", ({ reply }: { reply: (raw: unknown) => void }) =>
-      reply(raw),
-    );
+    f.replyToNextAcpRequest(raw);
     await f.run();
   }
   expect(
@@ -268,7 +266,7 @@ it("does not revive an unavailable row with a delayed duplicate", async () => {
   const q = monitor();
   const sample = group(Date.now() - 10, "A", 3);
   q.accept(sample);
-  await q.refresh(() => Promise.resolve(unavailable(NATIVE_CODEX)));
+  await q.refresh(unavailableCodexReader);
   q.accept(sample);
   expect(q.state().rows.find((r) => r.name === "A")?.availability).toBe("unavailable");
 });
@@ -279,10 +277,9 @@ it.each([0, 10])(
     const now = Date.now();
     const sample = group(now - 10, "A", 3);
     q.accept(sample);
-    await q.refresh(() => Promise.resolve(unavailable(NATIVE_CODEX)));
-    await q.refresh(
-      () => Promise.resolve(unavailable(NATIVE_CODEX)),
-      () => Promise.resolve(lag ? group(sample.observedAt - lag, "A", 81) : sample),
+    await q.refresh(unavailableCodexReader);
+    await q.refresh(unavailableCodexReader, () =>
+      Promise.resolve(lag ? group(sample.observedAt - lag, "A", 81) : sample),
     );
     expect(q.state().rows.find((r) => r.name === "A")).toMatchObject({
       availability: "available",
@@ -320,34 +317,28 @@ it("refreshes a stale group even with a fresh sibling", async () => {
   q.accept(group(now - 2 * QUOTA_AUTO_REFRESH_INTERVAL, "old", 5));
   q.accept(group(now, "new", 90));
   const acp = vi.fn(() => Promise.resolve(group(Date.now(), "old", 55)));
-  await q.refresh(() => Promise.resolve(unavailable(NATIVE_CODEX)), acp);
+  await q.refresh(unavailableCodexReader, acp);
   expect(acp).toHaveBeenCalledTimes(1);
 });
 it("returns the async refresh chain to the event bus for reload error handling", async () => {
-  const f = fixture();
-  const listener = f.events.listeners(REFRESH_EVENT)[0] as (req: unknown) => unknown;
-  f.events.on("antigravity-acp:quota:request", ({ reply }: { reply: (v: unknown) => void }) =>
-    reply({ ok: false }),
-  );
-  const result = listener({ provider: ACP, reply: () => {} });
+  const f = piQuotaFixture();
+  f.onAcpRequest(({ reply }) => reply({ ok: false }));
+  const result = f.refreshFromPanel({ provider: ACP, reply: () => {} });
   expect(result).toBeInstanceOf(Promise);
   await result;
 });
 it("propagates a forced panel refresh to the Pi adapter registry", async () => {
-  const f = fixture();
+  const f = piQuotaFixture();
   const read = vi.spyOn(QuotaAdapterRegistry.prototype, "read");
-  f.events.once("antigravity-acp:quota:request", ({ reply }: { reply: (v: unknown) => void }) =>
-    reply({ ok: false }),
-  );
-  const refresh = f.events.listeners(REFRESH_EVENT)[0] as (req: unknown) => Promise<void>;
-  await refresh({ provider: ACP, force: true, reply: () => {} });
+  f.replyToNextAcpRequest({ ok: false });
+  await f.refreshFromPanel({ provider: ACP, force: true, reply: () => {} });
   expect(read).toHaveBeenCalledWith(ACP, expect.anything(), undefined, { force: true });
 });
 
 it("limits refresh to one in flight and one read per auto-refresh interval independently of passive native events", async () => {
   vi.useFakeTimers();
   const q = monitor();
-  const codex = vi.fn(() => Promise.resolve(unavailable(NATIVE_CODEX)));
+  const codex = vi.fn(unavailableCodexReader);
   const acp = vi.fn(() => Promise.resolve(group(Date.now(), "A", 41)));
   await Promise.all([q.refresh(codex, acp), q.refresh(codex, acp)]);
   await q.refresh(codex, acp);

@@ -2,30 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { JourneyEvent, UsageObservation } from "../../../shared/usage";
+import { replayWithUsage as fixture } from "./usage-replay";
 import type { RpcMessage } from "../../src/session/codex-rpc";
 import { queryUsage } from "../usage-fixtures";
 import { recordUsage } from "../../src/usage/ledger";
-import { loadFixture, readRecording, recordingPath, replay, type Backend } from "./harness";
+import type { readRecording } from "./harness";
 
 beforeEach(() => vi.useFakeTimers({ toFake: ["Date"] }));
 afterEach(() => vi.useRealTimers());
-
-async function fixture(
-  backend: Backend,
-  name: string,
-  modify?: (recording: ReturnType<typeof readRecording>) => void,
-) {
-  const rec = readRecording(recordingPath(backend, name));
-  modify?.(rec);
-  const usage: UsageObservation[] = [];
-  const journey: JourneyEvent[] = [];
-  const result = await replay(backend, rec, await loadFixture(backend, name), undefined, {
-    recordUsage: (row) => usage.push(row),
-    recordJourney: (row) => journey.push(row),
-  });
-  return { usage, journey, result };
-}
 
 function tokenFrameIndices(rec: ReturnType<typeof readRecording>) {
   return rec.entries.flatMap((entry, index) =>
