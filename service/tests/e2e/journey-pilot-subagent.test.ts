@@ -104,7 +104,7 @@ it("keeps the reading anchor, width and child transcript stable across toggles, 
       const card = cards.first();
       const openTrace = card.getByRole("button", { name: /^Expand subagent:/ });
       const details = card.locator(":scope > .subagent-details");
-      const closeTrace = details.getByRole("button", { name: "Collapse subagent trace" });
+      const closeTrace = details.getByRole("button", { name: "Collapse subagent", exact: true });
       const transcript = details.locator(".event-text").getByText("x".repeat(18), { exact: true });
       await openTrace.waitFor();
       await page.evaluate("document.fonts.ready.then(() => undefined)");

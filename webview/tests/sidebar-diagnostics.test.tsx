@@ -318,6 +318,18 @@ it("purely toggles # without auto-capturing and highlights active state", async 
   expect(demo.textContent).toBe("");
   expect(snapshot.textContent).toBe("");
 
+  const notificationsPath = screen
+    .getByRole("button", { name: "Notifications" })
+    .querySelector("svg path")
+    ?.getAttribute("d");
+  const testPushPath = screen
+    .getByRole("button", { name: TEST_PUSH })
+    .querySelector("svg path")
+    ?.getAttribute("d");
+  expect(notificationsPath).toBe(ICONS.bell);
+  expect(testPushPath).toBe(ICONS.testPush);
+  expect(testPushPath).not.toBe(notificationsPath);
+
   // Distinct linear SVG icons for #, Diagnostics, Demo, and Snapshot (camera != #).
   const triggerPath = trigger.querySelector("svg path")?.getAttribute("d");
   const diagnosticsPath = diagnostics.querySelector("svg path")?.getAttribute("d");

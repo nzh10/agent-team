@@ -344,6 +344,11 @@ export function App() {
     document.addEventListener("focusout", onFocusOut);
     const onWindowResize = () => {
       safeTop = readSafeTop();
+      const input = textareaRef.current;
+      if (input) {
+        input.style.height = "36px";
+        input.style.height = Math.min(input.scrollHeight, 120) + "px";
+      }
       tracker.observe(window.innerHeight);
       scheduleHeal();
     };
@@ -659,7 +664,7 @@ export function App() {
     {
       id: "stats",
       label: "Session stats",
-      icon: "usage",
+      icon: "stats",
       active: openPanel === "stats",
       telemetry: openPanel === "stats" ? "panel.close" : "panel.stats",
       onClick: () => togglePanel("stats"),
@@ -2242,7 +2247,7 @@ export function App() {
                     title="Attach image"
                     aria-label="Attach image"
                   >
-                    <Icon name="plus" />
+                    <Icon name="attach" />
                   </button>
                   <textarea
                     ref={textareaRef}

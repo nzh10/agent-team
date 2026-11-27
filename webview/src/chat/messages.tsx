@@ -599,7 +599,7 @@ export const EventItem = memo(function EventItem({
           {hasHiddenBody && bodyOpen && (
             <BottomCollapse
               onClick={bodyFold.collapse}
-              label="Collapse tool details"
+              label="Hide details"
               action="trace.tool_toggle"
             />
           )}
@@ -619,7 +619,7 @@ export const EventItem = memo(function EventItem({
       {resultOpen && (isResult ? ev.content : ev.toolResult) && (
         <BottomCollapse
           onClick={resultFold.collapse}
-          label="Collapse tool result"
+          label="Hide result"
           action="trace.tool_toggle"
         />
       )}
@@ -676,19 +676,18 @@ function BottomCollapse({
   label: string;
   action: "trace.step_toggle" | "trace.subagent_toggle" | "trace.tool_toggle";
 }) {
-  return (
-    <div className="trace-collapse-footer">
-      <button
-        type="button"
-        className="trace-collapse"
-        {...telemetryTarget(action)}
-        onClick={onClick}
-        aria-label={label}
-      >
-        <span aria-hidden="true">▴</span> Collapse
-      </button>
-    </div>
+  const tool = action === "trace.tool_toggle";
+  const button = (
+    <button
+      type="button"
+      className={tool ? "btn-inline tool-collapse" : "trace-collapse"}
+      {...telemetryTarget(action)}
+      onClick={onClick}
+    >
+      <span aria-hidden="true">▴</span> {label}
+    </button>
   );
+  return tool ? button : <div className="trace-collapse-footer">{button}</div>;
 }
 
 function hasVisibleEventBody(ev: StreamEvent): boolean {
@@ -966,7 +965,7 @@ function SubagentDetails({ scope, onCollapse }: { scope: TraceScope; onCollapse:
       )}
       <BottomCollapse
         onClick={onCollapse}
-        label="Collapse subagent trace"
+        label="Collapse subagent"
         action="trace.subagent_toggle"
       />
     </div>
@@ -1147,7 +1146,7 @@ function StepBox({
           {items}
           <BottomCollapse
             onClick={bottom.collapse}
-            label="Collapse step trace"
+            label="Collapse steps"
             action="trace.step_toggle"
           />
         </div>

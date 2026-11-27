@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { userEvent } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { agentNameColor } from "../../src/workspace/agents";
 import "../../src/styles.css";
 
@@ -161,6 +161,141 @@ it.each(["light", "dark"])("keeps %s theme colors above their contrast floors", 
     passes("test-agent-name", "bg-primary", "bg-highlight");
   }
 });
+
+it.each(["light", "dark"])(
+  "aligns active sidebar pills and actions with AA contrast in %s",
+  async (theme) => {
+    await page.viewport(1280, 800);
+    document.documentElement.dataset.theme = theme;
+    const host = document.createElement("div");
+    host.innerHTML = `
+      <div class="sidebar-header">Sidebar</div>
+      <div class="ws-group">
+        <div class="ws-group-header active">
+          <span class="events-toggle">▸</span>
+          <span class="ws-group-label">Project</span>
+          <span class="ws-group-sealed">Sealed</span>
+          <span class="ws-group-status">
+            <span class="ws-group-attention"><span class="clip">1 unread</span></span>
+            <span class="ws-group-count">2</span>
+          </span>
+          <span class="ws-group-actions">
+            <button class="ws-group-add">+</button>
+            <button class="ws-group-pill">Archive</button>
+            <button class="task-delete">×</button>
+          </span>
+        </div>
+        <div class="task-item active">
+          <div class="task-info">
+            <div class="task-name">
+              <span class="session-attention"><span class="clip">Unread result</span></span>
+              <span class="session-silence">Quiet</span>
+            </div>
+          </div>
+          <span class="task-hover">
+            <button class="task-archive">▣</button>
+            <button class="task-delete">×</button>
+          </span>
+        </div>
+        <div class="ws-group-header" id="resting-header">
+          <span class="events-toggle">▸</span>
+          <span class="ws-group-label">Other</span>
+          <span class="ws-group-actions">
+            <button class="ws-group-add">+</button>
+            <button class="ws-group-pill">Archive</button>
+            <button class="task-delete">×</button>
+          </span>
+        </div>
+      </div>
+    `;
+    document.body.append(host);
+    try {
+      const activeHeader = host.querySelector<HTMLElement>(".ws-group-header.active")!;
+      const activeTask = host.querySelector<HTMLElement>(".task-item.active")!;
+      const activePills = [
+        ...host.querySelectorAll<HTMLElement>(
+          ".ws-group-header.active :is(.ws-group-attention, .ws-group-sealed, .ws-group-count), .task-item.active :is(.session-attention, .session-silence)",
+        ),
+      ];
+      expect(activePills).toHaveLength(5);
+      const contrast = (element: HTMLElement) => {
+        const row = element.closest<HTMLElement>(".ws-group-header, .task-item")!;
+        const style = getComputedStyle(element);
+        return contrastCss(
+          style.color,
+          getComputedStyle(row).backgroundColor,
+          style.backgroundColor,
+        );
+      };
+      for (const pill of activePills) {
+        const style = getComputedStyle(pill);
+        expect(pill.getBoundingClientRect().height, pill.className).toBe(18);
+        expect(Number.parseFloat(style.paddingLeft), pill.className).toBeGreaterThan(0);
+        expect(Number.parseFloat(style.paddingRight), pill.className).toBeGreaterThan(0);
+        expect(style.display, pill.className).toBe("flex");
+        expect(style.alignItems, pill.className).toBe("center");
+        expect(contrast(pill), pill.className).toBeGreaterThanOrEqual(4.5);
+      }
+
+      const activeControls = [
+        ...activeHeader.querySelectorAll<HTMLElement>(
+          ".ws-group-add, .ws-group-pill, .task-delete",
+        ),
+        ...activeTask.querySelectorAll<HTMLElement>(".task-archive, .task-delete"),
+      ];
+      for (const control of activeControls) {
+        const box = control.getBoundingClientRect();
+        expect(box.height, control.className).toBe(18);
+        if (!control.classList.contains("ws-group-pill")) expect(box.width).toBe(18);
+        expect(contrast(control), control.className).toBeGreaterThanOrEqual(4.5);
+      }
+      const activeArchive = activeHeader.querySelector<HTMLElement>(".ws-group-pill")!;
+      expect(getComputedStyle(activeArchive).borderTopColor).toBe("rgba(0, 0, 0, 0)");
+      expect(getComputedStyle(activeHeader.querySelector(".ws-group-sealed")!).borderTopColor).toBe(
+        "rgba(0, 0, 0, 0)",
+      );
+
+      await page.elementLocator(activeHeader).hover();
+      expect(getComputedStyle(activeHeader.querySelector(".ws-group-actions")!).opacity).toBe("1");
+      const headerMarks = [
+        ...activeHeader.querySelectorAll<HTMLElement>(
+          ".ws-group-attention, .ws-group-sealed, .ws-group-count, .ws-group-add, .ws-group-pill, .task-delete",
+        ),
+      ];
+      const centers = headerMarks.map((element) => {
+        const box = element.getBoundingClientRect();
+        return box.top + box.height / 2;
+      });
+      expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(0.01);
+      for (const control of activeControls) {
+        await page.elementLocator(control.closest(".ws-group-header, .task-item")!).hover();
+        await page.elementLocator(control).hover();
+        expect(contrast(control), `${control.className} hover`).toBeGreaterThanOrEqual(4.5);
+      }
+      await page.elementLocator(host.querySelector(".sidebar-header")!).hover();
+      activeArchive.focus();
+      expect(getComputedStyle(activeHeader.querySelector(".ws-group-actions")!).opacity).toBe("1");
+      expect(contrast(activeArchive)).toBeGreaterThanOrEqual(4.5);
+
+      const resting = host.querySelector<HTMLElement>("#resting-header")!;
+      await page.elementLocator(resting).hover();
+      const restingControls = [
+        ...resting.querySelectorAll<HTMLElement>(".ws-group-add, .ws-group-pill, .task-delete"),
+      ];
+      const restingCenters = restingControls.map((control) => {
+        const box = control.getBoundingClientRect();
+        const style = getComputedStyle(control);
+        expect(box.height, control.className).toBe(18);
+        expect(style.borderTopLeftRadius, control.className).toBe("5px");
+        return box.top + box.height / 2;
+      });
+      expect(Math.max(...restingCenters) - Math.min(...restingCenters)).toBeLessThanOrEqual(0.01);
+    } finally {
+      (document.activeElement as HTMLElement | null)?.blur();
+      host.remove();
+    }
+  },
+);
 
 it.each(["light", "dark"])("uses the focus token on %s focus-only field borders", async (theme) => {
   document.documentElement.dataset.theme = theme;

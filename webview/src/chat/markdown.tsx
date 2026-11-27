@@ -91,7 +91,7 @@ function DiagramCodeBlock({
   const slot = useContext(DiagramSlot);
   const view = useDiagramPreview(language, diagramSource(children), slot, offset);
   return (
-    <div className="code-block">
+    <div className="code-block code-block--diagram">
       <DiagramPreview {...view} copy={<CopyButton text={() => copyCode(pre.current)} />} />
       <pre {...rest} ref={pre} hidden={!!(view.display || view.box)}>
         {children}

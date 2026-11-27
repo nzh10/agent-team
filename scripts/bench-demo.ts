@@ -527,7 +527,10 @@ export async function runDemoBrowserSuite(
     await copyFrom(output, " Test Files  2 passed (2)\n      Tests  31 passed (31)");
     await bash.getByRole("button", { name: /^Hide result ·/ }).click();
     await bash.locator(".event-result").waitFor({ state: "hidden" });
-    await steps.getByRole("button", { name: "Collapse step trace" }).press("Enter");
+    await steps
+      .locator(".trace-collapse-footer")
+      .getByRole("button", { name: "Collapse steps" })
+      .press("Enter");
     await steps.getByRole("button", { name: "Expand steps" }).and(page.locator(":focus")).waitFor();
 
     const checkDiagrams = async (touch = false) => {

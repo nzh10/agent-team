@@ -134,11 +134,6 @@ export function DiagramPreview({
 }: ReturnType<typeof useDiagramPreview> & { copy: ReactNode }) {
   const label = open ? "Show code" : "Preview diagram";
   const loading = open && !display && !error;
-  const status = loading && (
-    <span className="diagram-preview-status" role="status">
-      Rendering diagram…
-    </span>
-  );
   return (
     <>
       <div className="code-block-actions">
@@ -155,7 +150,11 @@ export function DiagramPreview({
           <Icon name={open ? "code" : "diagram"} />
         </button>
       </div>
-      {box ? (
+      {/* Keep the live region mounted so assistive technology can announce its update. */}
+      <span className="diagram-preview-status" role="status">
+        {loading ? "Rendering diagram…" : null}
+      </span>
+      {box && (
         <div
           className="diagram-preview diagram-reservation"
           style={
@@ -164,11 +163,7 @@ export function DiagramPreview({
               "--diagram-height": `${box.height}px`,
             } as CSSProperties
           }
-        >
-          {status}
-        </div>
-      ) : (
-        status
+        />
       )}
       {error && (
         <p className="diagram-preview-error" role="alert">

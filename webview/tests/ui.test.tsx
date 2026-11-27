@@ -1033,7 +1033,7 @@ describe("live thinking", () => {
     expect(container.querySelector(".step-header")).toBe(header);
     const toggle = getByRole("button", { name: "Expand steps" });
     fireEvent.click(toggle);
-    expect(getByRole("button", { name: "Collapse step trace" })).toBeTruthy();
+    expect(container.querySelector(".trace-collapse")?.textContent).toBe("▴ Collapse steps");
     expect(container.querySelector(".live-thinking")!.textContent).toContain(
       "Weighing the options.",
     );

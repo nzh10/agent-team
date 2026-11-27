@@ -76,6 +76,29 @@ const box = (s: string) => {
   return [left, top, right, bottom];
 };
 const edges = (s: string) => [rect(s).left, rect(s).right];
+async function expectDisclosure(
+  toggleSelector: string,
+  open: boolean,
+  caretSelector = ".events-toggle",
+  duration = "0.12s",
+) {
+  const toggle = el(toggleSelector);
+  const caret = toggle.querySelector<HTMLElement>(caretSelector)!;
+  expect(toggle.getAttribute("aria-expanded")).toBe(String(open));
+  expect(caret.textContent).toBe("▸");
+  const style = getComputedStyle(caret);
+  expect(style.display).toBe("flex");
+  expect(style.alignItems).toBe("center");
+  expect(style.justifyContent).toBe("center");
+  if (duration === "0s") expect(style.transitionDuration).toBe("0s");
+  else {
+    expect(style.transitionProperty.split(", ")).toContain("transform");
+    for (const value of style.transitionDuration.split(", ")) expect(value).toBe(duration);
+  }
+  await expect
+    .poll(() => getComputedStyle(caret).transform)
+    .toBe(open ? "matrix(0, 1, -1, 0, 0, 0)" : "none");
+}
 // Headless Chromium can hide the thumb but still lay out the stable gutter.
 // Compare geometry with the platform's stable gutter, not a fixed pixel count.
 function checkGutter(s: string, overflow: boolean) {
@@ -113,7 +136,7 @@ for (const theme of ["light", "dark"])
           checkGutter(".task-list", false);
           for (const open of [true, false]) {
             await userEvent.click(el(mark));
-            expect(el(toggle).getAttribute("aria-expanded")).toBe(String(open));
+            await expectDisclosure(toggle, open);
             checkGutter(".task-list", open);
             expect.soft([box(mark), box(toggle), edges(group), edges(below)]).toEqual(before);
             expect(el(toggle).contains(document.elementFromPoint(x + w / 2, y + h / 2))).toBe(true);
@@ -125,8 +148,19 @@ for (const theme of ["light", "dark"])
         const before = [box(toggle), edges(group), edges(below)];
         for (const open of [false, true]) {
           await userEvent.click(el(toggle));
+          await expectDisclosure(toggle, open);
           checkGutter(".task-list", open);
           expect.soft([box(toggle), edges(group), edges(below)]).toEqual(before);
+        }
+        const folder =
+          ".ws-group > .ws-group-header:not(.ws-group-project):not(.ws-archived-header)";
+        await userEvent.hover(el(folder));
+        const folderBox = box(folder);
+        const folderInitial = el(folder).getAttribute("aria-expanded") === "true";
+        for (const open of [!folderInitial, folderInitial]) {
+          await userEvent.click(el(`${folder} .ws-group-label`));
+          await expectDisclosure(folder, open);
+          expect(box(folder)).toEqual(folderBox);
         }
       });
       it("keeps the standalone archive header anchored while its sessions unfold", async () => {
@@ -145,7 +179,32 @@ for (const theme of ["light", "dark"])
         const before = box(header);
         for (const open of [true, false]) {
           await userEvent.click(el(`${header} .ws-group-label`));
+          await expectDisclosure(header, open);
           checkGutter(".task-list", open);
+          expect(box(header)).toEqual(before);
+        }
+      });
+      it("keeps the Archived projects header anchored while its shelf unfolds", async () => {
+        await viewport();
+        const shelvedProject = {
+          ...project,
+          id: "shelf",
+          name: "Shelved",
+          leadWorkspaceId: "shelf-lead",
+          archivedAt: 2,
+        };
+        const shelfLead = ws("shelf-lead", {
+          projectLink: { projectId: "shelf", role: "lead" },
+          archivedAt: 2,
+        });
+        render(
+          <Drawer projects={[project, shelvedProject]} workspaces={[...workspaces, shelfLead]} />,
+        );
+        const header = ".ws-shelf .ws-archived-header";
+        const before = box(header);
+        for (const open of [true, false]) {
+          await userEvent.click(el(`${header} .ws-group-label`));
+          await expectDisclosure(header, open);
           expect(box(header)).toEqual(before);
         }
       });
@@ -272,3 +331,62 @@ for (const theme of ["light", "dark"])
         expect.soft(marks()).toEqual(narrow);
       });
     });
+
+it("disables every sidebar and quota caret transition in reduced motion", async () => {
+  await page.viewport(1280, 650);
+  await cdp().send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+  });
+  try {
+    const quota = {
+      refreshing: false,
+      rows: [
+        {
+          provider: "acp",
+          name: "acct",
+          availability: "available" as const,
+          observedAt: 1,
+          windows: [{ label: "5h", usedPct: 9 }],
+        },
+      ],
+    };
+    const shelvedProject = {
+      ...project,
+      id: "shelf",
+      name: "Shelved",
+      leadWorkspaceId: "shelf-lead",
+      archivedAt: 2,
+    };
+    const shelfLead = ws("shelf-lead", {
+      projectLink: { projectId: "shelf", role: "lead" },
+      archivedAt: 2,
+    });
+    render(
+      <Drawer
+        projects={[project, shelvedProject]}
+        quota={quota}
+        onRefreshQuota={noop}
+        workspaces={[
+          ...workspaces,
+          shelfLead,
+          ws("loose-archived", { projectLink: undefined, archivedAt: 2 }),
+        ]}
+      />,
+    );
+    const folder = ".ws-group > .ws-group-header:not(.ws-group-project):not(.ws-archived-header)";
+    await expectDisclosure(
+      folder,
+      el(folder).getAttribute("aria-expanded") === "true",
+      ".events-toggle",
+      "0s",
+    );
+    await expectDisclosure(".ws-shelf .ws-archived-header", false, ".events-toggle", "0s");
+    await expectDisclosure(".ws-group-toggle", true, ".events-toggle", "0s");
+    await expectDisclosure(".ws-archive-toggle", false, ".events-toggle", "0s");
+    await expectDisclosure(".ws-idle-toggle", false, ".events-toggle", "0s");
+    await expectDisclosure(".ws-archived-header", false, ".events-toggle", "0s");
+    await expectDisclosure(".quota-row-toggle", false, ".quota-caret", "0s");
+  } finally {
+    await cdp().send("Emulation.setEmulatedMedia", { features: [] });
+  }
+});

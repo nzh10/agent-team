@@ -170,8 +170,19 @@ it("renders compact quota rows on desktop with threshold colors, error badges, a
   expect(toggles[4].querySelector(".quota-summary")?.textContent).toBe("not configured");
 
   // Click expands Kimi inline directly underneath its row and shows all 3 windows.
+  const toggleBox = toggles[1].getBoundingClientRect();
+  const caret = toggles[1].querySelector(".quota-caret")!;
+  expect(caret.textContent).toBe("▸");
   fireEvent.click(toggles[1]);
   expect(toggles[1].getAttribute("aria-expanded")).toBe("true");
+  // Details grow the bottom-anchored panel upward; the caret itself adds no size shift.
+  expect(toggles[1].getBoundingClientRect()).toMatchObject({
+    width: toggleBox.width,
+    height: toggleBox.height,
+  });
+  expect(getComputedStyle(caret).transitionProperty.split(", ")).toContain("transform");
+  expect(getComputedStyle(caret).transitionDuration).toBe("0.12s");
+  await expect.poll(() => getComputedStyle(caret).transform).toBe("matrix(0, 1, -1, 0, 0, 0)");
   expect(onRefresh).toHaveBeenLastCalledWith(false, ["kimi-coding"]);
   const kimiDetails = document.getElementById(toggles[1].getAttribute("aria-controls")!)!;
   expect(kimiDetails).toBeTruthy();

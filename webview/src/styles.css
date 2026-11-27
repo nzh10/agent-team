@@ -635,9 +635,26 @@ button {
   --row-bg: var(--accent-solid);
   background: var(--accent-solid);
 }
-.ws-group-header .events-toggle {
+.ws-group-header .events-toggle,
+.ws-archive-toggle .events-toggle,
+.ws-idle-toggle .events-toggle,
+.quota-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  transform-origin: center;
+  transition: transform var(--motion-quick) ease-out;
+}
+.ws-group-header .events-toggle {
   color: var(--text-muted);
+}
+.ws-group-header[aria-expanded="true"] > .events-toggle,
+.ws-group-toggle[aria-expanded="true"] > .events-toggle,
+.ws-archive-toggle[aria-expanded="true"] > .events-toggle,
+.ws-idle-toggle[aria-expanded="true"] > .events-toggle,
+.quota-row-toggle[aria-expanded="true"] > .quota-caret {
+  transform: rotate(90deg);
 }
 .ws-group-label {
   flex: 0 1 auto;
@@ -762,7 +779,7 @@ button {
   width: 18px;
   height: 18px;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--text-muted);
   cursor: pointer;
@@ -821,7 +838,9 @@ button {
   flex-shrink: 0;
   color: var(--text-muted);
   opacity: 0;
-  transition: opacity var(--motion-quick) ease-out;
+  transition:
+    opacity var(--motion-quick) ease-out,
+    transform var(--motion-quick) ease-out;
 }
 .ws-idle-row:hover .ws-idle-toggle .events-toggle,
 .ws-idle-row:focus-within .ws-idle-toggle .events-toggle,
@@ -897,10 +916,13 @@ button {
   margin: 1px 0 1px 4px;
   cursor: pointer;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
   border-radius: var(--radius);
   min-width: 0;
+}
+.task-item:has(.task-meta) {
+  align-items: flex-start;
 }
 .task-item:hover {
   --row-bg: var(--bg-hover-row);
@@ -949,9 +971,16 @@ button {
     .ws-group-sealed,
     .ws-group-count
   ) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+  padding: 0 6px;
+  border-color: transparent;
   border-radius: var(--radius-sm);
   background: var(--active-row-pill);
   color: var(--on-solid);
+  line-height: 1;
 }
 .task-item.active .session-silence-quiet:focus-visible,
 .ws-group-header.active .session-silence-quiet:focus-visible {
@@ -960,6 +989,7 @@ button {
 .task-item.active :is(.task-archive, .task-delete),
 .ws-group-header.active :is(.ws-group-add, .ws-group-pill, .task-delete) {
   color: var(--on-solid);
+  border-color: transparent;
   background: var(--active-row-pill);
 }
 .task-item.active :is(.task-archive, .task-delete):hover,
@@ -998,6 +1028,12 @@ button {
   margin-top: 5px;
   background: var(--text-muted);
   opacity: 0.5;
+}
+.task-item .task-status {
+  margin-top: 0;
+}
+.task-item:has(.task-meta) .task-status {
+  margin-top: 5px;
 }
 .task-status.running {
   background: var(--accent);
@@ -1038,6 +1074,7 @@ button {
   min-width: 0;
 }
 .task-name {
+  min-height: 18px;
   font-size: var(--fs-text);
   color: var(--text-secondary);
   display: flex;
@@ -1060,9 +1097,11 @@ button {
    hovered (or open, on touch), so nothing moves and the name has the row. */
 .task-hover {
   position: absolute;
-  top: 3px;
+  top: 0;
+  bottom: 0;
   right: 6px;
-  min-height: 18px;
+  height: 18px;
+  margin-block: auto;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1070,6 +1109,11 @@ button {
   background: linear-gradient(to right, transparent, var(--row-bg) 16px);
   opacity: 0;
   pointer-events: none;
+}
+.task-item:has(.task-meta) .task-hover {
+  top: 5px;
+  bottom: auto;
+  margin-block: 0;
 }
 .task-item:hover .task-hover,
 .task-hover:focus-within {
@@ -1081,6 +1125,10 @@ button {
   visibility: hidden;
 }
 @media (hover: none) {
+  .task-archive,
+  .task-delete {
+    width: 20px;
+  }
   .task-item.active .task-hover {
     opacity: 1;
     pointer-events: auto;
@@ -1172,8 +1220,10 @@ button {
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 4px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: var(--radius-sm);
   opacity: 0;
   flex-shrink: 0;
 }
@@ -1661,10 +1711,6 @@ button {
   position: absolute;
   z-index: -1;
   inset: 0;
-  margin-block: auto;
-  /* Keep the emphasis visible for a centered jump into a tall row without
-     promoting a surface as tall as the entire reply or trace. */
-  max-block-size: min(220px, 30dvh);
   pointer-events: none;
   background: var(--bg-highlight);
   animation: highlight-release 300ms ease 1000ms forwards;
@@ -1900,10 +1946,12 @@ button {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px 12px;
-  margin: 8px 0;
   overflow-x: auto;
   font-size: 12px;
   line-height: 1.5;
+}
+.message-content :is(pre, .diagram-preview) {
+  margin: 8px 0;
 }
 .message-content pre code {
   background: none;
@@ -2210,14 +2258,33 @@ span.katex-display {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
-.trace-collapse:focus-visible {
+.trace-collapse:focus-visible,
+.tool-collapse:focus-visible {
   outline: 2px solid var(--focus-ring);
+}
+.trace-collapse:focus-visible {
   outline-offset: -2px;
+}
+.tool-collapse {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 24px;
+  margin: 2px auto 0;
+  padding-inline: 6px;
+  line-height: 16px;
 }
 @media (max-width: 768px), (pointer: coarse) {
   .trace-collapse {
     min-height: 44px;
     padding: 8px 12px;
+    font-size: 12px;
+  }
+  .tool-collapse {
+    min-height: 36px;
     font-size: 12px;
   }
 }
@@ -2452,7 +2519,6 @@ span.katex-display {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  margin: 3px 0;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2460,6 +2526,9 @@ span.katex-display {
   color: var(--text-secondary);
   max-height: 420px;
   overflow-y: auto;
+}
+.event-content :is(pre, .diagram-preview) {
+  margin: 3px 0;
 }
 .event-content code {
   background: var(--bg-tertiary);
@@ -2531,10 +2600,10 @@ span.katex-display {
 .banner-text > :last-child {
   margin-bottom: 0;
 }
-.banner-text > .code-block:first-child > pre {
+.banner-text > .code-block:first-child > :is(pre, .diagram-preview) {
   margin-top: 0;
 }
-.banner-text > .code-block:last-child > pre {
+.banner-text > .code-block:last-child > :is(pre, .diagram-preview) {
   margin-bottom: 0;
 }
 .banner-text > :is(ul, ol):first-child > li:first-child {
@@ -2711,7 +2780,7 @@ button.action-target:hover {
 }
 /* Unfolded prompts read as documents: block paragraphs, indented lists. */
 .banner-text p + p,
-.banner-text pre,
+.banner-text :is(pre, .diagram-preview),
 .banner-text blockquote {
   margin-top: 6px;
 }
@@ -2924,7 +2993,7 @@ button.action-target:hover {
 :is(.subagent-prompt, .subagent-summary) > .code-block {
   margin: 4px 0;
 }
-:is(.subagent-prompt, .subagent-summary) > .code-block > pre {
+:is(.subagent-prompt, .subagent-summary) > .code-block > :is(pre, .diagram-preview) {
   margin: 0;
 }
 /* The accent block owns its vertical inset, regardless of markdown shape. */
@@ -2975,11 +3044,13 @@ button.action-target:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  margin: 6px 0;
   overflow-x: auto;
   text-align: left;
   font-size: 12px;
   line-height: 1.5;
+}
+.system-message :is(pre, .diagram-preview) {
+  margin: 6px 0;
 }
 .system-message pre code {
   background: none;
@@ -3230,7 +3301,7 @@ button.action-target:hover {
   white-space: pre-wrap;
   word-break: break-word;
   resize: none;
-  line-height: 1.45;
+  line-height: 20px;
 }
 .input-row .chat-input::placeholder {
   color: var(--text-muted);
@@ -3244,12 +3315,15 @@ button.action-target:hover {
   border: none;
   border-radius: var(--radius-sm);
   padding: 0 16px;
-  height: 34px;
+  height: 36px;
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
   align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   transition: background 0.12s;
 }
 .input-row button:hover {
@@ -3356,9 +3430,9 @@ button.action-target:hover {
   color: var(--text-secondary) !important;
   border: none !important;
   padding: 0 !important;
-  width: 34px;
-  min-width: 34px;
-  height: 34px;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
   line-height: 1;
   display: flex;
   align-items: center;
@@ -3722,7 +3796,10 @@ button.quote-bar-content:focus-visible {
 }
 .usage-load-state {
   flex: 0 0 min(38vw, 12em);
-  min-height: 2.8em;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  height: 4.2em;
   margin: 0;
   color: var(--text-secondary);
   font-size: var(--fs-meta);
@@ -4651,6 +4728,11 @@ button.quote-bar-content:focus-visible {
     width: 14px;
     height: 14px;
   }
+  .task-archive,
+  .task-delete {
+    width: 22px;
+    height: 18px;
+  }
   /* The add action can enter flow on hover or when a touch group becomes
      current. Let its hit target use the header's vertical padding. */
   .ws-group-header:has(.ws-group-add) {
@@ -4883,18 +4965,18 @@ button.quote-bar-content:focus-visible {
   }
   .input-row .chat-input {
     font-size: 16px;
-    padding: 7px 6px;
-    min-height: 34px;
-    line-height: 1.35;
+    padding: 10px 6px;
+    min-height: 40px;
+    line-height: 20px;
   }
   .input-row .chat-input::placeholder {
     font-size: 14px;
   }
   .input-row > button,
   .input-row .btn-abort {
-    width: 34px;
-    min-width: 34px;
-    height: 34px;
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
     padding: 0;
     border-radius: 50%;
     font-size: 16px;
@@ -4910,7 +4992,7 @@ button.quote-bar-content:focus-visible {
     display: flex;
   }
   .btn-primary-slot {
-    min-width: 34px;
+    min-width: 40px;
   }
   .btn-attach {
     background: transparent !important;
@@ -7808,6 +7890,10 @@ button.from-author {
   .input-row,
   .input-row button,
   .bp-node,
+  .ws-group-header .events-toggle,
+  .ws-archive-toggle .events-toggle,
+  .ws-idle-toggle .events-toggle,
+  .quota-caret,
   .trace-caret,
   .bn-caret {
     transition: none;

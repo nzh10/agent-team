@@ -1,11 +1,11 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cdp, page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import type { ReactNode } from "react";
 import { MdBlock } from "../../src/chat/markdown";
 import { sanitizeDiagramSvg } from "../../src/chat/diagramRender";
-import { DiagramCacheScope } from "../../src/chat/diagramCache";
+import { DiagramCache, DiagramCacheContext, DiagramCacheScope } from "../../src/chat/diagramCache";
 import { TranscriptChoiceScope } from "../../src/chat/transcriptChoices";
 import "../../src/styles.css";
 
@@ -79,6 +79,133 @@ describe("diagram previews", () => {
       expect(() => contrastOf(color, "white")).toThrow("Expected opaque paint");
     },
   );
+
+  it.each([
+    { language: "mermaid", theme: "light", width: 1100, source: "flowchart LR\nA --> B" },
+    { language: "graphviz", theme: "light", width: 1100, source: "digraph { a -> b; }" },
+    { language: "mermaid", theme: "dark", width: 390, source: "flowchart LR; A --> B" },
+    { language: "graphviz", theme: "dark", width: 390, source: "digraph { a -> b; }" },
+  ])(
+    "keeps a cold $language preview still while loading ($theme, $width px)",
+    { timeout: 20_000 },
+    async ({ language, theme, width, source }) => {
+      await page.viewport(width, 844);
+      await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: width === 390 });
+      document.documentElement.dataset.theme = theme;
+      const cache = new DiagramCache();
+      const request = cache.request.bind(cache);
+      let release!: () => void;
+      let received!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const rendered = new Promise<void>((resolve) => (received = resolve));
+      vi.spyOn(cache, "request").mockImplementation((key, spec, receive) =>
+        request(key, spec, (answer) => {
+          received();
+          void gate.then(() => receive(answer));
+        }),
+      );
+      const { container, getByRole, getByText } = render(
+        <DiagramCacheContext.Provider value={cache}>
+          <Chat>
+            <MdBlock>{`Before.\n\n${fence(language, source)}\n\nAfter.`}</MdBlock>
+          </Chat>
+        </DiagramCacheContext.Provider>,
+      );
+      await document.fonts.ready;
+      const pre = container.querySelector("pre")!;
+      const block = pre.parentElement!;
+      const actions = block.querySelector(".code-block-actions")!;
+      const buttons = Array.from(actions.querySelectorAll("button"));
+      expect(buttons).toHaveLength(2);
+      const after = getByText("After.");
+      const bounds = (el: Element) => {
+        const { top, right, bottom, left } = el.getBoundingClientRect();
+        return { top, right, bottom, left };
+      };
+      const watched = [pre, block, actions, ...buttons, after];
+      const before = watched.map(bounds);
+      const gap = bounds(after).top - bounds(pre).bottom;
+      try {
+        fireEvent.click(getByRole("button", { name: "Preview diagram" }));
+        const status = getByRole("status");
+        expect(status.textContent).toBe("Rendering diagram…");
+        expect(pre.hidden).toBe(false);
+        expect(pre.textContent).toContain(source);
+        expect(watched.map(bounds)).toEqual(before);
+
+        await rendered;
+        expect(watched.map(bounds)).toEqual(before);
+        const label = status.getBoundingClientRect();
+        for (const button of buttons) {
+          expect(label.right).toBeLessThanOrEqual(button.getBoundingClientRect().left);
+        }
+        expect(label.width).toBeGreaterThan(0);
+        expect(label.height).toBeGreaterThan(0);
+        expect(status.scrollWidth).toBe(status.clientWidth);
+        const paint = getComputedStyle(status);
+        expect(paint.visibility).toBe("visible");
+        expect(contrastOf(paint.color, paint.backgroundColor)).toBeGreaterThanOrEqual(4.5);
+
+        await act(() => {
+          release();
+          return gate;
+        });
+        const diagram = await preview(container);
+        expect(diagram.querySelector("svg")).not.toBeNull();
+        expect(pre.hidden).toBe(true);
+        expect(status.textContent).toBe("");
+        expect(bounds(diagram).top).toBe(before[0].top);
+        expect(bounds(after).top - bounds(diagram).bottom).toBe(gap);
+        expect([actions, ...buttons].map(bounds)).toEqual(before.slice(2, -1));
+      } finally {
+        release();
+      }
+    },
+  );
+
+  it("measures Mermaid SVGs without extending the body's scroll range", async () => {
+    const { renderMermaid } = await import("../../src/chat/mermaidRenderer");
+    const body = document.body;
+    const filler = document.createElement("div");
+    filler.style.height = `${body.clientHeight}px`;
+    body.append(filler);
+    const scrollGeometry = () => [
+      body.scrollWidth,
+      body.scrollHeight,
+      body.scrollLeft,
+      body.scrollTop,
+      document.documentElement.scrollWidth,
+      document.documentElement.scrollHeight,
+      window.scrollX,
+      window.scrollY,
+    ];
+    const before = scrollGeometry();
+    const samples: number[][] = [];
+    let host: Element | undefined;
+    const observer = new MutationObserver(() => {
+      const measured = Array.from(body.children).find((node) =>
+        node.querySelector('svg[id^="diagram-preview-"]'),
+      );
+      if (!measured) return;
+      host = measured;
+      samples.push(scrollGeometry());
+    });
+    observer.observe(body, { childList: true, subtree: true });
+    try {
+      const raw = await renderMermaid("flowchart TD\nA[Start] --> B[Finish]", "light");
+      const svg = new DOMParser().parseFromString(raw, "image/svg+xml").documentElement;
+      const [, , width, height] = svg.getAttribute("viewBox")!.split(/\s+/).map(Number);
+      expect(width).toBeGreaterThan(0);
+      expect(height).toBeGreaterThan(0);
+      expect(samples.length).toBeGreaterThan(0);
+      expect(samples).toEqual(samples.map(() => before));
+      expect(host?.isConnected).toBe(false);
+      expect(scrollGeometry()).toEqual(before);
+    } finally {
+      observer.disconnect();
+      filler.remove();
+    }
+  });
 
   it(
     "accepts the graphviz alias and toggles back to code",
@@ -431,7 +558,7 @@ describe("diagram previews", () => {
       rerender(chat(true, 300));
       expect(container.querySelector(".diagram-preview")?.innerHTML).toBe(svg);
       expect(container.querySelector("pre")?.hidden).toBe(true);
-      expect(container.querySelector(".diagram-preview-status")).toBeNull();
+      expect(container.querySelector(".diagram-preview-status")?.textContent).toBe("");
       rerender(chat(false, 300, "other"));
       rerender(chat(true));
       expect(container.querySelector(".diagram-preview svg")).toBeNull();

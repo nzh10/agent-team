@@ -80,7 +80,9 @@ const contrastOf = (foreground: string, backgrounds: string[]) => {
 const row = (name: string) =>
   document.querySelector<HTMLElement>(`.task-item:has(.clip[title="${name}"])`);
 const order = () =>
-  [...document.querySelectorAll(".task-item .clip")].map((item) => item.textContent);
+  [...document.querySelectorAll(".task-item .task-name-text > .clip")].map(
+    (item) => item.textContent,
+  );
 const cue = (name: string) => row(name)?.querySelector(".session-attention")?.textContent;
 const sendPage = (sock: FakeSocket, workspaceId: string, messages: Message[]) =>
   act(() => sock.receive({ type: "workspace_messages", workspaceId, messages, hasMore: false }));
@@ -240,7 +242,8 @@ it.each([
     expect(foldedToggle.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(foldedToggle);
     expect(foldedToggle.getAttribute("aria-expanded")).toBe("true");
-    expect(foldedToggle.textContent).toContain("▾");
+    expect(foldedToggle.textContent).toContain("▸");
+    expect(foldedToggle.textContent).not.toContain("▾");
     // Unfolded idle workers render below the Idle (2) disclosure row.
     const idleRow = foldedToggle.closest(".ws-idle-row")!;
     const unfolded = row("Read and idle")!;
@@ -256,6 +259,37 @@ it.each([
     );
   },
 );
+
+it("keeps a constrained active project attention label ellipsized beside its actions", async () => {
+  await page.viewport(390, 800);
+  vi.spyOn(Date, "now").mockReturnValue(NOW);
+  mount();
+  connect([
+    lead,
+    workspace("Asking", 1, { awaitsUser: true }),
+    workspace("Failed", 2, { lastResult: "failed" }),
+    workspace("Unread", 3, { lastResult: "done", unread: 1 }),
+  ]);
+  fireEvent.click(get(".mobile-menu-btn"));
+  const header = get(".ws-group-header.active");
+  await page.elementLocator(header).hover();
+  const pill = header.querySelector<HTMLElement>(".ws-group-attention")!;
+  const text = pill.querySelector<HTMLElement>(".clip")!;
+  expect(pill.textContent).toBe("1 need you · 1 failed · 1 unread");
+  expect(pill.getBoundingClientRect().height).toBe(18);
+  expect(text.clientWidth).toBeGreaterThan(0);
+  expect(text.scrollWidth).toBeGreaterThan(text.clientWidth);
+  expect(getComputedStyle(text).textOverflow).toBe("ellipsis");
+  const pillBox = pill.getBoundingClientRect();
+  const textBox = text.getBoundingClientRect();
+  const style = getComputedStyle(pill);
+  expect(textBox.left).toBeGreaterThanOrEqual(
+    pillBox.left + Number.parseFloat(style.paddingLeft) - 1,
+  );
+  expect(textBox.right).toBeLessThanOrEqual(
+    pillBox.right - Number.parseFloat(style.paddingRight) + 1,
+  );
+});
 
 it("clears a failed row and project count on resume across live updates and a fresh snapshot", async () => {
   await page.viewport(1280, 800);
@@ -362,7 +396,7 @@ it.each([1280, 390])(
     expect(geometry()).toEqual(collapsed);
     expect(scroller.scrollWidth).toBeLessThanOrEqual(scroller.clientWidth);
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
-    fireEvent.click(view.getByRole("button", { name: "Collapse subagent trace" }));
+    fireEvent.click(view.getByRole("button", { name: "Collapse subagent" }));
     await painted();
     expect(jump()).toBeNull();
     expect(scroller.scrollTop).toBe(0);
@@ -1193,7 +1227,12 @@ it.each(["light", "dark"] as const)(
     fireEvent.click(row("Isolated")!);
     fireEvent.click(get(".mobile-menu-btn"));
     const touchArchive = row("Isolated")!.querySelector<HTMLElement>(".task-archive")!;
+    const touchDelete = row("Isolated")!.querySelector<HTMLElement>(".task-delete")!;
     await expect.poll(() => getComputedStyle(touchArchive).opacity).toBe("1");
+    for (const control of [touchArchive, touchDelete]) {
+      expect(control.getBoundingClientRect().width).toBe(22);
+      expect(control.getBoundingClientRect().height).toBe(18);
+    }
     expect(actionContrast(touchArchive)).toBeGreaterThanOrEqual(4.5);
   },
 );

@@ -38,7 +38,7 @@ describe("SubAgentItem", () => {
     expect(container.querySelector(".subagent-item > .subagent-details")?.textContent).toContain(
       "Trace is unavailable.",
     );
-    fireEvent.click(getByRole("button", { name: "Collapse subagent trace" }));
+    fireEvent.click(getByRole("button", { name: "Collapse subagent" }));
     expect(button.getAttribute("aria-expanded")).toBe("false");
     expect(container.querySelector(".subagent-details")).toBeNull();
   });
