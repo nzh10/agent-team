@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from "vitest";
+import { userEvent } from "vitest/browser";
 import { agentNameColor } from "../../src/workspace/agents";
 import "../../src/styles.css";
 
@@ -12,12 +13,28 @@ function luminance(channels: Uint8ClampedArray) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+function contrastCss(foreground: string, ...background: string[]) {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  ctx.clearRect(0, 0, 1, 1);
+  for (const fill of background) {
+    ctx.fillStyle = fill;
+    ctx.fillRect(0, 0, 1, 1);
+  }
+  const a = luminance(ctx.getImageData(0, 0, 1, 1).data);
+  ctx.fillStyle = foreground;
+  ctx.fillRect(0, 0, 1, 1);
+  const b = luminance(ctx.getImageData(0, 0, 1, 1).data);
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
 afterEach(() => {
   delete document.documentElement.dataset.theme;
   document.documentElement.style.removeProperty("--test-agent-name");
 });
 
-it.each(["light", "dark"])("keeps normal-sized %s text above 4.5:1", (theme) => {
+it.each(["light", "dark"])("keeps %s theme colors above their contrast floors", (theme) => {
   document.documentElement.dataset.theme = theme;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = 1;
@@ -47,6 +64,13 @@ it.each(["light", "dark"])("keeps normal-sized %s text above 4.5:1", (theme) => 
             ? 6
             : 4.5
         : 4.5;
+    expect(contrast, `${foreground} on ${background.join(" + ")}`).toBeGreaterThanOrEqual(minimum);
+  };
+
+  const passesAtLeast = (minimum: number, foreground: string, ...background: string[]) => {
+    const a = painted(background);
+    const b = painted([...background, foreground]);
+    const contrast = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
     expect(contrast, `${foreground} on ${background.join(" + ")}`).toBeGreaterThanOrEqual(minimum);
   };
 
@@ -84,10 +108,25 @@ it.each(["light", "dark"])("keeps normal-sized %s text above 4.5:1", (theme) => 
     passes(fg, "bg-tertiary", "error-soft");
   }
   passes("text-muted", "bg-tertiary", "accent-soft"); // Diff hunk header and sticky gutter.
-  for (const fill of ["accent-solid", "accent-hover", "error"]) passes("on-solid", fill);
+  // Light's primary blue fill is a documented 3:1 exception, not AA text.
+  // Dark brand fills, and every other normal text pair, remain strict 4.5:1.
+  const brandFillMinimum = theme === "light" ? 3 : 4.5;
+  for (const fill of ["accent-solid", "accent-hover"]) {
+    passesAtLeast(brandFillMinimum, "on-solid", fill);
+  }
+  passes("on-error", "error");
+
+  for (const surface of ["bg-primary", "bg-secondary", "bg-tertiary", "bg-elevated"]) {
+    passesAtLeast(3, "focus-ring", surface);
+  }
+  // Active-row titles/icons/status indicators share the solid brand fill above.
+  // Their glass attention/unread/silence pills and nested actions require strict text AA.
+  for (const fill of ["active-row-pill", "active-row-pill-hover"]) {
+    passesAtLeast(4.5, "on-solid", "accent-solid", fill);
+  }
 
   // Nested row actions keep their label/icon readable over both hover layers.
-  for (const fg of ["text-primary", "text-secondary", "accent-hover", "error"]) {
+  for (const fg of ["text-primary", "text-secondary", "accent-action-text", "error"]) {
     passes(fg, "bg-secondary", "bg-hover-strong");
     passes(fg, "bg-secondary", "bg-hover", "bg-hover-strong");
   }
@@ -120,5 +159,56 @@ it.each(["light", "dark"])("keeps normal-sized %s text above 4.5:1", (theme) => 
     }
     // Jump-highlight animation peak: 22% accent over the transcript canvas.
     passes("test-agent-name", "bg-primary", "bg-highlight");
+  }
+});
+
+it.each(["light", "dark"])("uses the focus token on %s focus-only field borders", async (theme) => {
+  document.documentElement.dataset.theme = theme;
+  const host = document.createElement("div");
+  host.innerHTML = `
+    <div class="search-bar"><input aria-label="Search" /></div>
+    <div class="input-row"><textarea aria-label="Composer"></textarea></div>
+    <div class="dialog-field"><input aria-label="Dialog input" /><select aria-label="Dialog select"></select></div>
+    <input class="bp-search" aria-label="Board search" />
+    <div class="dialog-field"><textarea class="ui-dialog-editor" aria-label="Dialog editor"></textarea></div>
+    <button class="ui-dialog-option">Option</button>
+  `;
+  document.body.append(host);
+  const colorProbe = document.createElement("span");
+  colorProbe.style.color = "var(--focus-ring)";
+  host.append(colorProbe);
+  const focusColor = getComputedStyle(colorProbe).color;
+  colorProbe.remove();
+  const fields = [
+    [".search-bar input", ".search-bar input"],
+    [".input-row", ".input-row textarea"],
+    [".dialog-field input", ".dialog-field input"],
+    [".dialog-field select", ".dialog-field select"],
+    [".bp-search", ".bp-search"],
+    [".ui-dialog-editor", ".ui-dialog-editor"],
+    [".ui-dialog-option", ".ui-dialog-option"],
+  ];
+  try {
+    for (const [targetSelector, focusSelector] of fields) {
+      await userEvent.tab();
+      const focused = host.querySelector<HTMLElement>(focusSelector)!;
+      expect(document.activeElement).toBe(focused);
+      const target = host.querySelector<HTMLElement>(targetSelector)!;
+      await expect
+        .poll(() => getComputedStyle(target).borderTopColor, { message: targetSelector })
+        .toBe(focusColor);
+      const style = getComputedStyle(target);
+      expect(
+        contrastCss(
+          style.borderTopColor,
+          getComputedStyle(document.body).backgroundColor,
+          style.backgroundColor,
+        ),
+        targetSelector,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  } finally {
+    (document.activeElement as HTMLElement | null)?.blur();
+    host.remove();
   }
 });

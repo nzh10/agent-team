@@ -309,16 +309,16 @@ it.each(["light", "dark"] as const)(
     expect(style(pill).fontSize).toBe("10px");
     const probe = document.createElement("div");
     probe.style.background = "var(--bg-hover-strong)";
-    probe.style.color = "var(--accent-hover)";
+    probe.style.color = "var(--accent-action-text)";
     document.body.append(probe);
     const strong = style(probe).backgroundColor;
-    const accentHover = style(probe).color;
+    const accentActionText = style(probe).color;
     probe.remove();
     await page.elementLocator(add).hover();
     expect(style(add).backgroundColor).toBe(strong);
     await page.elementLocator(pill).hover();
     expect(style(pill).backgroundColor).toBe(strong);
-    expect(style(pill).color).toBe(accentHover);
+    expect(style(pill).color).toBe(accentActionText);
   },
 );
 

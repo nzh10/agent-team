@@ -38,8 +38,8 @@ describe("agent name colors", () => {
   });
 
   it("bounds worst-case black and white and falls back for unsafe input", () => {
-    expect(weight("#ffffff")).toBe(26);
-    expect(weight("#000000")).toBe(25);
+    expect(weight("#ffffff")).toBe(28);
+    expect(weight("#000000")).toBe(29);
     expect(agentNameColor("transparent")).toBe("var(--text-primary)");
     expect(agentNameColor("not-a-color")).toBe("var(--text-primary)");
   });

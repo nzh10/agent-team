@@ -10,7 +10,7 @@
     <!-- Installable as a home-screen app: standalone display hides the browser
          chrome, the status bar overlays the page (safe-area insets in CSS). -->
     <link rel="manifest" href="manifest.webmanifest" />
-    <meta name="theme-color" content="#f2f3f5" />
+    <meta name="theme-color" content="#f2f2f2" />
     <script>
       // Run before styles or app code. These chrome colors match --bg-secondary.
       (() => {
@@ -33,7 +33,7 @@
           const changed = root.dataset.theme !== theme;
           root.dataset.theme = theme;
           root.style.colorScheme = theme;
-          meta.content = theme === "dark" ? "#1c1c1c" : "#f2f3f5";
+          meta.content = theme === "dark" ? "#141416" : "#f2f2f2";
           if (changed) changes.dispatchEvent(new Event("change"));
         };
         update();

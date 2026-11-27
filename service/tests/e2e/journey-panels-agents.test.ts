@@ -538,6 +538,8 @@ it("sets the theme before app startup and preserves the workspace across theme c
       const context = await browser.newContext({ viewport, colorScheme: system, hasTouch: mobile });
       try {
         const tab = await context.newPage();
+        const manifest = await tab.request.get(`${origin}/manifest.webmanifest`);
+        expect(await manifest.json()).toMatchObject({ theme_color: "#f2f2f2" });
         const entry = "**/assets/index-*.js";
         const bootstrap = async (theme: "light" | "dark") => {
           let resume!: () => void;
@@ -560,7 +562,7 @@ it("sets the theme before app startup and preserves the workspace across theme c
               chrome: document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
             }));
             expect(early.scheme).toBe(theme);
-            expect(early.chrome).toBe(theme === "dark" ? "#1c1c1c" : "#f2f3f5");
+            expect(early.chrome).toBe(theme === "dark" ? "#141416" : "#f2f2f2");
           } finally {
             resume();
             await tab.unrouteAll({ behavior: "wait" });

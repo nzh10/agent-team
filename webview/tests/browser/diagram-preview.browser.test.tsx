@@ -343,7 +343,7 @@ describe("diagram previews", () => {
             expect(rects).toHaveLength(5);
             for (const rect of rects) {
               const paint = getComputedStyle(rect);
-              expect(paint.fill).toBe(theme === "dark" ? "rgb(41, 41, 41)" : "rgb(255, 255, 255)");
+              expect(paint.fill).toBe(theme === "dark" ? "rgb(46, 46, 51)" : "rgb(255, 255, 255)");
               expect(paint.filter).toBe("none");
               expect(
                 contrastOf(
