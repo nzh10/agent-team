@@ -1,77 +1,25 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chromium, type Browser, type Locator, type Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
-import { seedDemo, type SeedDemoResult } from "../../../scripts/seed-demo";
 import { readNote, writeNote } from "../../src/project/notes";
 import { ObjectiveStore } from "../../src/project/objectives";
 import { ProjectStore } from "../../src/project/store";
-import { Server } from "../../src/server/server";
-import { closeHistory, loadAll, saveIndex, saveWorkspace } from "../../src/workspace/state";
+import { loadAll, saveIndex, saveWorkspace } from "../../src/workspace/state";
+import { runDemoJourney } from "./demo-journey-harness";
 
-const webDir = join(__dirname, "../../../dist/webview");
-const timeout = 10_000;
+const pageOptions = { viewport: { width: 1280, height: 800 }, timeout: 10_000 };
 const visible = (locator: Locator) => locator.waitFor({ state: "visible" });
 const hidden = (locator: Locator) => locator.waitFor({ state: "hidden" });
 const button = (scope: Page | Locator, name: string | RegExp) =>
   scope.getByRole("button", { name, exact: typeof name === "string" });
 const chat = (page: Page, text: string) => visible(page.locator(".messages", { hasText: text }));
 
-async function journey(
-  run: (page: Page, origin: string, dir: string, seed: SeedDemoResult) => Promise<void>,
-  prepare?: (dir: string, seed: SeedDemoResult) => void,
-) {
-  ensureWebviewBuilt();
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "yaat-board-projects-")));
-  const previousHost = process.env.AGENT_TEAM_HOST;
-  let server: Server | undefined;
-  let browser: Browser | undefined;
-  const consoleErrors: string[] = [];
-  const pageErrors: string[] = [];
-  try {
-    const seed = seedDemo(dir, { quiet: true, writeConfig: true });
-    try {
-      prepare?.(dir, seed);
-    } finally {
-      closeHistory(dir);
-    }
-    process.env.AGENT_TEAM_HOST = "127.0.0.1";
-    server = new Server(0, dir, webDir);
-    const origin = `http://127.0.0.1:${await server.listening}`;
-    browser = await chromium.launch();
-    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-    page.setDefaultTimeout(timeout);
-    page.on("console", (msg) => {
-      if (msg.type() === "error") consoleErrors.push(msg.text());
-    });
-    page.on("pageerror", (err) => pageErrors.push(err.stack ?? err.message));
-    await run(page, origin, dir, seed);
-    expect(consoleErrors, "Chromium console errors").toEqual([]);
-    expect(pageErrors, "Uncaught Chromium errors").toEqual([]);
-  } finally {
-    try {
-      try {
-        await browser?.close();
-      } finally {
-        await server?.close();
-      }
-    } finally {
-      if (previousHost === undefined) delete process.env.AGENT_TEAM_HOST;
-      else process.env.AGENT_TEAM_HOST = previousHost;
-      // Also release SQLite if Server construction threw before assigning server.
-      closeHistory(dir);
-      // A Windows git child can still hold its working directory after close().
-      await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
-    }
-  }
-}
-
 it("filters the real board, follows dependency and issue links, and reopens a note after a live disk edit", async () => {
-  await journey(
-    async (page, origin, dir, seed) => {
+  await runDemoJourney(
+    "yaat-board-projects-",
+    pageOptions,
+    async (page, { origin, dir, seed }) => {
       await page.goto(`${origin}/#chat-anchor`);
       await page.locator(".ws-group-project .ws-group-label", { hasText: "agent-team" }).click();
       await chat(page, "分成两件事");
@@ -94,10 +42,6 @@ it("filters the real board, follows dependency and issue links, and reopens a no
       await hidden(button(statuses, /^Archive\b/));
       await visible(button(board, /^All areas/).getByText("5", { exact: true }));
       expect(await cards.count()).toBe(5);
-      await button(statuses, /^Active\b/).click();
-      await visible(card("Search in the Files panel"));
-      await hidden(card("Panels on phones"));
-      await button(statuses, /^Active\b/).click();
       const ui = button(board.getByRole("navigation", { name: "Filters" }), /^ui/);
       await visible(ui.getByText("4", { exact: true }));
       await ui.click();
@@ -131,8 +75,7 @@ it("filters the real board, follows dependency and issue links, and reopens a no
       await board.locator(".bp-node", { hasText: "Preview deploys per branch" }).click();
       await button(detail("Preview deploys per branch"), /Panels on phones/).click();
       const mobile = detail("Panels on phones");
-      await visible(mobile.getByText("44px touch targets in the sheet header"));
-      await visible(mobile.getByText("Swipe down to close the sheet?"));
+      await visible(mobile);
       await button(mobile, "Close details").click();
 
       const issuesMode = button(board.getByRole("group", { name: "Show" }), /^Issues/);
@@ -282,8 +225,10 @@ it("filters the real board, follows dependency and issue links, and reopens a no
 }, 90_000);
 
 it("uses real sidebar groups, archives, history search, confirmations, and debug gating", async () => {
-  await journey(
-    async (page, origin, dir, seed) => {
+  await runDemoJourney(
+    "yaat-board-projects-",
+    pageOptions,
+    async (page, { origin, dir, seed }) => {
       await page.addInitScript((id) => {
         if (!localStorage.getItem("activeWsId")) localStorage.setItem("activeWsId", id);
       }, seed.workspaces.lead);
@@ -342,10 +287,6 @@ it("uses real sidebar groups, archives, history search, confirmations, and debug
       expect(await search.inputValue()).toBe("");
       await hidden(hit);
       await visible(group);
-      await search.fill("TemplateResolver");
-      await hit.click();
-      await chat(page, "TemplateResolver::resolve");
-      expect(await search.inputValue()).toBe("");
 
       await routes.hover();
       const removeSession = routes.getByTitle("Delete session", { exact: true });

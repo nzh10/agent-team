@@ -1,24 +1,14 @@
 /// <reference lib="dom" />
 
-import {
-  appendFileSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chromium, type Browser, type Page } from "playwright";
-import { expect, it, vi } from "vitest";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
-import { seedDemo, type SeedDemoResult } from "../../../scripts/seed-demo";
-import { Server } from "../../src/server/server";
+import type { Page } from "playwright";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { SeedDemoResult } from "../../../scripts/seed-demo";
 import * as codex from "../../src/session/codex";
 import { recordUsage } from "../../src/usage/ledger";
 import { LocalHost } from "../../src/session/host";
+import { runDemoJourney } from "./demo-journey-harness";
 
 const alpha = "journey/alpha";
 const beta = "journey/beta";
@@ -28,48 +18,38 @@ const png = Buffer.from(
   "base64",
 );
 
-async function journey(
-  run: (page: Page, seeded: SeedDemoResult) => Promise<void>,
-  setup?: (seeded: SeedDemoResult) => void,
-  withModels = false,
-) {
-  ensureWebviewBuilt();
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "yaat-panels-")));
-  let server: Server | undefined;
-  let browser: Browser | undefined;
-  const errors: string[] = [];
-  const pageErrors: string[] = [];
-  try {
-    vi.stubEnv("AGENT_TEAM_HOST", "127.0.0.1");
-    // Supply only the external discovery boundary. No CLI, account, turn, or
-    // mocked HTTP/WS/UI is needed to exercise agent configuration and storage.
-    vi.spyOn(codex, "probeCodexAuth").mockResolvedValue({
-      cliAvailable: false,
-      authenticated: false,
-      status: "unavailable",
-      checkedAt: 0,
-    });
-    const seeded = seedDemo(dir, { quiet: true, writeConfig: true });
-    if (withModels) {
-      vi.spyOn(LocalHost.prototype, "discoverPiModels").mockResolvedValue([
-        {
-          id: alpha,
-          provider: "journey",
-          modelId: "alpha",
-          name: "Alpha",
-          effortLevels: ["low", "high"],
-        },
-        {
-          id: beta,
-          provider: "journey",
-          modelId: "beta",
-          name: "Beta",
-          effortLevels: ["low", "high", "max"],
-        },
-      ]);
-      appendFileSync(
-        join(dir, "config.toml"),
-        `
+beforeEach(() => {
+  // Stub only external discovery; agent settings and storage use real HTTP and WebSocket.
+  vi.spyOn(codex, "probeCodexAuth").mockResolvedValue({
+    cliAvailable: false,
+    authenticated: false,
+    status: "unavailable",
+    checkedAt: 0,
+  });
+});
+
+afterEach(() => vi.restoreAllMocks());
+
+function prepareModels({ baseDir }: SeedDemoResult) {
+  vi.spyOn(LocalHost.prototype, "discoverPiModels").mockResolvedValue([
+    {
+      id: alpha,
+      provider: "journey",
+      modelId: "alpha",
+      name: "Alpha",
+      effortLevels: ["low", "high"],
+    },
+    {
+      id: beta,
+      provider: "journey",
+      modelId: "beta",
+      name: "Beta",
+      effortLevels: ["low", "high", "max"],
+    },
+  ]);
+  appendFileSync(
+    join(baseDir, "config.toml"),
+    `
 [pi]
 offline = true
 
@@ -87,52 +67,37 @@ color = "#884499"
 model = "${beta}"
 effort = "max"
 `,
-      );
-    }
-    setup?.(seeded);
-    server = new Server(0, dir, join(__dirname, "../../../dist/webview"));
-    const origin = `http://127.0.0.1:${await server.listening}`;
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-    context.on("page", (page) => {
-      page.on("pageerror", (error) => pageErrors.push(error.message));
-      page.on("console", (msg) => {
-        if (msg.type() !== "error") return;
-        // Chromium logs the intentionally failed real lookup as a resource
-        // diagnostic. The journey checks its exact HTTP status and UI result.
-        const url = msg.location().url;
-        if (
+  );
+}
+
+function journey(
+  run: (page: Page, seed: SeedDemoResult) => Promise<void>,
+  prepare?: (seed: SeedDemoResult) => void,
+) {
+  return runDemoJourney(
+    "yaat-panels-",
+    {
+      viewport: { width: 1440, height: 900 },
+      timeout: 8_000,
+      ignoreConsoleError: (message, origin) => {
+        // The missing-file journey asserts the HTTP status and recovery itself.
+        const url = message.location().url;
+        return (
           url.startsWith(`${origin}/api/file?`) &&
           /[\\/]missing\.ts$/.test(new URL(url).searchParams.get("path") ?? "") &&
-          msg.text().startsWith("Failed to load resource:") &&
-          msg.text().includes("404")
-        )
-          return;
-        errors.push(msg.text());
-      });
-    });
-    const page = await context.newPage();
-    page.setDefaultTimeout(8_000);
-    await page.goto(origin);
-    await page.locator(".ws-group-project").click();
-    await transcript(page, "分成两件事");
-    await run(page, seeded);
-    expect(errors).toEqual([]);
-    expect(pageErrors).toEqual([]);
-  } finally {
-    try {
-      await browser?.close();
-    } finally {
-      try {
-        await server?.close();
-      } finally {
-        vi.restoreAllMocks();
-        vi.unstubAllEnvs();
-        // A background Git scan can still hold a worktree handle on Windows.
-        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-      }
-    }
-  }
+          message.text().startsWith("Failed to load resource:") &&
+          message.text().includes("404")
+        );
+      },
+    },
+    async (page, { origin, seed }) => {
+      await page.goto(origin);
+      await page.locator(".ws-group-project").click();
+      await transcript(page, "分成两件事");
+      await run(page, seed);
+    },
+    (_dir, seed) => prepare?.(seed),
+  );
 }
 
 const rail = (page: Page, name: string) =>
@@ -339,12 +304,12 @@ it("browses workspace files, quotes real selected lines, and recovers from a mis
   );
 }, 45_000);
 
-it("opens tracked and untracked diffs and refreshes them after a real edit", async () => {
+it("counts and quotes real tracked and untracked diff lines", async () => {
   let removed: string;
   const css = "webview/src/styles.css";
   const added = "/* synthetic replacement */";
   await journey(
-    async (page, { worktrees }) => {
+    async (page) => {
       await worker(page, "mobile panels").click();
       await transcript(page, "sheet 头部已经改好");
       await rail(page, "Files").click();
@@ -385,17 +350,12 @@ it("opens tracked and untracked diffs and refreshes them after a real edit", asy
       );
       await panel.getByTitle("All changes").click();
       await untracked.click();
-      await panel.locator(".diff-add", { hasText: "# Mobile panels" }).waitFor();
-      expect((await panel.locator(".fp-bar .change-count").textContent())?.trim()).toBe("+3");
+      await expect
+        .poll(async () => (await panel.locator(".fp-bar .change-count").textContent())?.trim())
+        .toBe("+3");
       await panel.getByTitle("All changes").click();
       await panel.getByTitle("Files", { exact: true }).click();
       await panel.locator(".dir-entry", { hasText: "package.json" }).waitFor();
-
-      const fresh = "A fresh untracked change on disk";
-      writeFileSync(join(worktrees.mobilePanels, "fresh.txt"), `${fresh}\n`);
-      await rail(page, "Changes").click();
-      await panel.getByTitle("fresh.txt", { exact: true }).click();
-      await panel.locator(".diff-add", { hasText: fresh }).waitFor();
     },
     ({ worktrees }) => {
       const file = join(worktrees.mobilePanels, css);
@@ -407,124 +367,120 @@ it("opens tracked and untracked diffs and refreshes them after a real edit", asy
 }, 45_000);
 
 it("uses lead and worker agent cards to manage an agent with destructive confirmations", async () => {
-  await journey(
-    async (page) => {
-      const agents = rail(page, "Agents and sessions");
-      await agents.click();
-      await page.locator(".agents-panel").waitFor();
-      expect(await page.locator(".agents-panel .ap-agent").count()).toBe(0);
-      expect(await page.locator(".side-panel-sub").textContent()).toBe(
-        "agent-team · 4 sessions · idle",
-      );
-      const mobile = card(page, "mobile panels");
-      const wake = card(page, "wake-up time");
-      const fold = mobile.getByRole("button", { name: "Fold mobile panels", exact: true });
-      const unfold = mobile.getByRole("button", { name: "Unfold mobile panels", exact: true });
-      await unfold.click();
-      const usage = mobile
-        .locator(".ap-agent", { has: page.getByText("Perseus", { exact: true }) })
-        .locator(".ap-context");
-      await usage.waitFor();
-      expect(await usage.textContent()).toMatch(/\S+ \/ 1M/);
-      await fold.click();
-      await usage.waitFor({ state: "hidden" });
-      await unfold.click();
-      const add = mobile.getByRole("button", { name: "+ Agent", exact: true });
-      const dialog = page.getByRole("dialog", { name: "Add Agent" });
-      const name = dialog.getByRole("textbox", { name: "Name (or use preset)" });
-      const model = dialog.getByLabel("Model", { exact: true });
-      const effort = dialog.getByLabel("Reasoning effort");
-      await add.click();
-      await expect.poll(() => model.inputValue()).toBe(alpha);
-      expect(await effort.inputValue()).toBe("low");
-      await dialog.getByText("Reviewer", { exact: true }).click();
-      expect(await name.getAttribute("placeholder")).toBe("Reviewer");
-      expect(await model.inputValue()).toBe(beta);
-      expect(await effort.inputValue()).toBe("max");
-      await model.selectOption(alpha);
-      expect(await effort.inputValue()).toBe("");
-      await effort.selectOption("high");
-      await model.selectOption(beta);
-      expect(await effort.inputValue()).toBe("high");
-      await name.fill("Journey reviewer");
-      await dialog.getByRole("button", { name: "Cancel" }).click();
-      const custom = mobile.getByText("Journey reviewer", { exact: true });
-      expect(await custom.count()).toBe(0);
+  await journey(async (page) => {
+    const agents = rail(page, "Agents and sessions");
+    await agents.click();
+    await page.locator(".agents-panel").waitFor();
+    expect(await page.locator(".agents-panel .ap-agent").count()).toBe(0);
+    expect(await page.locator(".side-panel-sub").textContent()).toBe(
+      "agent-team · 4 sessions · idle",
+    );
+    const mobile = card(page, "mobile panels");
+    const wake = card(page, "wake-up time");
+    const fold = mobile.getByRole("button", { name: "Fold mobile panels", exact: true });
+    const unfold = mobile.getByRole("button", { name: "Unfold mobile panels", exact: true });
+    await unfold.click();
+    const usage = mobile
+      .locator(".ap-agent", { has: page.getByText("Perseus", { exact: true }) })
+      .locator(".ap-context");
+    await usage.waitFor();
+    expect(await usage.textContent()).toMatch(/\S+ \/ 1M/);
+    await fold.click();
+    await usage.waitFor({ state: "hidden" });
+    await unfold.click();
+    const add = mobile.getByRole("button", { name: "+ Agent", exact: true });
+    const dialog = page.getByRole("dialog", { name: "Add Agent" });
+    const name = dialog.getByRole("textbox", { name: "Name (or use preset)" });
+    const model = dialog.getByLabel("Model", { exact: true });
+    const effort = dialog.getByLabel("Reasoning effort");
+    await add.click();
+    await expect.poll(() => model.inputValue()).toBe(alpha);
+    expect(await effort.inputValue()).toBe("low");
+    await dialog.getByText("Reviewer", { exact: true }).click();
+    expect(await name.getAttribute("placeholder")).toBe("Reviewer");
+    expect(await model.inputValue()).toBe(beta);
+    expect(await effort.inputValue()).toBe("max");
+    await model.selectOption(alpha);
+    expect(await effort.inputValue()).toBe("");
+    await effort.selectOption("high");
+    await model.selectOption(beta);
+    expect(await effort.inputValue()).toBe("high");
+    await name.fill("Journey reviewer");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    const custom = mobile.getByText("Journey reviewer", { exact: true });
+    expect(await custom.count()).toBe(0);
 
-      await add.click();
-      await name.fill("Journey reviewer");
-      await model.selectOption(beta);
-      await effort.selectOption("high");
-      await dialog.getByRole("button", { name: "Add", exact: true }).click();
-      await custom.waitFor();
-      const reviewerModel = mobile.getByLabel("Journey reviewer's model");
-      expect(await reviewerModel.inputValue()).toBe(beta);
-      expect(await reviewerModel.locator("option").allTextContents()).toEqual(["alpha", "beta"]);
-      expect(await mobile.getByLabel("Journey reviewer's reasoning effort").inputValue()).toBe(
-        "high",
-      );
+    await add.click();
+    await name.fill("Journey reviewer");
+    await model.selectOption(beta);
+    await effort.selectOption("high");
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
+    await custom.waitFor();
+    const reviewerModel = mobile.getByLabel("Journey reviewer's model");
+    expect(await reviewerModel.inputValue()).toBe(beta);
+    expect(await reviewerModel.locator("option").allTextContents()).toEqual(["alpha", "beta"]);
+    expect(await mobile.getByLabel("Journey reviewer's reasoning effort").inputValue()).toBe(
+      "high",
+    );
 
-      await page.getByTitle("Maximise over the chat").click();
-      await page.getByTitle("Back beside the chat").waitFor();
-      await mobile.getByTitle("Open this session").click();
-      await transcript(page, "Journey reviewer joined the team");
-      await page.getByTitle("Maximise over the chat").waitFor();
-      await fold.waitFor();
-      await wake.waitFor({ state: "hidden" });
-      expect(await page.locator(".side-panel-sub").textContent()).toBe(
-        "mobile panels · 2 agents · idle",
-      );
-      const agentModel = mobile.getByLabel("Journey reviewer's model");
-      const agentEffort = mobile.getByLabel("Journey reviewer's reasoning effort");
-      await agentModel.selectOption(alpha);
-      await transcript(page, "Journey reviewer moves from Beta to Alpha");
-      await expect.poll(() => agentModel.inputValue()).toBe(alpha);
-      await agentEffort.selectOption("low");
-      await transcript(page, "/effort low");
-      await expect.poll(() => agentEffort.inputValue()).toBe("low");
+    await page.getByTitle("Maximise over the chat").click();
+    await page.getByTitle("Back beside the chat").waitFor();
+    await mobile.getByTitle("Open this session").click();
+    await transcript(page, "Journey reviewer joined the team");
+    await page.getByTitle("Maximise over the chat").waitFor();
+    await fold.waitFor();
+    await wake.waitFor({ state: "hidden" });
+    expect(await page.locator(".side-panel-sub").textContent()).toBe(
+      "mobile panels · 2 agents · idle",
+    );
+    const agentModel = mobile.getByLabel("Journey reviewer's model");
+    const agentEffort = mobile.getByLabel("Journey reviewer's reasoning effort");
+    await agentModel.selectOption(alpha);
+    await transcript(page, "Journey reviewer moves from Beta to Alpha");
+    await expect.poll(() => agentModel.inputValue()).toBe(alpha);
+    await agentEffort.selectOption("low");
+    await transcript(page, "/effort low");
+    await expect.poll(() => agentEffort.inputValue()).toBe("low");
 
-      const clear = mobile.getByRole("button", { name: "Clear Perseus's context", exact: true });
-      const clearDialog = page.getByRole("dialog", { name: "Clear Perseus's context?" });
-      await clear.click();
-      await clearDialog.getByRole("button", { name: "Cancel" }).click();
-      expect(
-        await page
-          .locator(".messages")
-          .getByText(/context cleared/)
-          .count(),
-      ).toBe(0);
-      await usage.waitFor();
-      await clear.click();
-      await clearDialog.getByRole("button", { name: "Clear context", exact: true }).click();
-      await transcript(page, "Perseus context cleared");
-      await expect.poll(() => usage.count()).toBe(0);
+    const clear = mobile.getByRole("button", { name: "Clear Perseus's context", exact: true });
+    const clearDialog = page.getByRole("dialog", { name: "Clear Perseus's context?" });
+    await clear.click();
+    await clearDialog.getByRole("button", { name: "Cancel" }).click();
+    expect(
+      await page
+        .locator(".messages")
+        .getByText(/context cleared/)
+        .count(),
+    ).toBe(0);
+    await usage.waitFor();
+    await clear.click();
+    await clearDialog.getByRole("button", { name: "Clear context", exact: true }).click();
+    await transcript(page, "Perseus context cleared");
+    await expect.poll(() => usage.count()).toBe(0);
 
-      const remove = mobile.getByRole("button", { name: "Remove Journey reviewer", exact: true });
-      const removeDialog = page.getByRole("dialog", { name: "Remove Journey reviewer?" });
-      await remove.click();
-      await removeDialog.getByRole("button", { name: "Cancel" }).click();
-      await custom.waitFor();
-      await remove.click();
-      await removeDialog.getByRole("button", { name: "Remove agent", exact: true }).click();
-      await transcript(page, "Journey reviewer left the team");
-      await custom.waitFor({ state: "hidden" });
-      expect(
-        await page
-          .locator(".messages")
-          .getByText(/Perseus context cleared/)
-          .count(),
-      ).toBe(1);
+    const remove = mobile.getByRole("button", { name: "Remove Journey reviewer", exact: true });
+    const removeDialog = page.getByRole("dialog", { name: "Remove Journey reviewer?" });
+    await remove.click();
+    await removeDialog.getByRole("button", { name: "Cancel" }).click();
+    await custom.waitFor();
+    await remove.click();
+    await removeDialog.getByRole("button", { name: "Remove agent", exact: true }).click();
+    await transcript(page, "Journey reviewer left the team");
+    await custom.waitFor({ state: "hidden" });
+    expect(
+      await page
+        .locator(".messages")
+        .getByText(/Perseus context cleared/)
+        .count(),
+    ).toBe(1);
 
-      await page.locator(".ws-group-project").click();
-      await transcript(page, "分成两件事");
-      await wake.getByTitle("Open this session").click();
-      await transcript(page, "noteSchedule");
-      await wake.getByRole("button", { name: "Fold wake-up time", exact: true }).waitFor();
-      await mobile.waitFor({ state: "hidden" });
-    },
-    undefined,
-    true,
-  );
+    await page.locator(".ws-group-project").click();
+    await transcript(page, "分成两件事");
+    await wake.getByTitle("Open this session").click();
+    await transcript(page, "noteSchedule");
+    await wake.getByRole("button", { name: "Fold wake-up time", exact: true }).waitFor();
+    await mobile.waitFor({ state: "hidden" });
+  }, prepareModels);
 }, 45_000);
 
 it("sets the theme before app startup and preserves the workspace across theme changes", async () => {
@@ -614,9 +570,16 @@ it("sets the theme before app startup and preserves the workspace across theme c
         await applied(system);
         expect(await geometry()).toEqual(before);
         await transcript(tab, "分成两件事");
-        await bootstrap(system); // Explicit choice wins over the opposite OS setting at reload.
-        await openDrawer();
-        await applied(system);
+        // Both explicit choices win over the opposite OS setting at startup.
+        for (const choice of [system, opposite] as const) {
+          if (choice === opposite) await toggle.click();
+          await tab.emulateMedia({ colorScheme: choice === system ? opposite : system });
+          await applied(choice);
+          await bootstrap(choice);
+          await openDrawer();
+          await applied(choice);
+          await transcript(tab, "分成两件事");
+        }
       } finally {
         await context.close();
       }

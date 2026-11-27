@@ -65,8 +65,8 @@ function textNodeOf(el: Element): Text {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   window.getSelection()?.removeAllRanges();
-  // The tests set their own on the document, over its prototype's.
   Reflect.deleteProperty(document, "execCommand");
 });
 
@@ -113,6 +113,8 @@ describe("copying a selection from a reply", () => {
   it("still copies a whole reply as markdown: heading, list and fence", () => {
     const c = renderReply();
     const content = c.querySelector(".message-content")!;
+    // Give the icon-only button a marker so omitting UI chrome is observable.
+    content.querySelector(".copy-btn")!.append("Copy");
     const r = document.createRange();
     r.selectNodeContents(content);
     select(r);
@@ -121,6 +123,24 @@ describe("copying a selection from a reply", () => {
     expect(md).toMatch(/^[-*] +item one$/m);
     expect(md).toContain("```bash\ncd /tmp/foo_bar && ls *.cpp\necho [x]\n```");
     expect(md).not.toContain("Copy");
+  });
+
+  it("omits message actions from a selection across replies", () => {
+    const { container } = render(
+      <>
+        <MessageItem msg={message({ content: "first" })} agents={agents} onQuote={vi.fn()} />
+        <MessageItem
+          msg={message({ id: "m2", content: "second" })}
+          agents={agents}
+          onQuote={vi.fn()}
+        />
+      </>,
+    );
+    const [first, last] = [...container.querySelectorAll(".message-content p")].map(textNodeOf);
+    select(rangeOver(first, 0, last, last.length));
+    const md = copied(first.parentElement!);
+    expect(md).toMatch(/^first[\s\S]*second$/);
+    expect(md).not.toContain("↩");
   });
 
   it("copies a code block selected whole as its code", () => {
@@ -335,19 +355,44 @@ describe("Copy buttons", () => {
     });
   }
 
-  it("copies a code block without the clipboard API", async () => {
+  it.each<Partial<Message>>([
+    { status: "streaming" },
+    { kind: "user", status: "queued" },
+    { kind: "user", status: "starting" },
+    { kind: "user", status: "dispatching" },
+    { content: " \n" },
+    { kind: "system" },
+  ])("does not offer message copy for %j", (props) => {
+    const { queryByRole } = render(<MessageItem msg={message(props)} agents={agents} />);
+    expect(queryByRole("button", { name: "Copy message" })).toBeNull();
+  });
+
+  it.each(["agent", "user"] as const)("copies raw text from a compact %s message", async (kind) => {
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const { getByRole } = render(<MessageItem msg={message({ kind })} agents={agents} compact />);
+    await click(getByRole("button", { name: "Copy message" }));
+    expect(writeText).toHaveBeenCalledWith(reply);
+    expect(getByRole("button", { name: "Copied" })).toBeTruthy();
+  });
+
+  it("copies a code block without the clipboard API and clears feedback on unmount", async () => {
     vi.stubGlobal("navigator", { ...navigator, clipboard: undefined });
     const texts = stubExecCommand();
-    const { container } = render(<MdBlock>{"```sh\nls foo_bar/\n```"}</MdBlock>);
+    const { container, unmount } = render(<MdBlock>{"```sh\nls foo_bar/\n```"}</MdBlock>);
+    const timer = vi.spyOn(globalThis, "setTimeout");
     const button = container.querySelector(".copy-btn")!;
-    // Beside the block, not inside what scrolls sideways.
     expect(button.parentElement!.className).toBe("code-block");
     expect(button.nextElementSibling!.tagName).toBe("PRE");
     expect(container.querySelector("pre .copy-btn")).toBeNull();
     await click(button);
     expect(texts).toEqual(["ls foo_bar/"]);
-    expect(button.textContent).toBe("Copied");
+    expect(button.getAttribute("aria-label")).toBe("Copied");
     expect(document.querySelector("textarea")).toBeNull();
+    const feedback = timer.mock.results[timer.mock.calls.findIndex(([, delay]) => delay === 1500)];
+    const clear = vi.spyOn(globalThis, "clearTimeout");
+    unmount();
+    expect(clear).toHaveBeenCalledWith(feedback.value);
   });
 
   it("falls back when the clipboard API refuses", async () => {
@@ -367,7 +412,7 @@ describe("Copy buttons", () => {
     const { container } = render(<MdBlock>{"```\nx\n```"}</MdBlock>);
     const button = container.querySelector(".copy-btn")!;
     await click(button);
-    expect(button.textContent).toBe("Copy");
+    expect(button.getAttribute("aria-label")).toBe("Copy");
   });
 
   it("puts the focus back where it was", async () => {
@@ -401,7 +446,7 @@ describe("Copy buttons", () => {
     const [read, grep] = container.querySelectorAll(".event-summary-line .copy-btn");
     await click(read);
     expect(writeText).toHaveBeenLastCalledWith("/home/u/a_b.ts");
-    expect(read.textContent).toBe("Copied");
+    expect(read.getAttribute("aria-label")).toBe("Copied");
     await click(grep);
     expect(writeText).toHaveBeenLastCalledWith("foo_bar in src/");
   });

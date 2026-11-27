@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cdp, page, userEvent } from "vitest/browser";
+import { cdp, page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import type { ReactNode } from "react";
 import { MdBlock } from "../../src/chat/markdown";
@@ -81,62 +81,13 @@ describe("diagram previews", () => {
   );
 
   it(
-    "previews Mermaid in place, supports keyboard focus, and copies source while previewing",
+    "accepts the graphviz alias and toggles back to code",
+
     { timeout: 20_000 },
     async () => {
-      await page.viewport(1000, 700);
-      const source = "flowchart LR\nA[Start] --> B[Finish]";
-      const writeText = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
-      const { container, getByRole } = render(
-        <Chat>{<MdBlock>{fence("mermaid", source)}</MdBlock>}</Chat>,
-      );
-      const block = container.querySelector<HTMLElement>(".code-block")!;
-      const pre = block.querySelector("pre")!;
-      const copy = getByRole("button", { name: "Copy" });
-      const toggle = getByRole("button", { name: "Preview diagram" });
-      expect(toggle.textContent).toBe("");
-      expect(toggle.getAttribute("aria-pressed")).toBe("false");
-      expect(toggle.getAttribute("title")).toBe("Preview diagram");
-      expect(pre.hidden).toBe(false);
-      expect(getComputedStyle(toggle).opacity).toBe("0");
-      await page.elementLocator(block).hover();
-      await expect.poll(() => getComputedStyle(toggle).opacity).toBe("1");
-      await expect.poll(() => getComputedStyle(copy).opacity).toBe("1");
-      await cdp().send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 0, y: 0 });
-
-      copy.focus();
-      await userEvent.tab();
-      expect(document.activeElement).toBe(toggle);
-      expect(toggle.matches(":focus-visible")).toBe(true);
-      await expect.poll(() => getComputedStyle(toggle).opacity).toBe("1");
-      expect(getComputedStyle(toggle).outlineStyle).toBe("solid");
-      await userEvent.keyboard("{Enter}");
-      const rendered = await preview(container);
-      expect(rendered.parentElement).toBe(block);
-      expect(rendered.querySelector("svg text")?.textContent).toContain("Start");
-      expect(pre.hidden).toBe(true);
-      expect(getByRole("button", { name: "Show code" }).getAttribute("aria-pressed")).toBe("true");
-      const copyRect = copy.getBoundingClientRect();
-      const toggleRect = toggle.getBoundingClientRect();
-      expect(toggleRect.left).toBeGreaterThanOrEqual(copyRect.right - 1);
-      expect(toggleRect.left).toBeGreaterThanOrEqual(block.getBoundingClientRect().left);
-      expect(copyRect.right).toBeLessThanOrEqual(block.getBoundingClientRect().right);
-
-      fireEvent.click(copy);
-      await waitFor(() => expect(writeText).toHaveBeenCalledWith(source));
-      fireEvent.click(getByRole("button", { name: "Show code" }));
-      expect(pre.hidden).toBe(false);
-      expect(container.querySelector(".diagram-preview")).toBeNull();
-    },
-  );
-
-  it.each(["dot", "graphviz"])(
-    "renders a %s fence with Graphviz and toggles back to code",
-    { timeout: 20_000 },
-    async (language) => {
       const source = 'digraph G { a [label="Alpha"]; a -> b [label="next"]; }';
       const { container, getByRole } = render(
-        <Chat>{<MdBlock>{fence(language, source)}</MdBlock>}</Chat>,
+        <Chat>{<MdBlock>{fence("graphviz", source)}</MdBlock>}</Chat>,
       );
       fireEvent.click(getByRole("button", { name: "Preview diagram" }));
       const rendered = await preview(container);

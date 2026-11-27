@@ -28,6 +28,8 @@ export const ICONS = {
   camera: "M2.5 5.5h2.3l1-2h4.4l1 2h2.3v7.5h-11zM8 11.2a2 2 0 1 0 0-4 2 2 0 0 0 0 4z",
   diagram: "M6 4.5 8 2.5l2 2-2 2zM2 11h4v3H2zM10 11h4v3h-4zM8 6.5V9M4 9v2M12 9v2M4 9h8",
   code: "M5.5 4 1.5 8l4 4M10.5 4l4 4-4 4M9 2.5 7 13.5",
+  copy: "M5.5 5.5h8v8h-8zM2.5 10.5v-8h8",
+  check: "M3 8l3.5 3.5L13 5",
   diagnostics: "M2 8h2.5l1.7-4.5 3.2 9 1.9-4.5H14",
   folder: "M2 12.5V4h4.5L8 5.5h6v7z",
   branch:

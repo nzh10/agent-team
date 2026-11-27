@@ -1711,7 +1711,7 @@ button {
 .delivery-inline-slot {
   flex-shrink: 0;
 }
-/* Let long model labels truncate before a non-today timestamp pushes Quote off-row. */
+/* Let long model labels truncate before a non-today timestamp pushes actions off-row. */
 .message-model {
   min-width: 0;
   overflow: hidden;
@@ -1926,6 +1926,12 @@ code code,
    not in it, so a wide block scrolls sideways under it. */
 .code-block .copy-btn,
 .event-summary-line .copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 27px;
+  height: 22px;
+  padding: 1px 4px;
   float: right;
   position: sticky;
   top: 0;
@@ -1934,13 +1940,16 @@ code code,
   border: 1px solid var(--border);
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 10.5px;
-  padding: 1px 7px;
   border-radius: 4px;
   margin: 6px 6px -100% -100%;
   opacity: 0;
   transition: opacity 0.15s;
   user-select: none;
+}
+.copy-btn .icon {
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
 }
 /* A path wraps, it does not scroll: its first line makes room for the
    button, which stays there instead of running over the lines below. */
@@ -1959,8 +1968,14 @@ code code,
   .code-block .copy-btn,
   .event-summary-line .copy-btn {
     opacity: 1;
-    font-size: 12.5px;
-    padding: 4px 11px;
+    width: 36px;
+    height: 32px;
+    padding: 4px;
+  }
+  .code-block .copy-btn .icon,
+  .event-summary-line .copy-btn .icon {
+    width: 16px;
+    height: 16px;
   }
 }
 @media (hover: hover) {
@@ -2075,13 +2090,31 @@ span.katex-display {
 
 /* In the message's header row, at its end: over the text it would hide its
    first line, and on touch take taps meant for it. */
-.btn-quote {
+.message-actions {
+  --message-action-width: 26px;
+  --message-action-height: 18px;
   flex-shrink: 0;
   align-self: center;
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+.message-actions:empty {
+  width: var(--message-action-width);
+  height: var(--message-action-height);
+}
+.btn-quote,
+.btn-copy-message {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--message-action-width);
+  height: var(--message-action-height);
+  padding: 0;
   font-size: 12px;
   line-height: 14px;
-  padding: 1px 6px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -2090,17 +2123,17 @@ span.katex-display {
   opacity: 0;
   transition: opacity 0.15s;
 }
-.message:hover .btn-quote,
-.btn-quote:focus-visible {
+.message:hover .message-actions button,
+.message-actions button:focus-visible {
   opacity: 1;
 }
 @media (hover: none) {
-  .btn-quote {
+  .message-actions button {
     opacity: 1;
   }
 }
 @media (hover: hover) {
-  .btn-quote:hover {
+  .message-actions button:hover {
     color: var(--accent-text);
     border-color: var(--accent);
   }
@@ -7771,7 +7804,7 @@ button.from-author {
   .pr-card,
   .code-block .copy-btn,
   .event-summary-line .copy-btn,
-  .btn-quote,
+  .message-actions button,
   .input-row,
   .input-row button,
   .bp-node,
