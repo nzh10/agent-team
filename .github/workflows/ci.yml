@@ -40,26 +40,7 @@ jobs:
           npm install -g @earendil-works/pi-coding-agent@1.6.0
           npm install --prefix "$HOME/.pi/agent/npm" pi-subagents@0.90.0
           printf '%s\n' '{"packages":["npm:pi-subagents"]}' > "$HOME/.pi/agent/settings.json"
-      - if: runner.os == 'Windows'
-        name: Check source and provision Chromium
-        run: |
-          # Playwright installs Media Foundation on Windows Server. It can do
-          # that while the source checks run, before either browser suite starts.
-          $install = Start-Job -WorkingDirectory $PWD -ScriptBlock {
-            $ErrorActionPreference = 'Stop'
-            $PSNativeCommandUseErrorActionPreference = $true
-            npx playwright install --with-deps chromium
-          }
-          try {
-            npm run check
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            Receive-Job $install -Wait -ErrorAction Stop
-            if ($install.State -ne 'Completed') { throw 'Chromium installation did not complete' }
-          } finally {
-            Remove-Job $install -Force
-          }
-      - if: runner.os == 'Linux'
-        run: npm run check
+      - run: npm run check
       - if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
       - if: runner.os == 'Linux'
@@ -68,3 +49,5 @@ jobs:
           if PI_BINARY=yaat-no-such-pi npm run test:e2e -w service -- pi-deterministic > "$RUNNER_TEMP/pi-negative.log" 2>&1; then exit 1; fi
           grep -F 'Pi E2E requires the pi binary' "$RUNNER_TEMP/pi-negative.log"
       - run: npm run test:ci
+        env:
+          YAAT_CI_INSTALL_CHROMIUM: ${{ runner.os == 'Windows' && '1' || '' }}
