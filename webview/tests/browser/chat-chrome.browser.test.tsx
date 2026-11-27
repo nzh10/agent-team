@@ -438,11 +438,11 @@ it.each(["light", "dark"])(
     expect(jumpBtn.matches(":focus-visible")).toBe(true);
     await expect
       .poll(() => getComputedStyle(jumpBtn).borderTopColor)
-      .toBe(resolveColor("var(--accent)"));
+      .toBe(resolveColor("var(--focus-ring)"));
     const focusStyle = getComputedStyle(jumpBtn);
     expect(focusStyle.outlineStyle).toBe("solid");
     expect(focusStyle.outlineWidth).toBe("2px");
-    expect(focusStyle.outlineColor).toBe(resolveColor("var(--accent)"));
+    expect(focusStyle.outlineColor).toBe(resolveColor("var(--focus-ring)"));
 
     // Keyboard Enter activates Jump to latest, removes the pill, and reveals the newly arrived message.
     await userEvent.keyboard("{Enter}");

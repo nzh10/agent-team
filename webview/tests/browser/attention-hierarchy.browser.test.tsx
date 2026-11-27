@@ -55,6 +55,28 @@ const frame = (n: number, over: Partial<Message> = {}): Message => ({
 });
 const get = <T extends HTMLElement = HTMLElement>(selector: string) =>
   document.querySelector<T>(selector)!;
+const contrastOf = (foreground: string, backgrounds: string[]) => {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+  const luminance = () => {
+    const [r, g, b] = Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3), (byte) => {
+      const c = byte / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  ctx.clearRect(0, 0, 1, 1);
+  for (const background of backgrounds) {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, 1, 1);
+  }
+  const a = luminance();
+  ctx.fillStyle = foreground;
+  ctx.fillRect(0, 0, 1, 1);
+  const b = luminance();
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+};
 const row = (name: string) =>
   document.querySelector<HTMLElement>(`.task-item:has(.clip[title="${name}"])`);
 const order = () =>
@@ -850,6 +872,12 @@ it("keeps Quiet unclipped, hit-testable on long project names, and reachable via
 
   leadHeader.querySelector<HTMLElement>(".ws-group-toggle")!.focus();
   await tabTo(leadQuiet);
+  const leadFocus = getComputedStyle(leadQuiet);
+  expect(leadHeader.classList.contains("active")).toBe(true);
+  expect(leadFocus.outlineColor).toBe("rgb(255, 255, 255)");
+  expect(
+    contrastOf(leadFocus.outlineColor, [getComputedStyle(leadHeader).backgroundColor]),
+  ).toBeGreaterThanOrEqual(3);
   const leadTip = leadQuiet.querySelector<HTMLElement>('[role="tooltip"]')!;
   expect(leadTip).not.toBeNull();
   expect(leadTip.textContent).toBe("No new events for 165s");
@@ -877,7 +905,7 @@ it("keeps Quiet unclipped, hit-testable on long project names, and reachable via
 });
 
 it.each(["light", "dark"] as const)(
-  "keeps running blue and waiting/sleeping purple status dots consistent across Sidebar, AgentsPanel, and Header (%s)",
+  "keeps status dots distinguishable across selected rows, Sidebar, AgentsPanel, and Header (%s)",
   async (theme) => {
     await page.viewport(1280, 800);
     document.documentElement.dataset.theme = theme;
@@ -894,6 +922,7 @@ it.each(["light", "dark"] as const)(
     const accent = resolveColor("--accent");
     const purple = resolveColor("--purple");
     const muted = resolveColor("--text-muted");
+    const onSolid = resolveColor("--on-solid");
     const expectPulsingDot = (dot: HTMLElement, color: string) => {
       const cs = getComputedStyle(dot);
       expect(cs.backgroundColor).toBe(color);
@@ -904,6 +933,20 @@ it.each(["light", "dark"] as const)(
         anim.pause();
         anim.currentTime = 0;
       }
+      expect(getComputedStyle(dot).opacity).toBe("1");
+    };
+
+    const expectActiveWorkingDot = (dot: HTMLElement) => {
+      const cs = getComputedStyle(dot);
+      expect(cs.backgroundColor).toBe(onSolid);
+      expect(cs.animationName).toBe("active-row-pulse");
+      expect(cs.animationIterationCount).toBe("infinite");
+      for (const anim of dot.getAnimations()) {
+        anim.pause();
+        anim.currentTime = 750;
+      }
+      // The selected-row pulse changes scale, never color or opacity.
+      expect(getComputedStyle(dot).backgroundColor).toBe(onSolid);
       expect(getComputedStyle(dot).opacity).toBe("1");
     };
 
@@ -1011,13 +1054,14 @@ it.each(["light", "dark"] as const)(
     );
     expect(combinedHeaderDot.classList.contains("running")).toBe(true);
 
-    // Working/running: pulsing --accent blue on worker (even with Your turn), project headers, and AgentsPanel.
+    // Unselected rows keep the accent pulse; the selected lead uses an opaque scale pulse.
     expect(runningDot.classList.contains("running")).toBe(true);
     expect(workHeaderDot.classList.contains("running")).toBe(true);
     expect(row("BusyCue")!.querySelector(".session-attention")?.textContent).toBe("Your turn");
-    for (const dot of [runningDot, combinedHeaderDot, workHeaderDot, apWorking]) {
+    for (const dot of [runningDot, workHeaderDot, apWorking]) {
       expectPulsingDot(dot, accent);
     }
+    expectActiveWorkingDot(combinedHeaderDot);
 
     // Waiting: pulsing --purple across Sidebar worker, Sidebar project header, and AgentsPanel.
     for (const dot of [waitingDot, waitHeaderDot, apWaiting]) {
@@ -1040,27 +1084,117 @@ it.each(["light", "dark"] as const)(
     expect(getComputedStyle(idleDot).opacity).toBe("0.5");
     expect(getComputedStyle(idleDot).animationName).toBe("none");
     expect(row("IdleWorker")!.querySelector(".task-archive")).not.toBeNull();
+    fireEvent.click(row("IdleWorker")!);
+    expect(getComputedStyle(idleDot).backgroundColor).toBe("rgba(0, 0, 0, 0)");
+    expect(getComputedStyle(idleDot).boxShadow).not.toBe("none");
+    expect(getComputedStyle(idleDot).opacity).toBe("1");
 
-    // Regression: agent_busy arriving before agent_state (with explicit state:"idle" and queued:false)
-    // restores the running blue dot and immediately hides Archive.
+    // Regression: agent_busy arriving before agent_state restores an opaque selected-row pulse.
     receive({ type: "agent_busy", workspaceId: "IdleWorker", agentId: agent.id, streamAt: NOW });
     const startingDot = row("IdleWorker")!.querySelector<HTMLElement>(".task-status")!;
     expect(startingDot.classList.contains("running")).toBe(true);
     expect(row("IdleWorker")!.classList.contains("task-item-active")).toBe(true);
     expect(row("IdleWorker")!.querySelector(".task-archive")).toBeNull();
-    expectPulsingDot(startingDot, accent);
+    expectActiveWorkingDot(startingDot);
 
-    // Verify Chat Header status dots match the same busy / waiting / sleeping styles.
+    // Chat Header retains hue; selected rows distinguish state without fading their marks.
     fireEvent.click(row("BusyCue")!);
+    expectActiveWorkingDot(runningDot);
     expectPulsingDot(get(".agent-status-dot.agent-status-busy"), accent);
 
     fireEvent.click(row("Waiting")!);
+    expect(getComputedStyle(waitingDot).backgroundColor).toBe(onSolid);
+    expect(getComputedStyle(waitingDot).animationName).toBe("none");
     expectPulsingDot(get(".agent-status-dot.agent-status-waiting"), purple);
 
     fireEvent.click(row("Sleeping")!);
+    expect(getComputedStyle(sleepingDot).backgroundColor).toBe(onSolid);
+    expect(getComputedStyle(sleepingDot).borderTopLeftRadius).toBe("2px");
+    expect(getComputedStyle(sleepingDot).animationName).toBe("none");
     const headerSleeping = get(".agent-status-dot.agent-status-sleeping");
     expect(getComputedStyle(headerSleeping).backgroundColor).toBe(purple);
     expect(getComputedStyle(headerSleeping).animationName).toBe("none");
+  },
+);
+
+it.each(["light", "dark"] as const)(
+  "keeps selected-row descendants and actions on their contrast floors (%s)",
+  async (theme) => {
+    await page.viewport(1280, 800);
+    document.documentElement.dataset.theme = theme;
+    vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const isolated = workspace("Isolated", 5, {
+      projectLink: { projectId: project.id, role: "worker", isolated: true },
+    });
+    const sealedProj: Project = {
+      id: "sealed-project",
+      name: "SealedProj",
+      root: "/repo/sealed",
+      createdAt: NOW + 10,
+      leadWorkspaceId: "sealed-lead",
+      status: "sealed",
+      sealedReason: "Read-only archive",
+      objectives: [],
+    };
+    const sealedLead = workspace("sealed-lead", 11, {
+      name: "SealedProj",
+      projectLink: { projectId: sealedProj.id, role: "lead" },
+    });
+    mount("Isolated");
+    connect([lead, isolated, sealedLead], { projects: [project, sealedProj] });
+
+    const selected = row("Isolated")!;
+    expect(selected.classList.contains("active")).toBe(true);
+    const role = selected.querySelector<HTMLElement>(".task-role-tag")!;
+    expect(role.textContent).toBe("isolated");
+    expect(
+      contrastOf(getComputedStyle(role).color, [getComputedStyle(selected).backgroundColor]),
+    ).toBeGreaterThanOrEqual(theme === "light" ? 3 : 4.5);
+
+    const archive = selected.querySelector<HTMLElement>(".task-archive")!;
+    const actionContrast = (element: HTMLElement) => {
+      const rowBackground = getComputedStyle(row("Isolated")!).backgroundColor;
+      const style = getComputedStyle(element);
+      return contrastOf(style.color, [rowBackground, style.backgroundColor]);
+    };
+    // Rest, pointer hover and keyboard reveal all use a contrast-safe glass surface.
+    expect(actionContrast(archive)).toBeGreaterThanOrEqual(4.5);
+    const restingBackground = getComputedStyle(archive).backgroundColor;
+    await page.elementLocator(selected).hover();
+    await page.elementLocator(archive).hover();
+    await expect.poll(() => getComputedStyle(archive).opacity).toBe("1");
+    expect(getComputedStyle(archive).backgroundColor).not.toBe(restingBackground);
+    expect(actionContrast(archive)).toBeGreaterThanOrEqual(4.5);
+    await cdp().send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 });
+    archive.focus();
+    await expect
+      .poll(() => getComputedStyle(selected.querySelector<HTMLElement>(".task-hover")!).opacity)
+      .toBe("1");
+    expect(actionContrast(archive)).toBeGreaterThanOrEqual(4.5);
+
+    const sealedHeader = [
+      ...document.querySelectorAll<HTMLElement>(".ws-group-header.ws-group-project"),
+    ].find((element) => element.textContent?.includes("SealedProj"))!;
+    fireEvent.click(sealedHeader);
+    expect(sealedHeader.classList.contains("active")).toBe(true);
+    const sealed = sealedHeader.querySelector<HTMLElement>(".ws-group-sealed")!;
+    expect(
+      contrastOf(getComputedStyle(sealed).color, [
+        getComputedStyle(sealedHeader).backgroundColor,
+        getComputedStyle(sealed).backgroundColor,
+      ]),
+    ).toBeGreaterThanOrEqual(4.5);
+
+    // Touch has no hover: the same selected-row action stays visible and readable at rest.
+    touch = true;
+    await cdp().send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.viewport(390, 800);
+    fireEvent.click(get(".mobile-menu-btn"));
+    fireEvent.click(row("Isolated")!);
+    fireEvent.click(get(".mobile-menu-btn"));
+    const touchArchive = row("Isolated")!.querySelector<HTMLElement>(".task-archive")!;
+    await expect.poll(() => getComputedStyle(touchArchive).opacity).toBe("1");
+    expect(actionContrast(touchArchive)).toBeGreaterThanOrEqual(4.5);
   },
 );
 

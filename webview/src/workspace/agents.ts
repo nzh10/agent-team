@@ -7,13 +7,13 @@ type Rgb = readonly [number, number, number];
 const NAME_THEMES = {
   light: {
     text: [0x25, 0x2a, 0x32],
-    surfaces: ["ffffff", "f2f3f5", "f7f8fa"],
-    highlight: ["007be8", "ffffff"],
+    surfaces: ["ffffff", "f2f2f2", "f7f8fa"],
+    highlight: ["0099ff", "ffffff"],
   },
   dark: {
     text: [0xdf, 0xdf, 0xdf],
-    surfaces: ["232323", "1c1c1c", "1e1e1e", "292929"],
-    highlight: ["4099f4", "232323"],
+    surfaces: ["1b1b1d", "141416", "242428", "2e2e33"],
+    highlight: ["0099ff", "1b1b1d"],
   },
 } as const;
 
