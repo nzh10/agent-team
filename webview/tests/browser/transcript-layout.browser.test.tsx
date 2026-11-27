@@ -17,7 +17,15 @@ import "../../src/fonts/sarasa-mono-sc/regular/result.css";
 import "../../src/fonts/sarasa-mono-sc/bold/result.css";
 import "../../src/fonts/sarasa-mono-sc/italic/result.css";
 import "../../src/fonts/sarasa-mono-sc/bold-italic/result.css";
-import type { AgentInfo, Message, Objective, Project } from "../../src/state/useServer";
+import type { Message } from "../../src/state/useServer";
+import { boardProps } from "../helpers/board";
+import { paintedContrast } from "../helpers/contrast";
+import {
+  agent as makeAgent,
+  message as makeMessage,
+  objective as makeObjective,
+  project as makeProject,
+} from "../helpers/fixtures";
 import "../../src/styles.css";
 
 afterEach(cleanup);
@@ -26,22 +34,8 @@ const rect = (el: Element) => el.getBoundingClientRect();
 const long = "A very long title that has to share a row with the other controls ".repeat(10).trim();
 const path = `/repo/${"very-long-directory/".repeat(20)}module.ts`;
 const no = () => {};
-const agent: AgentInfo = {
-  id: "a",
-  name: "Alice",
-  model: "claude-opus-5-5",
-  avatar: "A",
-  color: "#888",
-  isDefault: true,
-};
-const message: Message = {
-  id: "m",
-  kind: "agent",
-  agentId: "a",
-  content: "The tests passed.",
-  timestamp: 1,
-  status: "done",
-};
+const agent = makeAgent("a", { name: "Alice" });
+const message = makeMessage("m", { content: "The tests passed." });
 
 function lines(el: HTMLElement) {
   const range = document.createRange();
@@ -358,29 +352,13 @@ it.each([
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 1;
     const paint = canvas.getContext("2d", { willReadFrequently: true })!;
-    const luminance = () => {
-      const [r, g, b, alpha] = paint.getImageData(0, 0, 1, 1).data;
-      expect(alpha).toBe(255);
-      const linear = (n: number) =>
-        n / 255 <= 0.04045 ? n / (255 * 12.92) : ((n / 255 + 0.055) / 1.055) ** 2.4;
-      return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
-    };
     for (const control of [inner, steps, subagent]) {
       const backdrop: string[] = [];
       for (let node: HTMLElement | null = control; node; node = node.parentElement) {
         backdrop.unshift(getComputedStyle(node).backgroundColor);
       }
-      paint.clearRect(0, 0, 1, 1);
-      for (const color of backdrop) {
-        paint.fillStyle = color;
-        paint.fillRect(0, 0, 1, 1);
-      }
-      const background = luminance();
-      paint.fillStyle = getComputedStyle(control).color;
-      paint.fillRect(0, 0, 1, 1);
-      const foreground = luminance();
       expect(
-        (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05),
+        paintedContrast(getComputedStyle(control).color, backdrop, { opaque: true }),
       ).toBeGreaterThanOrEqual(4.5);
     }
 
@@ -847,39 +825,14 @@ it("fits a workspace dialog and board detail on a narrow phone", async () => {
   const dialog = document.querySelector(".dialog")!;
   expect(rect(dialog).left).toBeGreaterThanOrEqual(0);
   expect(rect(dialog).right).toBeLessThanOrEqual(320);
-  const objective: Objective = {
-    id: "web/layout",
-    area: "web",
+  const objective = makeObjective("web/layout", {
     title: "Layout",
     goal: path,
     context: "First paragraph.\n\nSecond paragraph.",
-    status: "active",
-    priority: "normal",
-    dependsOn: [],
-    tasks: [],
-    decisions: [],
-    sessions: [],
     updatedAt: 1,
-  };
-  const project: Project = {
-    id: "p",
-    name: "repo",
-    root: "/repo",
-    leadWorkspaceId: "lead",
-    createdAt: 1,
-    objectives: [objective],
-  };
-  rerender(
-    <BoardPage
-      project={project}
-      sessions={new Map()}
-      onClose={no}
-      onOpenSession={no}
-      onAskLead={no}
-      onRename={no}
-      onDelete={no}
-    />,
-  );
+  });
+  const project = makeProject("p", { name: "repo", objectives: [objective] });
+  rerender(<BoardPage project={project} {...boardProps({}, () => no)} />);
   fireEvent.click(get(container, ".bp-card"));
   const detail = get(container, ".bp-detail");
   const goal = get(detail, ".bp-goal");
@@ -894,38 +847,17 @@ it("fits a workspace dialog and board detail on a narrow phone", async () => {
 
 it("uses the space under board warnings and keeps Archive on a short desktop", async () => {
   await page.viewport(1100, 460);
-  const objective: Objective = {
-    id: "core/index",
-    area: "core",
+  const objective = makeObjective("core/index", {
     title: "Index",
     goal: "Build the index",
-    status: "active",
-    priority: "normal",
-    dependsOn: [],
-    tasks: [],
-    decisions: [],
-    sessions: [],
     updatedAt: 1,
-  };
-  const project: Project = {
-    id: "p",
+  });
+  const project = makeProject("p", {
     name: "repo",
-    root: "/repo",
-    leadWorkspaceId: "lead",
-    createdAt: 1,
     objectives: [objective, { id: "core/broken", error: "Invalid objective" }],
-  };
+  });
   const { container, getByRole } = render(
-    <BoardPage
-      project={project}
-      sessions={new Map()}
-      onClose={no}
-      onOpenSession={no}
-      onAskLead={no}
-      onRename={no}
-      onDelete={no}
-      onArchive={no}
-    />,
+    <BoardPage project={project} {...boardProps({ onArchive: no }, () => no)} />,
   );
   expect(rect(getByRole("button", { name: "Archive project" })).width).toBeGreaterThan(0);
   fireEvent.click(getByRole("button", { name: "Dependencies" }));

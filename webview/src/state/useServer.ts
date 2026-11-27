@@ -348,11 +348,6 @@ export interface HostInfo {
   connected: boolean;
 }
 
-export interface HostConfig {
-  label: string;
-  type: "local" | "remote";
-}
-
 // Set before the page reloads itself for a new build: nobody asked for that
 // load, so it is no sign that someone is at the screen.
 export const AUTO_RELOAD = "agentTeamAutoReload";
@@ -575,7 +570,6 @@ export function useServer() {
     setExtensionUi((prev) => ({ ...prev, notices: prev.notices.filter((n) => n !== notice) }));
   const [pendingDialogs, setPendingDialogs] = useState<UiDialogRequest[]>([]);
   const [hosts, setHosts] = useState<HostInfo[]>([]);
-  const [hostConfigs, setHostConfigs] = useState<Record<string, HostConfig>>({});
   const [quota, setQuota] = useState<QuotaState | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [archiveAfterDays, setArchiveAfterDays] = useState<number>(0);
@@ -741,7 +735,6 @@ export function useServer() {
             codexAuth?: CodexAuthState;
             commands?: CommandInfo[];
             telemetryEnabled?: boolean;
-            hosts: Record<string, HostConfig>;
           };
           configureTelemetry(config.telemetryEnabled === true);
           setUser(config.user ?? DEFAULT_USER);
@@ -758,7 +751,6 @@ export function useServer() {
             notices: [],
           });
           setPendingDialogs((msg.pendingDialogs as UiDialogRequest[] | undefined) ?? []);
-          if (config.hosts) setHostConfigs(config.hosts);
           if (msg.hosts) setHosts(msg.hosts as HostInfo[]);
           setProjects((msg.projects as Project[] | undefined) ?? []);
           setIssues((msg.issues as Record<string, IssueModules> | undefined) ?? {});
@@ -1520,7 +1512,6 @@ export function useServer() {
       setCommandTarget(workspaceId && agentId ? { workspaceId, agentId } : null);
     }, []),
     hosts,
-    hostConfigs,
     systemStatus,
     quota,
     refreshQuota,
@@ -1686,11 +1677,6 @@ export function useServer() {
       },
       [send],
     ),
-    forwardMessage: useCallback(
-      (wsId: string, messageId: string, targetAgentId: string) =>
-        send({ type: "forward_message", workspaceId: wsId, messageId, targetAgentId }),
-      [send],
-    ),
     abort: useCallback(
       (wsId: string, agentId?: string) => send({ type: "abort", workspaceId: wsId, agentId }, true),
       [send],
@@ -1715,7 +1701,6 @@ export function useServer() {
         send({ type: "clear_context", workspaceId: wsId, agentId }),
       [send],
     ),
-    restartServer: useCallback(() => send({ type: "restart_server" }), [send]),
     archiveWorkspace: useCallback(
       (wsId: string) => send({ type: "archive_workspace", workspaceId: wsId }, true),
       [send],

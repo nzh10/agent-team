@@ -14,6 +14,21 @@ import { autoPanelWidth } from "../src/panels/SidePanel";
 import { FileOpenContext, linkFileRef, parseFileRef, splitFileRef } from "../src/chat/fileRef";
 import { MdBlock } from "../src/chat/markdown";
 import type { Workspace } from "../src/state/useServer";
+import { deferred } from "./helpers/deferred";
+
+function stubFileViews(
+  find: (path: string) => FileView | { error: string; status: number } | undefined,
+) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((url: string) => {
+      const path = new URLSearchParams(url.split("?")[1]).get("path")!;
+      const view = find(path) ?? { error: "No such file or directory", status: 404 };
+      const status = "status" in view ? view.status : 200;
+      return Promise.resolve({ ok: status === 200, status, json: () => Promise.resolve(view) });
+    }),
+  );
+}
 
 describe("parseFileRef", () => {
   it("reads paths with lines and ranges", () => {
@@ -135,16 +150,10 @@ describe("FilesPanel", () => {
 
   beforeEach(() => {
     requested.length = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((url: string) => {
-        const path = new URLSearchParams(url.split("?")[1]).get("path")!;
-        requested.push(path);
-        const v = views[path] ?? { error: "No such file or directory", status: 404 };
-        const status = "status" in v ? v.status : 200;
-        return Promise.resolve({ ok: status === 200, status, json: () => Promise.resolve(v) });
-      }),
-    );
+    stubFileViews((path) => {
+      requested.push(path);
+      return views[path];
+    });
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -232,15 +241,10 @@ describe("FilesPanel", () => {
       views = { "/w/a.png": { kind: "image", path: "/w/a.png", size: blob.size } };
     });
 
-    function deferred<T>() {
-      let resolve!: (value: T) => void;
-      const promise = new Promise<T>((done) => {
-        resolve = done;
-      });
-      return { promise, resolve };
-    }
-
     const pngResponse = () => ({ ok: true, blob: () => Promise.resolve(blob) });
+    class Item {
+      constructor(readonly data: Record<string, Promise<Blob>>) {}
+    }
 
     function rawResponse(respond: (signal: AbortSignal) => unknown) {
       const fetchMock = vi.mocked(fetch);
@@ -256,9 +260,6 @@ describe("FilesPanel", () => {
     it("waits for one fetch and copies only the original PNG, with no HTML", async () => {
       const response = deferred<{ ok: boolean; blob: () => Promise<Blob> }>();
       const fetchMock = rawResponse(() => response.promise);
-      class Item {
-        constructor(readonly data: Record<string, Promise<Blob>>) {}
-      }
       const written = deferred<void>();
       const write = vi.fn((_items: Item[]) => written.promise);
       vi.stubGlobal("ClipboardItem", Item);
@@ -298,9 +299,6 @@ describe("FilesPanel", () => {
     it("fetches an oversized image only when the copy action needs its bytes", async () => {
       views["/w/a.png"] = { kind: "image", path: "/w/a.png", size: INLINE_IMAGE_LIMIT + 1 };
       const fetchMock = rawResponse(pngResponse);
-      class Item {
-        constructor(readonly data: Record<string, Promise<Blob>>) {}
-      }
       const write = vi.fn(async ([item]: Item[]) =>
         expect(await item.data["image/png"]).toBe(blob),
       );
@@ -632,20 +630,7 @@ describe("file references in replies", () => {
 
 describe("the Files panel's bar and listing", () => {
   let views: Record<string, FileView>;
-  beforeEach(() => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((url: string) => {
-        const path = new URLSearchParams(url.split("?")[1]).get("path")!;
-        const v = views[path];
-        return Promise.resolve({
-          ok: !!v,
-          status: v ? 200 : 404,
-          json: () => Promise.resolve(v ?? { error: "No such file or directory" }),
-        });
-      }),
-    );
-  });
+  beforeEach(() => stubFileViews((path) => views[path]));
   afterEach(() => vi.unstubAllGlobals());
 
   const repoRoots: FileRoot[] = [

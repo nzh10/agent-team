@@ -5,38 +5,18 @@ import { render, fireEvent, within, screen } from "@testing-library/react";
 import { BoardPage } from "../src/project/BoardPage";
 import { MdBlock } from "../src/chat/markdown";
 import { issueIdPattern, issueSummary } from "../src/project/issues";
-import type { Issue, IssueModule, IssueModules, Objective, Project } from "../src/state/useServer";
+import type { Issue, IssueModule, IssueModules, Project } from "../src/state/useServer";
+import { boardProject, boardProps, renderBoard } from "./helpers/board";
+import { objective as o } from "./helpers/fixtures";
 
-const o = (id: string, over: Partial<Objective> = {}): Objective => ({
-  id,
-  area: id.split("/")[0],
-  title: id,
-  goal: `goal of ${id}`,
-  status: "active",
-  priority: "normal",
-  dependsOn: [],
-  tasks: [],
-  decisions: [],
-  sessions: [],
-  updatedAt: 1_800_000_000_000,
-  ...over,
-});
-
-const project: Project = {
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: 0,
-  objectives: [
-    o("service/release-fixes", {
-      title: "Release fixes",
-      context: "Fix 10-06#1 first, then `10-06#1` stays code; 10-06#14 is no issue.",
-      tasks: [{ id: "t1", text: "修10-06#1：CUDA headers", state: "todo" }],
-    }),
-    o("index/hosts", { title: "Hosts" }),
-  ],
-};
+const project = boardProject([
+  o("service/release-fixes", {
+    title: "Release fixes",
+    context: "Fix 10-06#1 first, then `10-06#1` stays code; 10-06#14 is no issue.",
+    tasks: [{ id: "t1", text: "修10-06#1：CUDA headers", state: "todo" }],
+  }),
+  o("index/hosts", { title: "Hosts" }),
+]);
 
 const issues: IssueModules = [
   {
@@ -102,21 +82,15 @@ const issues: IssueModules = [
   { id: "03-paths", error: "Unexpected character at row 2" },
 ];
 
-function page(p: Project = project, modules: IssueModules = issues) {
-  const props = {
-    onClose: vi.fn(),
-    onOpenSession: vi.fn(),
-    onAskLead: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-  };
-  const utils = render(<BoardPage project={p} issues={modules} sessions={new Map()} {...props} />);
-  const rows = () =>
-    [...utils.container.querySelectorAll(".bi-row .bp-id")].map((e) => e.textContent);
-  const toIssues = () => fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
-  const nav = () => within(screen.getByRole("navigation", { name: "Issue filters" }));
-  return { ...utils, ...props, rows, toIssues, nav };
-}
+const rows = () => [...document.querySelectorAll(".bi-row .bp-id")].map((e) => e.textContent);
+const toIssues = () => fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+const nav = () => within(screen.getByRole("navigation", { name: "Issue filters" }));
+const page = (p = project, modules = issues) => ({
+  ...renderBoard(p, { issues: modules }),
+  rows,
+  toIssues,
+  nav,
+});
 
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
@@ -272,16 +246,6 @@ describe("issue view edge cases from review", () => {
     objectives: [],
     ...over,
   });
-  const props = {
-    onClose: vi.fn(),
-    onOpenSession: vi.fn(),
-    onAskLead: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-  };
-  const rows = () => [...document.querySelectorAll(".bi-row .bp-id")].map((e) => e.textContent);
-  const nav = () => within(screen.getByRole("navigation", { name: "Issue filters" }));
-
   it("leaves the issue opened from an objective in view, not scrolled back to the top", () => {
     const calls: string[] = [];
     Element.prototype.scrollIntoView = function (this: Element) {
@@ -301,9 +265,8 @@ describe("issue view edge cases from review", () => {
 
   it("keeps a picked tag on show, to be cleared, once no issue has it", () => {
     const one = [mod("m", { issues: [issue("a", { tags: ["崩溃"] }), issue("b")] })];
-    const { rerender } = render(
-      <BoardPage project={project} issues={one} sessions={new Map()} {...props} />,
-    );
+    const props = boardProps();
+    const { rerender } = render(<BoardPage project={project} issues={one} {...props} />);
     fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
     fireEvent.click(nav().getByRole("button", { name: /^崩溃/ }));
     expect(rows()).toEqual(["a"]);
@@ -311,8 +274,8 @@ describe("issue view edge cases from review", () => {
       <BoardPage
         project={project}
         issues={[mod("m", { issues: [issue("b")] })]}
-        sessions={new Map()}
         {...props}
+        sessions={new Map()}
       />,
     );
     const chip = nav().getByRole("button", { name: /^崩溃/ });
@@ -329,10 +292,8 @@ describe("issue view edge cases from review", () => {
         issues: [issue("a")],
       }),
     ];
-    const { container } = render(
-      <BoardPage project={project} issues={m} sessions={new Map()} {...props} />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+    const { container } = page(project, m);
+    toIssues();
     expect(container.querySelector(".bi-module-notes")!.textContent).toBe(
       "All paths go through one table.",
     );
@@ -350,8 +311,8 @@ describe("issue view edge cases from review", () => {
         ],
       }),
     ];
-    render(<BoardPage project={project} issues={m} sessions={new Map()} {...props} />);
-    fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+    page(project, m);
+    toIssues();
     const h = nav().getByRole("button", { name: /^H / });
     expect(h.textContent).toBe("H 1");
     fireEvent.click(h);
@@ -363,20 +324,16 @@ describe("issue view edge cases from review", () => {
       mod("one", { issues: [issue("F7")] }),
       mod("two", { issues: [issue("F7", { text: "other" })] }),
     ];
-    const { container } = render(
-      <BoardPage project={project} issues={m} sessions={new Map()} {...props} />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+    const { container } = page(project, m);
+    toIssues();
     expect(rows()).toEqual(["F7"]);
     expect(container.querySelector(".bp-broken")!.textContent).toContain("F7");
   });
 
   it("links the issues an issue's text names", () => {
     const m = [mod("m", { issues: [issue("a", { text: "Same root as b#1." }), issue("b#1")] })];
-    const { container } = render(
-      <BoardPage project={project} issues={m} sessions={new Map()} {...props} />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+    const { container } = page(project, m);
+    toIssues();
     fireEvent.click(container.querySelector('[data-issue="a"]')!);
     fireEvent.click(
       screen.getByRole("complementary", { name: "Issue a" }).querySelector(".issue-ref")!,
@@ -390,10 +347,8 @@ describe("issue view edge cases from review", () => {
       objectives: [o("x/done", { title: "Done one", status: "done" as const })],
     };
     const m = [mod("m", { issues: [issue("a", { objectives: ["x/done"] })] })];
-    const { container } = render(
-      <BoardPage project={p} issues={m} sessions={new Map()} {...props} />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /^Issues/ }));
+    const { container } = page(p, m);
+    toIssues();
     fireEvent.click(container.querySelector('[data-issue="a"]')!);
     fireEvent.click(screen.getByRole("button", { name: "Done one" }));
     expect(container.querySelector('[data-objective="x/done"]')!.classList).toContain("selected");

@@ -3,6 +3,7 @@ import { resolve, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { TELEMETRY_ACTIONS, TELEMETRY_LAYOUTS, TELEMETRY_OUTCOMES } from "../shared/telemetry";
+import { jsonLine } from "./capture-io";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Row = { [key: string]: Json };
@@ -255,11 +256,11 @@ export function exportCorpus(
   } finally {
     db.close();
   }
-  const serialized = JSON.stringify(redactCorpus({ workspaces, telemetry }));
-  if (Buffer.byteLength(serialized) > 1024 * 1024)
+  const serialized = jsonLine(redactCorpus({ workspaces, telemetry }));
+  if (Buffer.byteLength(serialized) - 1 > 1024 * 1024)
     throw new Error("Corpus exceeds 1 MiB; select a smaller slice");
   assertRedactedCorpus(JSON.parse(serialized));
-  return serialized + "\n";
+  return serialized;
 }
 
 const journeyActions = new Set([
@@ -327,7 +328,7 @@ function run(args: string[]): void {
   );
   const projected = journey ? projectJourney(JSON.parse(corpus) as AnonCorpus) : undefined;
   if (projected) assertJourneyCorpus(projected);
-  writeFileSync(output, projected ? JSON.stringify(projected) + "\n" : corpus, {
+  writeFileSync(output, projected ? jsonLine(projected) : corpus, {
     flag: "wx",
     mode: 0o600,
   });

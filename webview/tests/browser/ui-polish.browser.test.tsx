@@ -5,42 +5,32 @@ import type {} from "@vitest/browser-playwright";
 import { MdBlock } from "../../src/chat/markdown";
 import { FileOpenContext } from "../../src/chat/fileRef";
 import { Icon } from "../../src/panels/Icon";
-import { FOLDED_IDLE_STORAGE_KEY, Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
+import { FOLDED_IDLE_STORAGE_KEY, Sidebar } from "../../src/sidebar/Sidebar";
 import { IDLE_FOLD_MS } from "../../src/sidebar/groups";
 import { Avatar } from "../../src/workspace/avatar";
-import type { AgentInfo, Project, Workspace } from "../../src/state/useServer";
+import type { Workspace } from "../../src/state/useServer";
+import { themedViewport } from "../helpers/browser";
+import {
+  agent as makeAgent,
+  project as makeProject,
+  workspace as makeWorkspace,
+} from "../helpers/fixtures";
+import { sidebarProps as makeSidebarProps, stubHealth as healthyProbe } from "../helpers/sidebar";
+import { paintedContrast } from "../helpers/contrast";
 import "../../src/styles.css";
 
 const NOW = 1_800_000_000_000;
-const agent: AgentInfo = {
-  id: "agent",
-  name: "Agent",
-  model: "model",
-  avatar: "A",
-  color: "#528bff",
-  isDefault: true,
-};
-const project: Project = {
-  id: "project",
-  name: "Project",
-  root: "/repo",
-  leadWorkspaceId: "lead",
-  createdAt: NOW,
-  objectives: [],
-};
-const workspace = (id: string, order: number, fields: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "Project",
-  hostId: "local",
-  cwd: "/repo",
-  agents: [agent],
-  messages: [],
-  createdAt: NOW + order,
-  lastMessageAt: NOW + order,
-  projectLink: { projectId: project.id, role: id === "lead" ? "lead" : "worker" },
-  ...fields,
-});
+const agent = makeAgent("agent", { model: "model", color: "#528bff" });
+const project = makeProject("project", { createdAt: NOW });
+const workspace = (id: string, order: number, fields: Partial<Workspace> = {}) =>
+  makeWorkspace(id, {
+    project: "Project",
+    agents: [agent],
+    createdAt: NOW + order,
+    lastMessageAt: NOW + order,
+    projectLink: { projectId: project.id, role: id === "lead" ? "lead" : "worker" },
+    ...fields,
+  });
 const lead = workspace("lead", 0);
 const no = () => {};
 const get = <T extends HTMLElement = HTMLElement>(selector: string) => {
@@ -52,37 +42,8 @@ const style = (element: Element) => getComputedStyle(element);
 const rect = (element: Element) => element.getBoundingClientRect();
 const row = (name: string) => get(`.task-item:has(.clip[title="${name}"])`);
 
-function sidebarProps(workspaces: Workspace[], over: Partial<SidebarProps> = {}): SidebarProps {
-  return {
-    workspaces,
-    projects: [project],
-    activeWsId: lead.id,
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: no,
-    onDelete: no,
-    onToggleGroup: no,
-    onSearchChange: no,
-    onJump: no,
-    onCreate: no,
-    onCreateIn: no,
-    onReplayDemo: no,
-    onDebugSnapshot: no,
-    onPurgeArchived: no,
-    ...over,
-  };
-}
-
-function healthyProbe() {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ issues: [] }) })),
-  );
-}
+const sidebarProps = (workspaces: Workspace[]) =>
+  makeSidebarProps({ workspaces, projects: [project], activeWsId: lead.id, now: NOW }, () => no);
 
 afterEach(() => {
   cleanup();
@@ -249,8 +210,7 @@ it("restores manual folds and age-based quiet folds on a fresh mount", async () 
 it.each(["light", "dark"] as const)(
   "keeps compact avatar rings faint and a balanced group plus (%s)",
   async (theme) => {
-    await page.viewport(1280, 800);
-    document.documentElement.dataset.theme = theme;
+    await themedViewport(1280, 800, theme);
     const { container } = render(
       <>
         <Avatar avatar="A" color="#528bff" name="Agent" size={16} />
@@ -327,25 +287,8 @@ it("uses a calm passive surface for .archived-banner (with actionable Restore) a
   healthyProbe();
   vi.spyOn(Date, "now").mockReturnValue(NOW);
 
-  const luminance = (channels: Uint8ClampedArray) => {
-    const [r, g, b] = Array.from(channels.slice(0, 3), (byte) => {
-      const c = byte / 255;
-      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-    });
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  };
-  const contrastOf = (fg: string, bg: string) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = 1;
-    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, 1, 1);
-    const a = luminance(ctx.getImageData(0, 0, 1, 1).data);
-    ctx.fillStyle = fg;
-    ctx.fillRect(0, 0, 1, 1);
-    const b = luminance(ctx.getImageData(0, 0, 1, 1).data);
-    return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
-  };
+  const contrastOf = (foreground: string, background: string) =>
+    paintedContrast(foreground, [background]);
 
   const shadows: Record<string, string> = {};
   for (const theme of ["light", "dark"] as const) {

@@ -2,11 +2,17 @@ import { act, cleanup, fireEvent, render, within } from "@testing-library/react"
 import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { App } from "../../src/App";
 import { ICONS } from "../../src/panels/Icon";
 import { Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
-import type { AgentInfo, Project, Workspace } from "../../src/state/useServer";
-import { FakeSocket } from "../fakeSocket";
+import type { AgentInfo, Workspace } from "../../src/state/useServer";
+import { FakeSocket, initFrame } from "../fakeSocket";
+import { mountFixedApp } from "../helpers/browser";
+import {
+  agent as makeAgent,
+  project as makeProject,
+  workspace as makeWorkspace,
+} from "../helpers/fixtures";
+import { sidebarProps as makeSidebarProps, stubHealth as healthyProbe } from "../helpers/sidebar";
 import "../../src/fonts/sarasa-mono-sc/regular/result.css";
 import "../../src/fonts/sarasa-mono-sc/bold/result.css";
 import "../../src/styles.css";
@@ -24,37 +30,17 @@ const get = <T extends HTMLElement = HTMLElement>(root: ParentNode, selector: st
   return element!;
 };
 
-const agent: AgentInfo = {
-  id: "agent",
-  name: "Agent",
-  model: "model",
-  avatar: "A",
-  color: "#888",
-  isDefault: true,
-};
-const project: Project = {
-  id: "project",
-  name: "Project",
-  root: "/repo",
-  leadWorkspaceId: "lead",
-  createdAt: NOW,
-  objectives: [],
-};
-function workspace(id: string, fields: Partial<Workspace> = {}): Workspace {
-  return {
-    id,
-    name: id,
+const agent = makeAgent("agent", { model: "model" });
+const project = makeProject("project", { createdAt: NOW });
+const workspace = (id: string, fields: Partial<Workspace> = {}) =>
+  makeWorkspace(id, {
     project: "Project",
-    hostId: "local",
-    cwd: "/repo",
     agents: [agent],
-    messages: [],
     createdAt: NOW,
     lastMessageAt: NOW,
     projectLink: { projectId: project.id, role: id === "lead" ? "lead" : "worker" },
     ...fields,
-  };
-}
+  });
 const sidebarWorkspaces = [
   workspace("lead"),
   workspace("plain"),
@@ -63,39 +49,19 @@ const sidebarWorkspaces = [
   workspace("two-line", { archivedAt: NOW - 1000, cwd: "/elsewhere/folder" }),
 ];
 
-function sidebarProps(activeWsId: string): SidebarProps {
-  return {
-    workspaces: sidebarWorkspaces,
-    projects: [project],
-    activeWsId,
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: no,
-    onDelete: no,
-    onDeleteProject: no,
-    onToggleGroup: no,
-    onSearchChange: no,
-    onJump: no,
-    onCreate: no,
-    onCreateProject: no,
-    onCreateIn: no,
-    onReplayDemo: no,
-    onDebugSnapshot: no,
-    onPurgeArchived: no,
-    onArchiveWorkspace: no,
-  };
-}
-
-function healthyProbe() {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ issues: [] }) })),
+const sidebarProps = (activeWsId: string): SidebarProps =>
+  makeSidebarProps(
+    {
+      workspaces: sidebarWorkspaces,
+      projects: [project],
+      activeWsId,
+      now: NOW,
+      onDeleteProject: no,
+      onCreateProject: no,
+      onArchiveWorkspace: no,
+    },
+    () => no,
   );
-}
 
 let touch = false;
 afterEach(async () => {
@@ -202,21 +168,11 @@ function bootApp() {
   FakeSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeSocket);
   healthyProbe();
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  render(<App />, { container: root });
+  const { container: root } = mountFixedApp();
   const socket = FakeSocket.instances.at(-1)!;
   act(() => {
     socket.open();
-    socket.receive({
-      type: "init",
-      workspaces: [appWorkspace],
-      projects: [project],
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-    });
+    socket.receive(initFrame([appWorkspace], { projects: [project] }));
   });
   return root;
 }

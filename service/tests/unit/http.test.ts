@@ -15,6 +15,7 @@ import { validatePiAttachments } from "../../src/session/pi";
 import { resolveFilePath } from "../../src/repo/files";
 import type { AuthConfig } from "../../src/config/config";
 import { lsofBinary } from "../lsof";
+import { loopbackRequest, type RequestOptions } from "./helpers/loopback-request";
 
 vi.mock("fs", async (original) => {
   const fs = await original<typeof import("fs")>();
@@ -47,36 +48,8 @@ const AUTH: AuthConfig = {
   max_age_days: 1,
 };
 
-function request(
-  pathname: string,
-  opts: { method?: string; headers?: Record<string, string>; body?: string | Buffer } = {},
-): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: pathname,
-        method: opts.method ?? "GET",
-        headers: opts.headers,
-        agent: false,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () =>
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: res.headers,
-            body: Buffer.concat(chunks),
-          }),
-        );
-      },
-    );
-    req.on("error", reject);
-    req.end(opts.body);
-  });
-}
+const request = (pathname: string, opts?: RequestOptions) =>
+  loopbackRequest(port, pathname, opts, false);
 
 const sign = (secret: string, payload: string) =>
   crypto.createHmac("sha256", secret).update(payload).digest("hex");
@@ -515,71 +488,34 @@ describe("uploads and snapshots", () => {
     expect((await request(`/${a.url}`)).status).toBe(302);
   });
 
-  it("matches stored upload extension to image magic bytes so re-encoded PNGs pass Pi validation", async () => {
-    const cookie = await login();
-    const jpegBytes = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
-    const reencodedPng = await request("/upload", {
-      method: "POST",
-      headers: {
-        Cookie: cookie,
-        "Content-Type": "image/jpeg",
-        "X-Filename": "image.png",
-      },
-      body: jpegBytes,
-    });
-    const jpg = JSON.parse(reencodedPng.body.toString()) as { url: string; name: string };
-    expect(jpg.name).toBe("image.png");
-    expect(jpg.url).toMatch(/^uploads\/\d+-[a-z0-9]+\.jpg$/);
-    expect(() => validatePiAttachments(uploads, [path.basename(jpg.url)])).not.toThrow();
-    const servedJpg = await request(`/${jpg.url}`, { headers: { Cookie: cookie } });
-    expect(servedJpg.headers["content-type"]).toBe("image/jpeg");
-
-    const pngBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
-    const utf8Png = await request("/upload", {
-      method: "POST",
-      headers: {
-        Cookie: cookie,
-        "Content-Type": "image/png",
-        "X-Filename": encodeURIComponent("屏幕截图.PNG"),
-      },
-      body: pngBytes,
-    });
-    const png = JSON.parse(utf8Png.body.toString()) as { url: string; name: string };
-    expect(png.name).toBe("屏幕截图.PNG");
-    expect(png.url).toMatch(/^uploads\/\d+-[a-z0-9]+\.png$/);
-    expect(() => validatePiAttachments(uploads, [path.basename(png.url)])).not.toThrow();
-    const servedPng = await request(`/${png.url}`, { headers: { Cookie: cookie } });
-    expect(servedPng.headers["content-type"]).toBe("image/png");
-
-    const webpBytes = Buffer.from("52494646100000005745425056503820", "hex");
-    const webpRes = await request("/upload", {
-      method: "POST",
-      headers: {
-        Cookie: cookie,
-        "Content-Type": "image/webp",
-        "X-Filename": "100%.png",
-      },
-      body: webpBytes,
-    });
-    const webp = JSON.parse(webpRes.body.toString()) as { url: string; name: string };
-    expect(webp.name).toBe("100%.png");
-    expect(webp.url).toMatch(/^uploads\/\d+-[a-z0-9]+\.webp$/);
-    expect(() => validatePiAttachments(uploads, [path.basename(webp.url)])).not.toThrow();
-
-    const gifBytes = Buffer.from("GIF89a\x01\x00\x01\x00", "ascii");
-    const gifRes = await request("/upload", {
-      method: "POST",
-      headers: {
-        Cookie: cookie,
-        "Content-Type": "image/gif",
-        "X-Filename": "anim.png",
-      },
-      body: gifBytes,
-    });
-    const gif = JSON.parse(gifRes.body.toString()) as { url: string; name: string };
-    expect(gif.url).toMatch(/^uploads\/\d+-[a-z0-9]+\.gif$/);
-    expect(() => validatePiAttachments(uploads, [path.basename(gif.url)])).not.toThrow();
-  });
+  it.each([
+    ["image/jpeg", "image.png", "image.png", "ffd8ffe000104a46494600010100000100010000ffd9", "jpg"],
+    [
+      "image/png",
+      encodeURIComponent("屏幕截图.PNG"),
+      "屏幕截图.PNG",
+      "89504e470d0a1a0a0000000d49484452",
+      "png",
+    ],
+    ["image/webp", "100%.png", "100%.png", "52494646100000005745425056503820", "webp"],
+    ["image/gif", "anim.png", "anim.png", "47494638396101000100", "gif"],
+  ])(
+    "stores %s bytes with the matching extension for Pi attachments",
+    async (mime, header, name, hex, ext) => {
+      const cookie = await login();
+      const uploaded = await request("/upload", {
+        method: "POST",
+        headers: { Cookie: cookie, "Content-Type": mime, "X-Filename": header },
+        body: Buffer.from(hex, "hex"),
+      });
+      const image = JSON.parse(uploaded.body.toString()) as { url: string; name: string };
+      expect(image.name).toBe(name);
+      expect(image.url).toMatch(new RegExp(`^uploads/\\d+-[a-z0-9]+\\.${ext}$`));
+      expect(() => validatePiAttachments(uploads, [path.basename(image.url)])).not.toThrow();
+      const served = await request(`/${image.url}`, { headers: { Cookie: cookie } });
+      expect(served.headers["content-type"]).toBe(mime);
+    },
+  );
 
   it.each([
     ["Image/WebP; mode=example", "photo.png", ".webp"],

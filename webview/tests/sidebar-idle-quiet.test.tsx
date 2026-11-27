@@ -3,32 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FOLDED_IDLE_STORAGE_KEY, Sidebar, type SidebarProps } from "../src/sidebar/Sidebar";
 import { IDLE_FOLD_MS } from "../src/sidebar/groups";
 import { SILENCE_MS, StreamSilence } from "../src/sidebar/StreamSilence";
-import type { AgentInfo, Project, Workspace } from "../src/state/useServer";
+import type { Project, Workspace } from "../src/state/useServer";
+import { agent, project as makeProject, workspace } from "./helpers/fixtures";
+import { sidebarProps } from "./helpers/sidebar";
 
 const NOW = 1_800_000_000_000;
-const baseAgent: AgentInfo = {
-  id: "a1",
-  name: "Agent",
-  model: "model",
-  avatar: "A",
-  color: "#888",
-  isDefault: true,
-};
-
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  hostId: "local",
-  project: "repo",
-  cwd: "/repo",
-  agents: [baseAgent],
-  messages: [],
-  createdAt: NOW - 1000,
-  lastMessageAt: NOW - 1000,
-  git: null,
-  pr: null,
-  ...over,
-});
+const baseAgent = agent("a1", { model: "model" });
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, {
+    agents: [baseAgent],
+    createdAt: NOW - 1000,
+    lastMessageAt: NOW - 1000,
+    git: null,
+    pr: null,
+    ...over,
+  });
 
 beforeEach(() => {
   const values = new Map<string, string>();
@@ -129,50 +118,32 @@ describe("StreamSilence", () => {
 });
 
 describe("Sidebar idle disclosure and worker archive action", () => {
-  const project: Project = {
-    id: "p1",
-    name: "agent-team",
-    root: "/repo",
-    leadWorkspaceId: "lead",
-    createdAt: NOW - 5000,
-    objectives: [],
-  };
+  const project = makeProject("p1", { name: "agent-team", createdAt: NOW - 5000 });
 
-  const baseProps = (over: Partial<SidebarProps> = {}): SidebarProps => ({
-    workspaces: [
-      ws("lead", { projectLink: { projectId: "p1", role: "lead" } }),
-      ws("done-worker", {
-        name: "Done Worker",
-        lastResult: "done",
-        projectLink: { projectId: "p1", role: "worker" },
-      }),
-      ws("idle-worker", {
-        name: "Idle Worker",
-        projectLink: { projectId: "p1", role: "worker" },
-      }),
-    ],
-    projects: [project],
-    activeWsId: "lead",
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: vi.fn(),
-    onDelete: vi.fn(),
-    onToggleGroup: vi.fn(),
-    onSearchChange: vi.fn(),
-    onJump: vi.fn(),
-    onCreate: vi.fn(),
-    onCreateIn: vi.fn(),
-    onReplayDemo: vi.fn(),
-    onDebugSnapshot: vi.fn(),
-    onPurgeArchived: vi.fn(),
-    onArchiveWorkspace: vi.fn(),
-    onArchiveProject: vi.fn(),
-    ...over,
-  });
+  const baseProps = (over: Partial<SidebarProps> = {}) =>
+    sidebarProps(
+      {
+        workspaces: [
+          ws("lead", { projectLink: { projectId: "p1", role: "lead" } }),
+          ws("done-worker", {
+            name: "Done Worker",
+            lastResult: "done",
+            projectLink: { projectId: "p1", role: "worker" },
+          }),
+          ws("idle-worker", {
+            name: "Idle Worker",
+            projectLink: { projectId: "p1", role: "worker" },
+          }),
+        ],
+        projects: [project],
+        activeWsId: "lead",
+        now: NOW,
+        onArchiveWorkspace: vi.fn(),
+        onArchiveProject: vi.fn(),
+        ...over,
+      },
+      () => vi.fn(),
+    );
 
   it("renders ... (N) disclosure with sibling Fold (+M) (no nested buttons) and unfolds items below", () => {
     const props = baseProps();

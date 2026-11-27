@@ -1,7 +1,8 @@
 // npm run capture -- pi basic-turn   (one account-backed turn, no tools)
 // npm run capture -- pi extract FILE LINE   (one v3 message, anonymized, stdout)
 import fs from "node:fs";
-import { once } from "node:events";
+import { trackCaptureChild } from "./capture-child.ts";
+import { jsonLine, parseJsonLine, writeJsonl } from "./capture-io.ts";
 import { validateTurn } from "../service/tests/snap/pi-capture-contract.ts";
 import type { PiFrame } from "../service/tests/snap/fixture.ts";
 import { captures } from "../service/tests/snap/pi-captures.ts";
@@ -25,13 +26,6 @@ interface Line {
   command?: string;
   success?: boolean;
   data?: { messages?: unknown[] };
-}
-function parse(row: string): Line {
-  try {
-    return JSON.parse(row) as Line;
-  } catch {
-    throw new Error("Invalid JSON in capture input");
-  } // Never echo private input.
 }
 
 const keys = new Set(
@@ -187,7 +181,7 @@ export async function capturePi(args: string[], snap: string) {
     let i = 0;
     try {
       for await (const row of rows) {
-        const rec = parse(row);
+        const rec = parseJsonLine<Line>(row);
         if (++i === 1 && (rec.type !== "session" || rec.version !== 3))
           throw new Error(
             "Not a Pi v3 session (workspace stream logs are projections, not Pi frames)",
@@ -209,7 +203,7 @@ export async function capturePi(args: string[], snap: string) {
             timestamp: recordedAt,
           };
           const session = path.join(dir, "excerpt.jsonl");
-          fs.writeFileSync(
+          writeJsonl(
             session,
             [
               {
@@ -220,9 +214,7 @@ export async function capturePi(args: string[], snap: string) {
                 cwd: dir,
               },
               selected,
-            ]
-              .map((x) => JSON.stringify(x))
-              .join("\n") + "\n",
+            ],
             { mode: 0o600 },
           );
           const output = execFileSync(
@@ -253,7 +245,7 @@ export async function capturePi(args: string[], snap: string) {
               stdio: ["pipe", "pipe", "ignore"],
             },
           );
-          const frame = parse(output);
+          const frame = parseJsonLine<Line>(output);
           if (
             !frame.success ||
             frame.command !== "get_messages" ||
@@ -359,9 +351,11 @@ export async function capturePi(args: string[], snap: string) {
       ],
       { cwd: dir, stdio: ["pipe", "pipe", "ignore"] },
     );
-    const closed = once(child, "close");
-    void closed.catch(() => {}); // Propagated on cleanup, even if spawn failed before stdout EOF.
-    child.stdin.on("error", () => child.kill("SIGTERM"));
+    const closeChild = trackCaptureChild(
+      child,
+      queued ? 183_000 : 93_000,
+      queued ? 180_000 : 90_000,
+    );
     const rows = readline.createInterface({ input: child.stdout });
     const started = Date.now();
     const entries: unknown[] = [];
@@ -369,10 +363,8 @@ export async function capturePi(args: string[], snap: string) {
     const step = (i: number) => add({ step: { ...steps[i], i } });
     const send = (sent: object, wire = sent) => {
       add({ sent });
-      child.stdin.write(JSON.stringify(wire) + "\n");
+      child.stdin.write(jsonLine(wire));
     };
-    const timer = setTimeout(() => child.kill("SIGTERM"), queued ? 180_000 : 90_000);
-    const deadline = setTimeout(() => child.kill("SIGKILL"), queued ? 183_000 : 93_000);
     try {
       step(0);
       const prompt = { type: "prompt", message: first.text };
@@ -391,7 +383,7 @@ export async function capturePi(args: string[], snap: string) {
       for await (const row of rows) {
         bytes += Buffer.byteLength(row);
         if (bytes > 8 * 1024 * 1024) throw new Error("Pi tape exceeded size cap");
-        const frame = parse(row);
+        const frame = parseJsonLine<Line>(row);
         if (
           acp &&
           frame.type === "tool_execution_start" &&
@@ -470,24 +462,16 @@ export async function capturePi(args: string[], snap: string) {
             name,
             entries.flatMap((e) => (e as { frame?: PiFrame }).frame ?? []),
           );
-          fs.writeFileSync(
-            path.join(snap, `pi/${name}.jsonl`),
-            [{ header }, ...entries].map((x) => JSON.stringify(x)).join("\n") + "\n",
-          );
+          writeJsonl(path.join(snap, `pi/${name}.jsonl`), [{ header }, ...entries]);
           return;
         }
       }
       throw new Error("Incomplete capture");
     } finally {
-      clearTimeout(timer);
-      clearTimeout(deadline);
-      child.stdin.end();
       rows.close();
-      const reap = setTimeout(() => child.kill("SIGKILL"), 3000);
       try {
-        await closed;
+        await closeChild();
       } finally {
-        clearTimeout(reap);
         fs.rmSync(dir, { recursive: true, force: true });
       }
     }

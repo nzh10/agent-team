@@ -1,5 +1,5 @@
 // Compose only observed scenario frames. Replay markers are not wire data.
-import fs from "node:fs";
+import { writeJsonl } from "./capture-io.ts";
 import path from "node:path";
 import { sanitizer } from "./capture-pi.ts";
 
@@ -45,10 +45,7 @@ export function moreExcerpts(sessions, snap) {
           model: "pi-e2e/scenario",
           recordedAt: new Date(last).toISOString(),
         };
-        fs.writeFileSync(
-          path.join(snap, "pi", fixture + ".jsonl"),
-          [{ header }, ...entries].map((r) => JSON.stringify(r)).join("\n") + "\n",
-        );
+        writeJsonl(path.join(snap, "pi", `${fixture}.jsonl`), [{ header }, ...entries]);
       },
     };
   }

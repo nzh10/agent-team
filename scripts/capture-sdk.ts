@@ -10,11 +10,11 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import { capturePi } from "./capture-pi.ts";
+import { writeJsonl } from "./capture-io.ts";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  type Backend,
   type Entry,
   type Fixture,
   type Header,
@@ -37,33 +37,18 @@ const MAX_PER_RUN = 4;
 // A request can hang ~2 min before the CLI times it out and retries.
 const STEP_DEADLINE_MS = 300_000;
 
-const trim = tapeTrim;
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 class Tape {
   entries: Entry[] = [];
   private t0 = Date.now();
-  cli: string | undefined;
   add(e: Omit<Entry, "t">): void {
     this.entries.push({ t: Date.now() - this.t0, ...e } as Entry);
   }
   frame(f: unknown): void {
-    this.add({ frame: trim(f) });
+    this.add({ frame: tapeTrim(f) });
   }
 }
-
-interface Driver {
-  send(text: string): Promise<void>;
-  wait(until: "result" | "idle" | number | { frame: string }): Promise<void>;
-  end(): Promise<void>;
-  abort(): Promise<void>;
-  interrupt(): Promise<void>;
-  compact(): Promise<void>;
-  cli(): string | undefined;
-}
-
-// --- codex ------------------------------------------------------------------
 
 // What a recording must not carry: the account's identity and the machine's.
 const REDACT = new Set(["email", "accountId", "installationId", "serverName"]);
@@ -83,7 +68,7 @@ function tapedAppServer(tape: Tape, args: string[], ended: () => boolean): Trans
   const t = spawnAppServer({ cwd: RECORD_CWD, args });
   return {
     write: (m) => {
-      tape.add({ sent: trim(m) });
+      tape.add({ sent: tapeTrim(m) });
       t.write(m);
     },
     onMessage: (cb) =>
@@ -101,7 +86,7 @@ function tapedAppServer(tape: Tape, args: string[], ended: () => boolean): Trans
   };
 }
 
-function codexDriver(tape: Tape, model: string, fixture: Fixture, api?: { url: string }): Driver {
+function codexDriver(tape: Tape, model: string, fixture: Fixture, api?: { url: string }) {
   const version = execFileSync(codexBinary(), ["--version"], { encoding: "utf-8" }).trim();
   // The stand-in is a provider of its own, whatever the user's config.toml
   // picks; the ChatGPT login still signs its requests.
@@ -218,7 +203,7 @@ function codexDriver(tape: Tape, model: string, fixture: Fixture, api?: { url: s
   };
 
   return {
-    async send(text) {
+    async send(text: string) {
       const client = await ensure();
       const input = [{ type: "text", text, text_elements: [] }];
       seen = [];
@@ -243,7 +228,7 @@ function codexDriver(tape: Tape, model: string, fixture: Fixture, api?: { url: s
       });
       if (completed === 0) turnId = res.turn.id;
     },
-    async wait(until) {
+    async wait(until: Extract<Step, { op: "wait" }>["for"]) {
       if (typeof until === "number") return sleep(until);
       const deadline = Date.now() + STEP_DEADLINE_MS;
       while (Date.now() < deadline) {
@@ -275,7 +260,7 @@ function codexDriver(tape: Tape, model: string, fixture: Fixture, api?: { url: s
       completed = 0;
       await client.request("thread/compact/start", { threadId });
     },
-    cli: () => version,
+    cli: version,
   };
 }
 
@@ -318,7 +303,7 @@ async function codexUsageLimitApi(): Promise<{ url: string; close(): void }> {
 
 // --- run --------------------------------------------------------------------
 
-function materialize(backend: Backend, files: Fixture["files"]): void {
+function materialize(files: Fixture["files"]): void {
   fs.mkdirSync(RECORD_CWD, { recursive: true });
   for (const [rel, content] of Object.entries(files ?? {})) {
     const file = path.join(RECORD_CWD, rel);
@@ -328,11 +313,12 @@ function materialize(backend: Backend, files: Fixture["files"]): void {
   }
 }
 
-async function record(backend: Backend, name: string): Promise<void> {
+async function record(name: string): Promise<void> {
+  const backend = "codex";
   const file = path.join(SNAP, backend, `${name}.ts`);
   const fixture = ((await import(file)) as { default: Fixture }).default;
   const model = fixture.model ?? DEFAULT_MODEL[backend];
-  materialize(backend, fixture.files);
+  materialize(fixture.files);
   const tape = new Tape();
   const api = fixture.api === "usage-limit" ? await codexUsageLimitApi() : undefined;
   const driver = codexDriver(tape, model, fixture, api);
@@ -376,14 +362,11 @@ async function record(backend: Backend, name: string): Promise<void> {
     fixture: name,
     description: fixture.description,
     model,
-    cli: driver.cli(),
+    cli: driver.cli,
     recordedAt: new Date().toISOString(),
   };
   const out = path.join(SNAP, backend, failure ? `${name}.failed.jsonl` : `${name}.jsonl`);
-  fs.writeFileSync(
-    out,
-    [JSON.stringify({ header }), ...tape.entries.map((e) => JSON.stringify(e))].join("\n") + "\n",
-  );
+  writeJsonl(out, [{ header }, ...tape.entries]);
   console.log(`${backend}/${name}: ${tape.entries.length} entries -> ${path.relative(ROOT, out)}`);
   if (failure) throw failure;
 }
@@ -406,6 +389,6 @@ for (const [i, name] of names.entries()) {
     console.log(`pausing ${PAUSE_MS / 1000}s before ${name}`);
     await sleep(PAUSE_MS);
   }
-  await record(backend, name);
+  await record(name);
 }
 process.exit(0);

@@ -1,11 +1,17 @@
 // The board page wired into the App: asking the lead, dialogs over it, and
 // stream frames that must not re-render it.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, act, fireEvent } from "@testing-library/react";
+import { fireEvent } from "@testing-library/react";
 import * as board from "../src/project/board";
-import { App } from "../src/App";
 import type { Project, Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import {
+  bootProjectApp as boot,
+  cliceProject,
+  frame,
+  repoSession,
+  resetProjectApp,
+  setupProjectApp,
+} from "./helpers/projectApp";
 
 vi.mock("../src/project/board", async (orig) => {
   const real = await orig<typeof import("../src/project/board")>();
@@ -14,44 +20,27 @@ vi.mock("../src/project/board", async (orig) => {
 
 const NOW = Date.now();
 
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  git: null,
-  pr: null,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW - 5000,
-  ...over,
-});
+const ws = (id: string, fields?: Partial<Workspace>) => repoSession(id, NOW, fields);
 
-const project = (over: Partial<Project> = {}): Project => ({
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [
-    {
-      id: "core/modules",
-      area: "core",
-      title: "C++20 modules",
-      goal: "Serve modules",
-      status: "active",
-      priority: "high",
-      dependsOn: [],
-      tasks: [],
-      decisions: [],
-      sessions: [],
-      updatedAt: NOW,
-    },
-  ],
-  ...over,
-});
+const project = (over: Partial<Project> = {}) =>
+  cliceProject(NOW, {
+    objectives: [
+      {
+        id: "core/modules",
+        area: "core",
+        title: "C++20 modules",
+        goal: "Serve modules",
+        status: "active",
+        priority: "high",
+        dependsOn: [],
+        tasks: [],
+        decisions: [],
+        sessions: [],
+        updatedAt: NOW,
+      },
+    ],
+    ...over,
+  });
 
 const lead = ws("lead", {
   name: "clice · lead",
@@ -67,26 +56,6 @@ const worker = ws("w1", {
   lastMessageAt: NOW - 3000,
 });
 
-function boot(workspaces: Workspace[], projects: Project[], active: string) {
-  localStorage.setItem("activeWsId", active);
-  render(<App />);
-  const sock = FakeSocket.instances.at(-1)!;
-  const recv = (f: unknown) => act(() => sock.receive(f));
-  act(() => sock.open());
-  recv({
-    type: "init",
-    workspaces,
-    config: { presets: [], models: [], commands: [], hosts: {} },
-    hosts: [],
-    projects,
-  });
-  return { sock, recv };
-}
-
-const frame = () =>
-  act(() => {
-    vi.advanceTimersByTime(20);
-  });
 const textarea = () => document.querySelector("textarea") as HTMLTextAreaElement;
 const type = (text: string) => fireEvent.change(textarea(), { target: { value: text } });
 const openBoard = () =>
@@ -97,24 +66,8 @@ const ask = () => {
   frame();
 };
 
-beforeEach(() => {
-  vi.useFakeTimers();
-  const store = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => store.get(k) ?? null,
-    setItem: (k: string, v: string) => void store.set(k, String(v)),
-    removeItem: (k: string) => void store.delete(k),
-    clear: () => store.clear(),
-  });
-  FakeSocket.instances = [];
-  vi.stubGlobal("WebSocket", FakeSocket);
-  Element.prototype.scrollIntoView = vi.fn();
-});
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-  vi.useRealTimers();
-});
+beforeEach(setupProjectApp);
+afterEach(resetProjectApp);
 
 describe("Ask the lead", () => {
   it("adds the objective to the draft in the lead's composer", () => {
@@ -226,17 +179,7 @@ describe("Issues from the server", () => {
   const rows = () => [...document.querySelectorAll(".bi-row .bp-id")].map((e) => e.textContent);
 
   it("come with init and are replaced by a project's own message, apart from its objectives", () => {
-    localStorage.setItem("activeWsId", "lead");
-    render(<App />);
-    const sock = FakeSocket.instances.at(-1)!;
-    const recv = (f: unknown) => act(() => sock.receive(f));
-    act(() => sock.open());
-    recv({
-      type: "init",
-      workspaces: [lead, worker],
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-      projects: [project()],
+    const { recv } = boot([lead, worker], [project()], "lead", {
       issues: { p1: [module("paths", "10-07#1", "Bad path")] },
     });
     openBoard();

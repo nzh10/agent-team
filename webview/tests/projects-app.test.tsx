@@ -1,35 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, act, fireEvent } from "@testing-library/react";
-import { App } from "../src/App";
+import { act, fireEvent } from "@testing-library/react";
 import type { Message, Project, Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import type { FakeSocket } from "./fakeSocket";
+import {
+  bootProjectApp as boot,
+  cliceProject,
+  frame,
+  repoSession,
+  resetProjectApp,
+  setupProjectApp,
+} from "./helpers/projectApp";
 
 const NOW = Date.now();
 
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  git: null,
-  pr: null,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW - 5000,
-  ...over,
-});
-
-const project = (over: Partial<Project> = {}): Project => ({
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [],
-  ...over,
-});
+const ws = (id: string, fields?: Partial<Workspace>) => repoSession(id, NOW, fields);
+const project = (fields?: Partial<Project>) => cliceProject(NOW, fields);
 
 const lead = ws("lead", {
   name: "clice · lead",
@@ -54,46 +39,10 @@ const fromMsg = (from: Message["from"]): Message => ({
   from,
 });
 
-function boot(workspaces: Workspace[], projects: Project[], active: string) {
-  localStorage.setItem("activeWsId", active);
-  render(<App />);
-  const sock = FakeSocket.instances.at(-1)!;
-  const recv = (f: unknown) => act(() => sock.receive(f));
-  act(() => sock.open());
-  recv({
-    type: "init",
-    workspaces,
-    config: { presets: [], models: [], commands: [], hosts: {} },
-    hosts: [],
-    projects,
-  });
-  return { sock, recv };
-}
-
-const frame = () =>
-  act(() => {
-    vi.advanceTimersByTime(20);
-  });
 const title = () => document.querySelector(".panel-title")!.textContent;
 
-beforeEach(() => {
-  vi.useFakeTimers();
-  const store = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => store.get(k) ?? null,
-    setItem: (k: string, v: string) => void store.set(k, String(v)),
-    removeItem: (k: string) => void store.delete(k),
-    clear: () => store.clear(),
-  });
-  FakeSocket.instances = [];
-  vi.stubGlobal("WebSocket", FakeSocket);
-  Element.prototype.scrollIntoView = vi.fn();
-});
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-  vi.useRealTimers();
-});
+beforeEach(setupProjectApp);
+afterEach(resetProjectApp);
 
 describe("opening a project session from a link", () => {
   it("re-expands its collapsed folder group", () => {

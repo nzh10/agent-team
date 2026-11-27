@@ -1,71 +1,53 @@
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { App } from "../../src/App";
-import type { AgentInfo, Message } from "../../src/state/useServer";
-import { FakeSocket } from "../fakeSocket";
+import type { Message } from "../../src/state/useServer";
+import { FakeSocket, initFrame } from "../fakeSocket";
+import {
+  mountFixedApp,
+  nextPaint,
+  rowOffset,
+  scrollGap as gap,
+  scrollTo as move,
+} from "../helpers/browser";
+import { agent as makeAgent, message, workspace } from "../helpers/fixtures";
 import { healViewport, settleScroller } from "../../src/viewport/viewportHeal";
 import "../../src/styles.css";
 
-const agent: AgentInfo = {
-  id: "a",
-  name: "Agent",
-  model: "claude-opus-5-5",
-  color: "#888",
-  avatar: "A",
-  isDefault: true,
-};
+const agent = makeAgent("a");
 const title = "A workspace with a title much too long for a phone to show on a single line";
-const ws = {
-  id: "w",
-  name: title,
-  project: "repo",
-  cwd: "/repo",
-  hostId: "local",
-  agents: [agent],
-  messages: [],
-  createdAt: 1,
-};
-const turn = (i: number, extra: Partial<Message> = {}): Message => ({
-  id: `m${i}`,
-  kind: "agent",
-  agentId: "a",
-  status: "done",
-  timestamp: 1000 + i,
-  content: `Reply ${i}\n\n${"A paragraph of work in progress. ".repeat(4)}`,
-  ...extra,
-});
+const ws = workspace("w", { name: title, agents: [agent] });
+const turn = (i: number, extra: Partial<Message> = {}) =>
+  message(`m${i}`, {
+    timestamp: 1000 + i,
+    content: `Reply ${i}\n\n${"A paragraph of work in progress. ".repeat(4)}`,
+    ...extra,
+  });
 const history = Array.from({ length: 18 }, (_, i) => turn(i));
 const get = <T extends HTMLElement = HTMLElement>(selector: string) =>
   document.querySelector<T>(selector)!;
-const gap = (el: HTMLElement) => el.scrollHeight - el.clientHeight - el.scrollTop;
 const bottom = (el: HTMLElement) => expect.poll(() => gap(el)).toBeLessThanOrEqual(1);
-const nextPaint = () =>
-  new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
 
 function connect(sock: FakeSocket, workspaces = [ws]) {
   act(() => {
     sock.open();
-    sock.receive({
-      type: "init",
-      workspaces,
-      config: {
-        presets: [],
-        models: [],
-        commands: [
-          {
-            name: "compact",
-            description: "Summarize the conversation before continuing",
-            source: "extension",
-          },
-        ],
-        hosts: {},
-      },
-      hosts: [],
-    });
+    sock.receive(
+      initFrame(workspaces, {
+        config: {
+          presets: [],
+          models: [],
+          commands: [
+            {
+              name: "compact",
+              description: "Summarize the conversation before continuing",
+              source: "extension",
+            },
+          ],
+          hosts: {},
+        },
+      }),
+    );
   });
 }
 async function mountTranscript(workspaces: (typeof ws)[], width: number, height = 760) {
@@ -73,11 +55,7 @@ async function mountTranscript(workspaces: (typeof ws)[], width: number, height 
   localStorage.clear();
   FakeSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeSocket);
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  render(<App />, { container: root });
+  mountFixedApp();
   const sock = FakeSocket.instances.at(-1)!;
   connect(sock, workspaces);
   const receive = (frame: object) => {
@@ -100,10 +78,6 @@ function chooseWorkspace(name: string) {
     el.textContent?.includes(name),
   );
   fireEvent.click(row!);
-}
-function move(el: HTMLElement, top: number) {
-  el.scrollTop = top;
-  fireEvent.scroll(el);
 }
 afterEach(() => {
   cleanup();
@@ -667,14 +641,18 @@ it.each([
     const bounded = () =>
       expect(scroll.querySelectorAll("[data-transcript-row]").length).toBeLessThanOrEqual(45);
     const loaded = () => Number(get(".messages-content").dataset.loadedMessages);
-    const y = (id: string) =>
-      get(`#msg-${id}`).getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+    const y = (id: string) => rowOffset(scroll, get(`#msg-${id}`));
     // Exercise a resize before any scroll notification saves a reading position.
     const deferScroll = (event: Event) => event.stopImmediatePropagation();
     if (width >= 768) scroll.addEventListener("scroll", deferScroll, true);
     let oldest = await servePage(sock);
     await bottom(scroll);
     expect(loaded()).toBe(newestLimit);
+    const latest = async () => {
+      fireEvent.click(get(".jump-latest"));
+      await bottom(scroll);
+      expect(get("#msg-m364")).not.toBeNull();
+    };
     if (width >= 768) {
       await page.viewport(920, 844);
       await nextPaint();
@@ -694,8 +672,7 @@ it.each([
     }
     for (let i = 0; i < 7; i++) await prepend(sock);
     expect(loaded()).toBe(newestLimit + 350);
-    fireEvent.click(get(".jump-latest"));
-    await bottom(scroll);
+    await latest();
     expect(get("#msg-m160")).toBeNull();
     const quote = get("#msg-m364 .forward-ref");
     quote.focus();
@@ -756,8 +733,7 @@ it.each([
     // Close the open trace only after its row has unmounted and remounted.
     move(scroll, scroll.scrollTop * 0.75);
     await expect.poll(() => get("#msg-m160")).toBeNull();
-    fireEvent.click(get(".jump-latest"));
-    await bottom(scroll);
+    await latest();
     fireEvent.click(get("#msg-m364 .forward-ref"));
     await expect.poll(() => steps()?.getAttribute("aria-expanded")).toBe("true");
     move(scroll, scroll.scrollTop + y(anchor) - anchored);
@@ -770,6 +746,7 @@ it.each([
     messages = messages.filter((message) => message.id !== "m160");
     await nextPaint();
     expect(get("#msg-m160")).toBeNull();
+    expect(get("#msg-m162").textContent).toContain("Reply 162");
     expectAnchored();
 
     for (const nextWidth of [width === 390 ? 1280 : 390, width]) {
@@ -811,17 +788,17 @@ it.each([
     expect(input.value).toBe("half a thought");
     expect(input.selectionStart).toBe(4);
 
-    fireEvent.click(get(".jump-latest"));
-    await bottom(scroll);
-    expect(get("#msg-m364")).not.toBeNull();
+    await latest();
     await prepend(next);
     expect(loaded()).toBe(messages.length);
-    const first = get<HTMLElement>("[data-window-first] .message");
+    const first = get("[data-window-first] .message");
     const firstIndex = messages.findIndex((message) => `msg-${message.id}` === first.id);
     expect(firstIndex).toBeGreaterThan(0);
     const neighbor = `msg-${messages[firstIndex - 1].id}`;
-    expect(get(`#${neighbor}`)).toBeNull();
-    get<HTMLButtonElement>(`#${first.id} .btn-quote`).focus({ preventScroll: true });
+    expect(get(`#${neighbor}`)).toBeNull(); // Must actually cross an unmounted edge.
+    const edge = first.querySelector<HTMLButtonElement>(".btn-quote")!;
+    edge.focus({ preventScroll: true });
+    expect(document.activeElement).toBe(edge);
     await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
     expect(document.activeElement?.closest(".message")?.id).toBe(neighbor);
     bounded();

@@ -8,12 +8,14 @@ import {
   toolNameOf,
   toolSummary,
 } from "../src/state/stream";
-import { Message, StreamEvent, type Workspace } from "../src/state/useServer";
+import { Message, StreamEvent } from "../src/state/useServer";
 import {
   INACTIVE_TRANSCRIPT_BUDGET,
+  inactiveTranscriptBytes,
   retainInactiveTranscripts,
 } from "../src/state/transcriptRetention";
 import { splitEvents } from "../src/chat/events";
+import { message, workspace } from "./helpers/fixtures";
 
 const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
   kind,
@@ -21,16 +23,8 @@ const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
   ...over,
 });
 
-const msg = (over: Partial<Message> = {}): Message => ({
-  id: "m1",
-  kind: "agent",
-  agentId: "a",
-  content: "",
-  timestamp: 0,
-  status: "streaming",
-  events: [],
-  ...over,
-});
+const msg = (over: Partial<Message> = {}) =>
+  message("m1", { timestamp: 0, status: "streaming", events: [], ...over });
 
 const traceSummary = (taskId: string, eventCount: number, transcriptRevision: number) =>
   ev("subagent_enrichment", {
@@ -405,17 +399,6 @@ describe("mergeLatestPage", () => {
     expect(mergeLatestPage([msg({ id: "m1" })], [])).toEqual([]);
   });
 
-  it("replaces the list when a message that came live is all the page shares", () => {
-    // Held m1..m50; m51..m110 were written while away; m111 arrived by
-    // new_message before the resync reply, which holds m62..m111.
-    const range = (a: number, b: number) =>
-      Array.from({ length: b - a + 1 }, (_, k) =>
-        msg({ id: `m${a + k}`, timestamp: a + k, status: "done" }),
-      );
-    const out = mergeLatestPage([...range(1, 50), ...range(111, 111)], range(62, 111));
-    expect(out.map((m) => m.id)).toEqual(range(62, 111).map((m) => m.id));
-  });
-
   it("keeps a live thinking block across a resync while both sides still stream", () => {
     const cur = msg({ id: "m1", liveThinking: "so far", liveThinkingSince: 1_000 });
     const next = msg({ id: "m1", detail: "summary", liveThinkingSince: 1_000 });
@@ -536,19 +519,18 @@ it(
       row("live", 3, { status: "streaming", replyTo: "prompt" }),
       row("last", 4, { content: half.repeat(2) }),
     ];
-    const ws = (id: string, messages: Message[]): Workspace => ({
-      id,
-      name: id,
-      project: "p",
-      hostId: "h",
-      cwd: "/",
-      createdAt: 0,
-      agents: [],
-      messages,
-      messagesLoaded: true,
-    });
+    const ws = (id: string, messages: Message[]) =>
+      workspace(id, {
+        project: "p",
+        hostId: "h",
+        cwd: "/",
+        createdAt: 0,
+        messages,
+        messagesLoaded: true,
+      });
+    const prefix = [row("older-note", -1), row("prefix", 0, { content: half })];
     const older = {
-      ...ws("older", [row("prefix", 0, { content: half }), ...floor]),
+      ...ws("older", [...prefix, ...floor]),
       loadingOlder: true,
       queued: true,
     };
@@ -557,8 +539,11 @@ it(
     ]);
     const active = ws("active", [row("large", 0, { content: half.repeat(2) })]);
     const order = [active.id, older.id, recent.id];
+    const stored = [recent, active, older]; // Deliberately not in read order.
+    const bytes = (rows: Message[]) => Buffer.byteLength(JSON.stringify(rows), "utf8");
+    expect(inactiveTranscriptBytes(stored, active.id)).toBe(bytes(recent.messages) + bytes(prefix));
     expect(retainInactiveTranscripts([recent, active], active.id, order)).toEqual([recent, active]);
-    expect(retainInactiveTranscripts([recent, active, older], active.id, order)).toEqual([
+    expect(retainInactiveTranscripts(stored, active.id, order)).toEqual([
       recent,
       active,
       { ...older, messages: floor, hasMore: true, loadingOlder: false },

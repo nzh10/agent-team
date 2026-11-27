@@ -382,12 +382,7 @@ export class ProjectManager {
         project = this.create(path.basename(root) || root, root);
         if (list.every((w) => w.isArchived)) this.setArchived(project.id, true);
       }
-      for (const w of list) {
-        w.projectLink = { projectId: project.id, role: "worker", unreported: true };
-        const tools = this.toolsFor(w);
-        for (const a of w.agents.values()) a.session.setPanelTools?.(tools);
-        this.host.saveWorkspaceNow(w);
-      }
+      for (const w of list) this.adoptWorker(w, project.id);
       this.changed(project.id);
     }
   }
@@ -430,12 +425,14 @@ export class ProjectManager {
       if (project?.status === "active" && project.archivedAt) this.setArchived(id, false);
       return;
     }
-    const project = this.ensureFor(w.cwd);
-    w.projectLink = { projectId: project.id, role: "worker", unreported: true };
-    const tools = this.toolsFor(w);
-    for (const a of w.agents.values()) a.session.setPanelTools?.(tools);
-    this.host.saveWorkspaceNow(w);
+    this.adoptWorker(w, this.ensureFor(w.cwd).id);
     this.host.workspaceChanged(w);
+  }
+
+  private adoptWorker(w: Workspace, projectId: string): void {
+    w.projectLink = { projectId, role: "worker", unreported: true };
+    this.refreshPanelTools(w);
+    this.host.saveWorkspaceNow(w);
   }
 
   rename(id: string, name: string): void {
@@ -451,10 +448,7 @@ export class ProjectManager {
       this.host.workspaceChanged(lead);
     }
     // The tools' instructions carry the name.
-    for (const w of this.members(id)) {
-      const tools = this.toolsFor(w);
-      for (const a of w.agents.values()) a.session.setPanelTools?.(tools);
-    }
+    for (const w of this.members(id)) this.refreshPanelTools(w);
     this.changed(id);
   }
 
@@ -674,6 +668,11 @@ export class ProjectManager {
         );
   }
 
+  private refreshPanelTools(w: Workspace): void {
+    const tools = this.toolsFor(w);
+    for (const a of w.agents.values()) a.session.setPanelTools?.(tools);
+  }
+
   // The user switches whether a worker session reports to the lead. One
   // that stops loses what the lead had queued for it.
   setReporting(workspaceId: string, reports: boolean): void {
@@ -693,8 +692,7 @@ export class ProjectManager {
       this.markAnswered(w);
       void this.forget(w);
     }
-    const tools = this.toolsFor(w);
-    for (const a of w.agents.values()) a.session.setPanelTools?.(tools);
+    this.refreshPanelTools(w);
     this.host.saveWorkspaceNow(w);
     this.host.workspaceChanged(w);
     this.changed(link.projectId);
@@ -714,13 +712,9 @@ export class ProjectManager {
     this.settleAfter(w, SETTLE_MS);
   }
 
-  awaitsUser(w: Workspace): boolean {
-    return this.waits(w);
-  }
-
   // Only an edge into waiting counts, not each snapshot or later idle check.
   showAwaiting(w: Workspace, live = false): void {
-    const waiting = this.waits(w);
+    const waiting = this.awaitsUser(w);
     if (waiting === w.projectedAwaitsUser) return;
     w.projectedAwaitsUser = waiting;
     if (waiting) {
@@ -737,7 +731,7 @@ export class ProjectManager {
     for (const w of this.host.workspaces()) this.showAwaiting(w);
   }
 
-  private waits(w: Workspace): boolean {
+  awaitsUser(w: Workspace): boolean {
     const link = w.projectLink;
     return (
       w.hasPendingDialogs ||
@@ -2036,10 +2030,11 @@ export class ProjectManager {
       });
       return `Removed ${o.id} ${itemId}.`;
     }
-    if (o.tasks.some((t) => t.id === itemId)) {
+    const task = o.tasks.find((t) => t.id === itemId);
+    if (task) {
       if (patch.outcome !== undefined)
         throw new Error(`${itemId} is a task; outcome is for decisions`);
-      if (patch.text !== o.tasks.find((t) => t.id === itemId)!.text) checkTask(patch.text);
+      if (patch.text !== task.text) checkTask(patch.text);
       this.saveObjective(projectId, {
         ...o,
         tasks: o.tasks.map((t) =>
@@ -2055,9 +2050,9 @@ export class ProjectManager {
       });
       return `Updated ${o.id} ${itemId}.`;
     }
-    if (o.decisions.some((d) => d.id === itemId)) {
+    const d = o.decisions.find((x) => x.id === itemId);
+    if (d) {
       if (patch.state) throw new Error(`${itemId} is a decision; settle it with an outcome`);
-      const d = o.decisions.find((x) => x.id === itemId)!;
       if (patch.text !== d.question) {
         checkLength("The question", patch.text, LIMITS.decision, "the question alone");
       }
@@ -2712,9 +2707,6 @@ function asked(messages: Message[], input: Message): Message {
 function fromLead(m: { from?: MessageOrigin }, lead: Workspace | undefined): boolean {
   return m.from?.role === "lead" && !!lead && m.from.workspaceId === lead.id;
 }
-
-// The models a project's lead and the workers it starts may run on: every
-// backend's session takes the panel's tools.
 
 function taskLine(t: Task): string {
   return `- ${t.id} [${t.state}] ${t.text}`;

@@ -10,21 +10,12 @@ import { entriesOf, HistoryIndex } from "../../src/workspace/history-index";
 import { HistoryService } from "../../src/workspace/history-service";
 import { formatPiToolUse } from "../../src/session/pi-tool-format";
 import type { StreamEvent } from "../../src/session/types";
+import { historyMessage as msg } from "./helpers/history";
 import type { Message, MessageStatus } from "../../src/workspace/workspace";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
-});
-
-const msg = (id: string, content: string, timestamp = 1, over: Partial<Message> = {}): Message => ({
-  id,
-  kind: "agent",
-  agentId: "a",
-  content,
-  timestamp,
-  status: "done",
-  ...over,
 });
 
 function setup() {

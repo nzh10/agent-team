@@ -3,29 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
 import { MobileMenuButton } from "../src/sidebar/MobileMenuButton";
 import type { Project, Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { FakeSocket, initFrame } from "./fakeSocket";
+import { project as makeProject, workspace } from "./helpers/fixtures";
+import { resetProjectApp, setupProjectApp } from "./helpers/projectApp";
 
 const NOW = Date.now();
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW,
-  ...over,
-});
-const project: Project = {
-  id: "p1",
-  name: "Project",
-  root: "/repo/project",
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [],
-};
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, { cwd: `/repo/${id}`, createdAt: NOW - 5000, lastMessageAt: NOW, ...over });
+const project = makeProject("p1", { root: "/repo/project", createdAt: NOW - 10_000 });
 const lead = ws("lead", {
   cwd: "/repo/project",
   projectLink: { projectId: "p1", role: "lead" },
@@ -45,37 +30,16 @@ function boot(workspaces: Workspace[], activeWsId: string | null, projects: Proj
   const sock = FakeSocket.instances.at(-1)!;
   act(() => {
     sock.open();
-    sock.receive({
-      type: "init",
-      workspaces,
-      projects,
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-    });
+    sock.receive(initFrame(workspaces, { projects }));
   });
   return (frame: unknown) => act(() => sock.receive(frame));
 }
 
 beforeEach(() => {
-  vi.useFakeTimers();
-  const store = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (key: string) => store.get(key) ?? null,
-    setItem: (key: string, value: string) => void store.set(key, String(value)),
-    removeItem: (key: string) => void store.delete(key),
-    clear: () => store.clear(),
-  });
-  FakeSocket.instances = [];
-  vi.stubGlobal("WebSocket", FakeSocket);
+  setupProjectApp();
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
-  Element.prototype.scrollIntoView = vi.fn();
 });
-
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-  vi.useRealTimers();
-});
+afterEach(resetProjectApp);
 
 describe("MobileMenuButton", () => {
   it("renders a quiet session count, amber your-turn state, and an accessible status", () => {

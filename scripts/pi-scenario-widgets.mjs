@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import { parseJsonLine, writeJsonl } from "./capture-io.ts";
 import path from "node:path";
 import { sanitizer } from "./capture-pi.ts";
 
@@ -7,6 +7,34 @@ const hold = "pi-e2e-hold-parent";
 const inspect = "/subagents-inspect-rpc fixture-request";
 const asyncPrefix = "PI_SUBAGENT_ASYNC_JSON:";
 const inspectPrefix = "PI_SUBAGENT_INSPECT_JSON:";
+
+// The deterministic scenario may deliver a worker report after the held
+// parent settles and before Pi starts the separate native wake.
+export function widgetClip(clip, runId) {
+  const held = clip.findIndex((r) => r.sent?.message === hold);
+  const parentEnd = clip.findIndex(
+    ({ frame: f }, i) => i > held && f?.command === "get_session_stats",
+  );
+  const notice = clip.findIndex(
+    ({ frame: f }, i) =>
+      i > parentEnd &&
+      f?.type === "message_start" &&
+      f.message?.customType === "subagent-notify" &&
+      f.message.details.runs.some((r) => r.runId === runId),
+  );
+  const wake = clip.findLastIndex(({ frame: f }, i) => i < notice && f?.type === "agent_start");
+  const end = clip.findIndex(({ frame: f }, i) => i > wake && f?.type === "agent_settled");
+  if (held < 0 || parentEnd < 0 || wake <= parentEnd || end <= notice)
+    throw new Error("Missing native wake or settlement");
+  const native = clip.slice(wake, end + 1);
+  if (native.some(({ frame: f }) => f?.type === "message_start" && f.message?.role === "user"))
+    throw new Error("Native notice arrived in a user turn, not a separate wake");
+  // Shutdown can preempt the wake's stats RPC. The recorded settlement is the boundary.
+  return [
+    ...clip.slice(0, parentEnd + 1),
+    ...native.filter(({ sent, frame }) => !sent && frame?.type !== "response"),
+  ];
+}
 
 // Keep only the gated run (the live widget also lists earlier scenario jobs).
 // These payloads are JSON inside a widget line; sanitizing the outer RPC alone
@@ -20,14 +48,7 @@ export function extractScenarioWidgets(sessions, snap, versions) {
     ({ frame: f }) => f?.type === "tool_execution_end" && f.toolName === "subagent",
   )?.frame;
   const runId = tool?.result.details.asyncId;
-  const notice = clip.findIndex(
-    ({ frame: f }) =>
-      f?.type === "message_start" &&
-      f.message?.customType === "subagent-notify" &&
-      f.message.details.runs.some((r) => r.runId === runId),
-  );
-  const end = clip.findIndex(({ frame: f }, i) => i > notice && f?.command === "get_session_stats");
-  if (!runId || notice < 0 || end < 0) throw new Error("Missing native wake or settlement");
+  if (!runId) throw new Error("No gated run launch receipt");
   const slots = new Map([
     [runId, "fixture-run"],
     ["task-1", "child-1"],
@@ -39,7 +60,7 @@ export function extractScenarioWidgets(sessions, snap, versions) {
   let parentBusy = false;
   let inspectReply = false;
   let inspectClear = false;
-  for (const { at, sent, frame: f } of clip.slice(0, end + 1)) {
+  for (const { at, sent, frame: f } of widgetClip(clip, runId)) {
     const add = (entry) => rows.push({ t: at - clip[0].at, ...entry });
     if (sent?.type === "prompt") {
       const { message } = sent;
@@ -63,7 +84,7 @@ export function extractScenarioWidgets(sessions, snap, versions) {
         frame.widgetPlacement = widgetPlacement;
       }
       if (widgetKey === "subagent-async" && widgetLines?.[0]?.startsWith(asyncPrefix)) {
-        const payload = JSON.parse(widgetLines[0].slice(asyncPrefix.length));
+        const payload = parseJsonLine(widgetLines[0].slice(asyncPrefix.length));
         const run = payload.runs.find((r) => r.id === runId);
         if (!run || widgetStates.has(run.state)) continue;
         if (run.state === "complete" && !parentBusy)
@@ -145,7 +166,7 @@ export function extractScenarioWidgets(sessions, snap, versions) {
         ];
       } else if (widgetKey === "subagent-inspect" && widgetLines?.[0]?.startsWith(inspectPrefix)) {
         const { kind, version, requestId, asyncId, childId, status, label, task, messages } =
-          JSON.parse(widgetLines[0].slice(inspectPrefix.length));
+          parseJsonLine(widgetLines[0].slice(inspectPrefix.length));
         if (
           kind !== "pi-subagents.inspect-reply" ||
           version !== 1 ||
@@ -214,8 +235,5 @@ export function extractScenarioWidgets(sessions, snap, versions) {
     ...versions,
     recordedAt: new Date(clip[0].at).toISOString(),
   };
-  fs.writeFileSync(
-    path.join(snap, "pi/messages/subagents-widgets.jsonl"),
-    [{ header }, ...rows].map((r) => JSON.stringify(r)).join("\n") + "\n",
-  );
+  writeJsonl(path.join(snap, "pi/messages/subagents-widgets.jsonl"), [{ header }, ...rows]);
 }

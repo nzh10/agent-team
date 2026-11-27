@@ -4,7 +4,6 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ACP_PREPARE_STEP } from "../../src/session/acp-readiness";
 import { PanelHttpServer, type PanelReadyReport } from "../../src/session/panel-http";
@@ -22,8 +21,18 @@ import type {
 } from "../../src/session/types";
 
 import { piFrame, piFrames, piReply } from "../snap/pi-wire";
+import {
+  createPiWireTransport,
+  piIdleState,
+  piPanelConnection,
+  piReadyReport,
+  piRpcResponse,
+} from "./helpers/pi-wire-harness";
 
 type Frame = { id: string; type: string; [key: string]: unknown };
+type SessionHarness = ReturnType<typeof harness>;
+type SessionClient = SessionHarness["clients"][number];
+type EmitFrame = SessionClient["event"];
 const dirs: string[] = [];
 const cleanup: Array<() => Promise<void> | void> = [];
 function temp() {
@@ -53,29 +62,29 @@ function config(dir: string): SessionConfig {
   };
 }
 
-function harness(
-  override: {
-    config?: Partial<SessionConfig>;
-    options?: Partial<PiSessionOptions>;
-    ready?: (ready: PanelReadyReport) => void;
-    state?: (config: SessionConfig) => SessionState;
-    disposition?: string;
-    delayedQuota?: boolean;
-    retire?: { trailing?: object };
-    holdPromptReply?: boolean;
-    promptError?: string;
-    contextUsage?: { tokens: number | null; contextWindow: number };
-    enabledModels?: string[];
-    startupModel?: { provider: string; id: string };
-    models?: Array<{
-      provider: string;
-      id: string;
-      contextWindow?: number;
-      reasoning?: boolean;
-      thinkingLevelMap?: Partial<Record<string, string | null>>;
-    }>;
-  } = {},
-) {
+type HarnessOverrides = {
+  config?: Partial<SessionConfig>;
+  options?: Partial<PiSessionOptions>;
+  ready?: (ready: PanelReadyReport) => void;
+  state?: (config: SessionConfig) => SessionState;
+  disposition?: string;
+  delayedQuota?: boolean;
+  retire?: { trailing?: object };
+  holdPromptReply?: boolean;
+  promptError?: string;
+  contextUsage?: { tokens: number | null; contextWindow: number };
+  enabledModels?: string[];
+  startupModel?: { provider: string; id: string };
+  models?: Array<{
+    provider: string;
+    id: string;
+    contextWindow?: number;
+    reasoning?: boolean;
+    thinkingLevelMap?: Partial<Record<string, string | null>>;
+  }>;
+};
+
+function harness(override: HarnessOverrides = {}) {
   const dir = temp();
   const cfg = { ...config(dir), ...override.config };
   if (override.enabledModels)
@@ -112,28 +121,16 @@ function harness(
       ? opts.args[opts.args.indexOf("--session-id") + 1]
       : sessionHeader!.id;
     const proofState = state ?? session.getState();
-    const ready: PanelReadyReport = {
-      sessionProof: {
-        sessionId: sessionId ?? null,
-        sessionFile: sessionFile ?? null,
-        cwd: fs.realpathSync.native(proofState.normalizedCwd ?? proofState.config.cwd),
-        headerCwd: sessionHeader?.cwd ?? dir,
-        entryCount: proofState.minEntryCount ?? 0,
-        leafId: proofState.expectedLeafAnchorId ?? null,
-        anchorOnActiveBranch: true,
-        anchorExistsInFile: true,
-      },
-      ownerToolNames: ["write_note"],
-      requiredExtensionsRegistered: true,
-      subagentsRpcReady: true,
-      subagentsSessionId: sessionId ?? null,
-    };
+    const ready = piReadyReport({
+      sessionId: sessionId ?? null,
+      sessionFile: sessionFile ?? null,
+      cwd: fs.realpathSync.native(proofState.normalizedCwd ?? proofState.config.cwd),
+      headerCwd: sessionHeader?.cwd ?? dir,
+      entryCount: proofState.minEntryCount ?? 0,
+      leafId: proofState.expectedLeafAnchorId ?? null,
+    });
     override.ready?.(ready);
-    const headers = {
-      authorization: `Bearer ${opts.env?.YAAT_PANEL_TOKEN ?? ""}`,
-      "content-type": "application/json",
-    };
-    const endpoint = `${opts.env?.YAAT_PANEL_URL ?? ""}/v1/sessions/${opts.env?.YAAT_PANEL_KEY ?? ""}`;
+    const { headers, endpoint } = piPanelConnection(opts);
     const bridgeReady = fetch(`${endpoint}/toolset`, { headers })
       .then(async (response) => {
         if (!response.ok) throw new Error(`bridge toolset fetch failed: ${response.status}`);
@@ -145,33 +142,26 @@ function harness(
         await response.text();
       });
     cleanup.push(() => bridgeReady);
-    const stdout = new PassThrough();
     const wire: Frame[] = [];
-    const event = (frame: object) => stdout.write(JSON.stringify(frame) + "\n");
     const respond = (frame: Frame, data?: unknown, success = true) =>
-      event({
-        ...piReply(frame.type),
-        command: frame.type,
-        id: frame.id,
-        success,
-        data,
-        ...(!success && { error: override.promptError ?? "preflight denied" }),
-      });
-    const stdin = new Writable({
+      event(
+        piRpcResponse(
+          frame,
+          data,
+          success ? undefined : (override.promptError ?? "preflight denied"),
+        ),
+      );
+    const {
+      stdin,
+      stdout,
+      emit: event,
+    } = createPiWireTransport({
       write(chunk: Buffer, _, callback) {
         const frame = JSON.parse(chunk.toString()) as Frame;
         wire.push(frame);
         switch (frame.type) {
           case "get_state":
-            respond(frame, {
-              sessionId,
-              sessionFile,
-              thinkingLevel: "low",
-              isStreaming: false,
-              isCompacting: false,
-              pendingMessageCount: 0,
-              model: override.startupModel ?? { provider: "mock", id: "test" },
-            });
+            respond(frame, piIdleState(sessionId, sessionFile, override.startupModel));
             break;
           case "get_available_models":
             respond(frame, {
@@ -265,6 +255,27 @@ function harness(
   };
 }
 
+function requests(wire: Frame[], type: string) {
+  return wire.filter((frame) => frame.type === type);
+}
+
+function promptTexts(wire: Frame[]) {
+  return requests(wire, "prompt").map((frame) => frame.message);
+}
+
+function waitForLastRequest(
+  client: () => SessionClient | undefined,
+  type: "prompt" | "compact",
+  afterCount?: number,
+) {
+  return vi.waitFor(() => {
+    const c = client();
+    if (afterCount !== undefined) expect(c?.wire.length).toBeGreaterThan(afterCount);
+    const frame = c?.wire.at(-1);
+    expect(frame?.type).toBe(type);
+  });
+}
+
 function saved(cfg: SessionConfig, runs: ActiveAsyncRunRecord[] = []): SessionState {
   const session = new PiSession(cfg);
   const state = { ...session.getState(), sessionId: "saved", activeAsyncRuns: runs };
@@ -300,35 +311,211 @@ function assistantStart() {
   return piFrame("message_start", { role: "assistant" });
 }
 
-function assistantEnd(content: Array<Record<string, unknown>>, stopReason = "stop") {
+function assistantEnd(
+  content: Array<Record<string, unknown>>,
+  stopReason = "stop",
+  fields?: { errorMessage?: string; provider?: string; model?: string; yaatLimitReset?: number },
+) {
   const frame = piFrame("message_end", { role: "assistant" });
-  return { ...frame, message: { ...frame.message, content, stopReason } };
+  return { ...frame, message: { ...frame.message, content, stopReason, ...fields } };
 }
 
-function workspaceFor(h: ReturnType<typeof harness>, callbacks: Partial<WorkspaceCallbacks>) {
+const silentWorkspaceCallbacks = {
+  onNewMessage: () => {},
+  onStreamEvent: () => {},
+  onMessageDone: () => {},
+} satisfies WorkspaceCallbacks;
+
+function workspaceFor(h: SessionHarness, callbacks: Partial<WorkspaceCallbacks> = {}) {
   const registry = new HostRegistry();
   const host = new LocalHost("local", "Local");
   vi.spyOn(host, "createSession").mockReturnValue(h.session);
   registry.register(host);
   const ws = new Workspace("ws", "test", "project", "local", h.dir, registry, {
-    onNewMessage: () => {},
-    onStreamEvent: () => {},
-    onMessageDone: () => {},
+    ...silentWorkspaceCallbacks,
     ...callbacks,
   });
   return { ws, registry };
 }
 
-function conversationEntry(id: string, parentId: string | null, role: string, text: string) {
+function workspaceWithPi(h: SessionHarness, callbacks?: Partial<WorkspaceCallbacks>) {
+  const { ws, registry } = workspaceFor(h, callbacks);
+  const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+  return { ws, registry, agent };
+}
+
+function reloadWorkspace(ws: Workspace, registry: HostRegistry) {
+  const restored = Workspace.fromState(ws.getState(), registry, silentWorkspaceCallbacks);
+  restored.setMessages(structuredClone(ws.getMessages()));
+  return restored;
+}
+
+const largeContextWindow = 1_048_576;
+
+function contextHarness(tokens?: number) {
+  return harness({
+    models: [{ provider: "mock", id: "test", contextWindow: largeContextWindow }],
+    ...(tokens !== undefined && { contextUsage: { tokens, contextWindow: largeContextWindow } }),
+  });
+}
+
+function estimatedContext(tokens: number, window = largeContextWindow) {
+  return { tokens, window, estimated: true };
+}
+
+type PiUsage = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
+function emitAssistantUsage(event: EmitFrame, text: string, usage: PiUsage) {
+  event({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text }], usage },
+  });
+}
+
+function settleTurn(event: EmitFrame) {
+  event({ type: "agent_end", messages: [] });
+  event({ type: "agent_settled", aborted: false });
+}
+
+type CompactionResult = {
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  estimatedTokensAfter?: number;
+};
+
+function compacted(tokensBefore: number, estimatedTokensAfter?: number): CompactionResult {
   return {
-    type: "message",
-    id,
-    parentId,
-    message: {
-      role,
-      content: role === "assistant" ? [{ type: "text", text }] : text,
-    },
+    summary: "Compacted",
+    firstKeptEntryId: "kept",
+    tokensBefore,
+    ...(estimatedTokensAfter !== undefined && { estimatedTokensAfter }),
   };
+}
+
+function emitCompaction(
+  event: EmitFrame,
+  reason: "manual" | "threshold" | "overflow",
+  end: {
+    result?: CompactionResult;
+    errorMessage?: string;
+  },
+) {
+  event({ type: "compaction_start", reason });
+  const { result, errorMessage } = end;
+  event({ type: "compaction_end", reason, result, aborted: false, willRetry: false, errorMessage });
+}
+
+function answerManualCompaction(c: SessionClient, frame: Frame, result: CompactionResult) {
+  emitCompaction(c.event, "manual", { result });
+  c.respond(frame, result);
+}
+
+async function waitForWorkspacePrompt(h: SessionHarness) {
+  await waitForLastRequest(() => h.clients[0], "prompt");
+  const client = h.clients[0];
+  client.respond(client.wire.at(-1)!);
+  client.event({ type: "agent_start" });
+  return client;
+}
+
+async function seedWorkspaceContext(
+  h: SessionHarness,
+  { ws, agent }: { ws: Workspace; agent: { id: string } },
+  prompt: string,
+  usage: PiUsage,
+  expectedTokens: number,
+) {
+  const sending = ws.sendMessage(prompt, agent.id);
+  const c = await waitForWorkspacePrompt(h);
+  emitAssistantUsage(c.event, "done", usage);
+  settleTurn(c.event);
+  await sending;
+  await vi.waitFor(() =>
+    expect(ws.getInfo().agents[0].context).toEqual(estimatedContext(expectedTokens)),
+  );
+  return c;
+}
+
+function readPiFixture(name: "pi-compact-empty" | "pi-compact-overflow" | "pi-1.6-extension-ui") {
+  return fs
+    .readFileSync(path.join(__dirname, "fixtures", `${name}.jsonl`), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Frame);
+}
+
+function startSubagent(event: EmitFrame, args: object, toolCallId = "call") {
+  event({ type: "tool_execution_start", toolName: "subagent", toolCallId, args });
+}
+
+function finishSubagent(event: EmitFrame, details: object, toolCallId = "call") {
+  event({ type: "tool_execution_end", toolName: "subagent", toolCallId, result: { details } });
+}
+
+function notifySubagent(
+  event: EmitFrame,
+  details: { runId: string; status: string; children?: object[] },
+) {
+  event({
+    type: "message_end",
+    message: { role: "custom", customType: "subagent-notify", details },
+  });
+}
+
+function subagentCards(
+  events: StreamEvent[],
+  kind: "subagent_start" | "subagent_done" | "subagent_progress",
+) {
+  return events.filter((event) => event.kind === kind).map((event) => event.subagent);
+}
+
+function backgroundTaskIds(session: PiSession) {
+  return session.backgroundTaskList.map((task) => task.id);
+}
+
+function asyncWidget(event: EmitFrame, snapshot?: object) {
+  event({
+    type: "extension_ui_request",
+    method: "setWidget",
+    widgetKey: "subagent-async",
+    ...(snapshot && { widgetLines: [`PI_SUBAGENT_ASYNC_JSON:${JSON.stringify(snapshot)}`] }),
+  });
+}
+
+function asyncSnapshot<
+  T extends { kind: "workflow" | "subagent"; id: string; label: string; state: string },
+>(run: T) {
+  return { kind: "pi-subagents.async-status-snapshot", version: 1, runs: [run] };
+}
+
+function messageEntry(
+  id: string,
+  parentId: string | null,
+  message: { role: string; [key: string]: unknown },
+) {
+  return { type: "message", id, parentId, message };
+}
+
+function conversationEntry(
+  id: string,
+  parentId: string | null,
+  role: "assistant" | "user",
+  text: string,
+) {
+  return messageEntry(id, parentId, {
+    role,
+    content: role === "assistant" ? [{ type: "text", text }] : text,
+  });
+}
+
+function appendConversationEntry(file: string, ...entry: Parameters<typeof conversationEntry>) {
+  fs.appendFileSync(file, `${JSON.stringify(conversationEntry(...entry))}\n`);
 }
 
 function writeSession(
@@ -340,6 +527,13 @@ function writeSession(
 ) {
   const records = [{ type: "session", version: 3, id: sessionId, cwd }, ...entries];
   fs.writeFileSync(file, `${records.map((entry) => JSON.stringify(entry)).join("\n")}\n${tail}`);
+}
+
+function proofAt(leafId: string, entryCount: number) {
+  return (report: PanelReadyReport) => {
+    report.sessionProof.entryCount = entryCount;
+    report.sessionProof.leafId = leafId;
+  };
 }
 
 function anchored(cfg: SessionConfig): SessionState {
@@ -415,7 +609,7 @@ describe("Pi boundary steering", () => {
     });
     await h.boundary(() => open);
     expect(h.finish.mock.calls).toEqual([["rejected"]]);
-    expect(h.client.wire.some((frame) => frame.type === "steer")).toBe(false);
+    expect(requests(h.client.wire, "steer")).toHaveLength(0);
   });
 
   it("treats a malformed reply after write as unknown, never a rejection", async () => {
@@ -515,7 +709,7 @@ describe("Pi boundary steering", () => {
       }
       const expected = ["interrupted", "crash"].includes(outcome) ? "outcome_unknown" : outcome;
       expect(h.finish.mock.calls).toEqual([[expected]]);
-      expect(h.client.wire.some((frame) => frame.type === "clear_queue")).toBe(false);
+      expect(requests(h.client.wire, "clear_queue")).toHaveLength(0);
     },
   );
 });
@@ -526,6 +720,25 @@ describe("PiSession ACP readiness", () => {
     disposition: "rejected",
     error: `Antigravity ACP runtime is not ready. ${ACP_PREPARE_STEP}`,
   };
+
+  function stubRuntime() {
+    const runtime = path.join(temp(), "agy");
+    fs.writeFileSync(runtime, "not run", { mode: 0o700 });
+    return runtime;
+  }
+
+  function runtimeModel(
+    provider: string,
+    overrides?: Pick<HarnessOverrides, "disposition" | "promptError">,
+  ) {
+    const model = { provider, id: "test" };
+    return harness({
+      startupModel: model,
+      models: [model],
+      options: { env: { AGY_ACP_BIN: stubRuntime() } },
+      ...overrides,
+    });
+  }
 
   it.each([undefined, "antigravity-acp/sample", "sample"])(
     "rejects an ACP turn on model %s before writing and retries in the same Pi after setup",
@@ -577,9 +790,7 @@ describe("PiSession ACP readiness", () => {
     }
     expect(await h.session.send("/quota")).toEqual({ disposition: "handled" });
     expect(await h.session.send("hello")).toEqual({ disposition: "handled" });
-    expect(h.clients[0].wire.filter(({ type }) => type === "prompt").map((f) => f.message)).toEqual(
-      ["/quota", "hello"],
-    );
+    expect(promptTexts(h.clients[0].wire)).toEqual(["/quota", "hello"]);
   });
 
   it.each([
@@ -593,22 +804,14 @@ describe("PiSession ACP readiness", () => {
     ["RPC error -32000: Rate limit exceeded", "antigravity-acp", false],
     ["RPC error -32000: Authentication required", "mock", false],
   ])("makes %s actionable only for ACP (model %s)", async (errorMessage, provider, acp) => {
-    const runtime = path.join(temp(), "agy");
-    fs.writeFileSync(runtime, "not run", { mode: 0o700 });
-    const model = { provider, id: "test" };
-    const h = harness({
-      startupModel: model,
-      models: [model],
-      options: { env: { AGY_ACP_BIN: runtime } },
-    });
+    const h = runtimeModel(provider);
     await h.session.ensureStarted();
     const terminal = new Promise<StreamEvent>((resolve) => h.session.once("done", resolve));
     await h.session.send("hello");
     const client = h.clients[0];
     client.event(piFrame("agent_start"));
     client.event(piFrame("message_end", { role: "user" }));
-    const failed = assistantEnd([], "error");
-    client.event({ ...failed, message: { ...failed.message, errorMessage } });
+    client.event(assistantEnd([], "error", { errorMessage }));
     client.event(piFrame("agent_settled"));
     const event = await terminal;
     expect(event.kind).toBe("error");
@@ -620,20 +823,14 @@ describe("PiSession ACP readiness", () => {
   });
 
   it("returns host login guidance for an ACP prompt rejected by Pi RPC", async () => {
-    const runtime = path.join(temp(), "agy");
-    fs.writeFileSync(runtime, "not run", { mode: 0o700 });
-    const model = { provider: "antigravity-acp", id: "test" };
-    const h = harness({
-      startupModel: model,
-      models: [model],
-      options: { env: { AGY_ACP_BIN: runtime } },
+    const h = runtimeModel("antigravity-acp", {
       disposition: "rejected",
       promptError: "No saved Google login for this Pi profile.",
     });
     const receipt = await h.session.send("hello");
     expect(receipt.disposition).toBe("rejected");
     expect(receipt.error).toContain("/login antigravity-acp in standalone host Pi");
-    expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(true);
+    expect(requests(h.clients[0].wire, "prompt").length).toBeGreaterThan(0);
   });
 
   it("keeps other models usable and rejects ACP prompts when runtime stores conflict", async () => {
@@ -668,9 +865,7 @@ describe("PiSession ACP readiness", () => {
     const receipt = await h.session.send("ACP model");
     expect(receipt.disposition).toBe("rejected");
     expect(receipt.error).toContain("move the managed gemini directory");
-    expect(
-      h.clients[0].wire.filter((frame) => frame.type === "prompt").map((frame) => frame.message),
-    ).toEqual(["other model"]);
+    expect(promptTexts(h.clients[0].wire)).toEqual(["other model"]);
     expect(fs.readFileSync(path.join(managed, "acp_token.json"), "utf8")).toContain("fake-managed");
     expect(fs.readFileSync(path.join(host, "acp_token.json"), "utf8")).toContain("fake-host");
   });
@@ -787,10 +982,8 @@ describe("PiSession ACP readiness", () => {
   });
 
   it("redirects setup and policy changes for both ACP aliases even with a ready runtime", async () => {
-    const runtime = path.join(temp(), "agy");
-    fs.writeFileSync(runtime, "not run", { mode: 0o700 });
     const h = harness({
-      options: { env: { AGY_ACP_BIN: runtime } },
+      options: { env: { AGY_ACP_BIN: stubRuntime() } },
       disposition: "handled",
     });
     const onBeforeWrite = vi.fn();
@@ -813,7 +1006,7 @@ describe("PiSession ACP readiness", () => {
       }
     }
     expect(onBeforeWrite).not.toHaveBeenCalled();
-    expect(h.clients[0].wire.some(({ type }) => type === "prompt")).toBe(false);
+    expect(requests(h.clients[0].wire, "prompt")).toHaveLength(0);
     expect(await h.session.send("/antigravity-acp updates")).toEqual({ disposition: "handled" });
     expect(await h.session.send("/gemini-acp status")).toEqual({ disposition: "handled" });
     expect(await h.session.send("/antigravity-acp quota")).toEqual({ disposition: "handled" });
@@ -906,19 +1099,12 @@ describe("PiSession dispatch and stream state", () => {
       await h.session.ensureStarted();
       const c = h.clients[0];
       const pending = h.session.send(command);
-      await vi.waitFor(() => expect(c.wire.at(-1)?.type).toBe("compact"));
+      await waitForLastRequest(() => c, "compact");
       const frame = c.wire.at(-1)!;
       expect(frame.customInstructions).toBe(command === "/compact" ? undefined : "Keep\ndecisions");
       await expect(h.session.send("next")).rejects.toThrow(/busy/);
-      c.event({ type: "compaction_start", reason: "manual" });
       const result = { summary: "Summary", firstKeptEntryId: "kept", tokensBefore: 1234 };
-      c.event({
-        type: "compaction_end",
-        reason: "manual",
-        result,
-        aborted: false,
-        willRetry: false,
-      });
+      emitCompaction(c.event, "manual", { result });
       c.respond(frame, result);
       await expect(pending).resolves.toEqual({ disposition: "handled" });
       expect(h.session.getState()).toMatchObject({
@@ -932,180 +1118,94 @@ describe("PiSession dispatch and stream state", () => {
   );
 
   it("updates live and restored workspace context occupancy after manual /compact with estimatedTokensAfter", async () => {
-    const h = harness({
-      contextUsage: { tokens: 312_900, contextWindow: 1_048_576 },
-      models: [{ provider: "mock", id: "test", contextWindow: 1_048_576 }],
-    });
+    const h = contextHarness(312_900);
     const updated: Array<{ context: { tokens: number; window: number } | null | undefined }> = [];
-    const { ws, registry } = workspaceFor(h, {
+    const workspace = workspaceWithPi(h, {
       onAgentUpdated: (_wsId, agent) => updated.push({ context: agent.context }),
     });
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const { ws, registry, agent } = workspace;
 
     // Seed a high pre-compaction context from a normal turn.
-    const first = ws.sendMessage("hello", agent.id);
-    await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("prompt"));
-    const c = h.clients[0];
-    c.respond(c.wire.at(-1)!);
-    c.event({ type: "agent_start" });
-    c.event({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "done" }],
-        usage: { input: 312_248, output: 1_641, cacheRead: 512, cacheWrite: 0 },
+    const c = await seedWorkspaceContext(
+      h,
+      workspace,
+      "hello",
+      {
+        input: 312_248,
+        output: 1_641,
+        cacheRead: 512,
+        cacheWrite: 0,
       },
-    });
-    c.event({ type: "agent_end", messages: [] });
-    c.event({ type: "agent_settled", aborted: false });
-    await first;
-    await vi.waitFor(() =>
-      expect(ws.getInfo().agents[0].context).toEqual({
-        tokens: 312_900,
-        window: 1_048_576,
-        estimated: true,
-      }),
+      312_900,
     );
 
     // Manual /compact reports estimatedTokensAfter; both live and restored state must drop to it.
     updated.length = 0;
     const compacting = ws.sendMessage("/compact", agent.id);
-    await vi.waitFor(() => expect(c.wire.at(-1)?.type).toBe("compact"));
+    await waitForLastRequest(() => c, "compact");
     const compactFrame = c.wire.at(-1)!;
-    const compactResult = {
-      summary: "Compacted",
-      firstKeptEntryId: "kept",
-      tokensBefore: 314_401,
-      estimatedTokensAfter: 33_812,
-    };
-    c.event({ type: "compaction_start", reason: "manual" });
-    c.event({
-      type: "compaction_end",
-      reason: "manual",
-      result: compactResult,
-      aborted: false,
-      willRetry: false,
-    });
-    c.respond(compactFrame, compactResult);
+    answerManualCompaction(c, compactFrame, compacted(314_401, 33_812));
     await compacting;
 
-    expect(ws.getInfo().agents[0].context).toEqual({
-      tokens: 33_812,
-      window: 1_048_576,
-      estimated: true,
-    });
-    expect(updated.at(-1)?.context).toEqual({ tokens: 33_812, window: 1_048_576, estimated: true });
-    expect(ws.getMessages().at(-1)?.context).toEqual({
-      tokens: 33_812,
-      window: 1_048_576,
-      estimated: true,
-    });
+    expect(ws.getInfo().agents[0].context).toEqual(estimatedContext(33_812));
+    expect(updated.at(-1)?.context).toEqual(estimatedContext(33_812));
+    expect(ws.getMessages().at(-1)?.context).toEqual(estimatedContext(33_812));
 
-    const restored = Workspace.fromState(ws.getState(), registry, {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-    });
-    restored.setMessages(structuredClone(ws.getMessages()));
-    expect(restored.getInfo().agents[0].context).toEqual({
-      tokens: 33_812,
-      window: 1_048_576,
-      estimated: true,
-    });
+    const restored = reloadWorkspace(ws, registry);
+    expect(restored.getInfo().agents[0].context).toEqual(estimatedContext(33_812));
   });
 
   it("clears stale pre-compaction context when /compact has no token estimate and stops pre-compaction fallback on reload", async () => {
-    const h = harness({
-      contextUsage: { tokens: 312_900, contextWindow: 1_048_576 },
-      models: [{ provider: "mock", id: "test", contextWindow: 1_048_576 }],
-    });
+    const h = contextHarness(312_900);
     const updated: Array<{ context: { tokens: number; window: number } | null | undefined }> = [];
-    const { ws, registry } = workspaceFor(h, {
+    const workspace = workspaceWithPi(h, {
       onAgentUpdated: (_wsId, agent) => updated.push({ context: agent.context }),
     });
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const { ws, registry, agent } = workspace;
 
-    const first = ws.sendMessage("hello", agent.id);
-    await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("prompt"));
-    const c = h.clients[0];
-    c.respond(c.wire.at(-1)!);
-    c.event({ type: "agent_start" });
-    c.event({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: [{ type: "text", text: "done" }],
-        usage: { input: 312_000, output: 100, cacheRead: 760, cacheWrite: 0 },
+    const c = await seedWorkspaceContext(
+      h,
+      workspace,
+      "hello",
+      {
+        input: 312_000,
+        output: 100,
+        cacheRead: 760,
+        cacheWrite: 0,
       },
-    });
-    c.event({ type: "agent_end", messages: [] });
-    c.event({ type: "agent_settled", aborted: false });
-    await first;
-    await vi.waitFor(() =>
-      expect(ws.getInfo().agents[0].context).toEqual({
-        tokens: 312_900,
-        window: 1_048_576,
-        estimated: true,
-      }),
+      312_900,
     );
 
     // A failed compact keeps the existing context intact.
     const failed = ws.sendMessage("/compact", agent.id);
-    await vi.waitFor(() => expect(c.wire.at(-1)?.type).toBe("compact"));
+    await waitForLastRequest(() => c, "compact");
     const failFrame = c.wire.at(-1)!;
-    c.event({ type: "compaction_start", reason: "manual" });
-    c.event({
-      type: "compaction_end",
-      reason: "manual",
-      aborted: false,
-      willRetry: false,
+    emitCompaction(c.event, "manual", {
       errorMessage: "Compaction failed: Nothing to compact (session too small)",
     });
     c.respond(failFrame, undefined, false);
     await failed;
-    expect(ws.getInfo().agents[0].context).toEqual({
-      tokens: 312_900,
-      window: 1_048_576,
-      estimated: true,
-    });
+    expect(ws.getInfo().agents[0].context).toEqual(estimatedContext(312_900));
 
     // A successful compact without estimatedTokensAfter clears stale context both live and after reload.
     updated.length = 0;
     const wireCountBefore = c.wire.length;
     const compacting = ws.sendMessage("/compact", agent.id);
-    await vi.waitFor(() => {
-      expect(c.wire.length).toBeGreaterThan(wireCountBefore);
-      expect(c.wire.at(-1)?.type).toBe("compact");
-    });
+    await waitForLastRequest(() => c, "compact", wireCountBefore);
     const compactFrame = c.wire.at(-1)!;
-    const compactResult = { summary: "Compacted", firstKeptEntryId: "kept", tokensBefore: 314_401 };
-    c.event({ type: "compaction_start", reason: "manual" });
-    c.event({
-      type: "compaction_end",
-      reason: "manual",
-      result: compactResult,
-      aborted: false,
-      willRetry: false,
-    });
-    c.respond(compactFrame, compactResult);
+    answerManualCompaction(c, compactFrame, compacted(314_401));
     await compacting;
 
     expect(ws.getInfo().agents[0].context).toBeNull();
     expect(updated.at(-1)?.context).toBeNull();
 
-    const restored = Workspace.fromState(ws.getState(), registry, {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-    });
-    restored.setMessages(structuredClone(ws.getMessages()));
+    const restored = reloadWorkspace(ws, registry);
     expect(restored.getInfo().agents[0].context).toBeNull();
   });
 
   it("keeps missing terminal context unknown when earlier Pi stats arrive late", async () => {
     const h = harness();
-    const { ws, registry } = workspaceFor(h, {});
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const { ws, registry, agent } = workspaceWithPi(h);
     await ws.sendMessage("first", agent.id);
     const c = h.clients[0];
     let resolveFirst!: (stats: Record<string, unknown>) => void;
@@ -1127,9 +1227,7 @@ describe("PiSession dispatch and stream state", () => {
     c.event(piFrame("agent_settled"));
     const secondReply = ws.getMessages().at(-1)!;
     resolveFirst({ contextUsage: { tokens: 17, contextWindow: 100 } });
-    await vi.waitFor(() =>
-      expect(firstReply.context).toEqual({ tokens: 17, window: 100, estimated: true }),
-    );
+    await vi.waitFor(() => expect(firstReply.context).toEqual(estimatedContext(17, 100)));
     expect(secondReply.context).toBeNull();
     expect(ws.getInfo().agents[0].context).toBeNull();
     expect(await h.session.getContextUsage()).toBeNull();
@@ -1142,164 +1240,87 @@ describe("PiSession dispatch and stream state", () => {
 
   it("does not restore pre-compaction context at turn settlement after threshold auto-compaction", async () => {
     for (const estimatedTokensAfter of [28_400, undefined]) {
-      const h = harness({
-        models: [{ provider: "mock", id: "test", contextWindow: 1_048_576 }],
-      });
-      const { ws, registry } = workspaceFor(h, {});
-      const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+      const h = contextHarness();
+      const { ws, registry, agent } = workspaceWithPi(h);
 
       const turn = ws.sendMessage("big turn", agent.id);
-      await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("prompt"));
-      const c = h.clients[0];
-      c.respond(c.wire.at(-1)!);
-      c.event({ type: "agent_start" });
-      c.event({
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "answer" }],
-          usage: { input: 310_000, output: 1_000, cacheRead: 2_000, cacheWrite: 0 },
-        },
+      const c = await waitForWorkspacePrompt(h);
+      emitAssistantUsage(c.event, "answer", {
+        input: 310_000,
+        output: 1_000,
+        cacheRead: 2_000,
+        cacheWrite: 0,
       });
-      c.event({ type: "compaction_start", reason: "threshold" });
-      c.event({
-        type: "compaction_end",
-        reason: "threshold",
-        result: {
-          summary: "Compacted",
-          firstKeptEntryId: "kept",
-          tokensBefore: 313_000,
-          ...(estimatedTokensAfter !== undefined && { estimatedTokensAfter }),
-        },
-        aborted: false,
-        willRetry: false,
+      emitCompaction(c.event, "threshold", {
+        result: compacted(313_000, estimatedTokensAfter),
       });
       expect(ws.getInfo().agents[0].context).toEqual(
-        estimatedTokensAfter === undefined
-          ? null
-          : { tokens: estimatedTokensAfter, window: 1_048_576, estimated: true },
+        estimatedTokensAfter === undefined ? null : estimatedContext(estimatedTokensAfter),
       );
-      c.event({ type: "agent_end", messages: [] });
-      c.event({ type: "agent_settled", aborted: false });
+      settleTurn(c.event);
       await turn;
 
       expect(ws.getInfo().agents[0].context).toBeNull();
       expect(ws.getMessages().at(-1)?.context).toBeNull();
 
-      const restored = Workspace.fromState(ws.getState(), registry, {
-        onNewMessage: () => {},
-        onStreamEvent: () => {},
-        onMessageDone: () => {},
-      });
-      restored.setMessages(structuredClone(ws.getMessages()));
+      const restored = reloadWorkspace(ws, registry);
       expect(restored.getInfo().agents[0].context).toBeNull();
     }
   });
 
   it("preserves out-of-turn compaction estimates and clears across workspace reload", async () => {
     for (const estimatedTokensAfter of [22_500, undefined]) {
-      const h = harness({
-        contextUsage: { tokens: 201_500, contextWindow: 1_048_576 },
-        models: [{ provider: "mock", id: "test", contextWindow: 1_048_576 }],
-      });
-      const { ws, registry } = workspaceFor(h, {});
-      const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+      const h = contextHarness(201_500);
+      const workspace = workspaceWithPi(h);
+      const { ws, registry } = workspace;
 
-      const first = ws.sendMessage("seed", agent.id);
-      await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("prompt"));
-      const c = h.clients[0];
-      c.respond(c.wire.at(-1)!);
-      c.event({ type: "agent_start" });
-      c.event({
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "done" }],
-          usage: { input: 200_000, output: 500, cacheRead: 1_000, cacheWrite: 0 },
+      const c = await seedWorkspaceContext(
+        h,
+        workspace,
+        "seed",
+        {
+          input: 200_000,
+          output: 500,
+          cacheRead: 1_000,
+          cacheWrite: 0,
         },
-      });
-      c.event({ type: "agent_end", messages: [] });
-      c.event({ type: "agent_settled", aborted: false });
-      await first;
-      await vi.waitFor(() =>
-        expect(ws.getInfo().agents[0].context).toEqual({
-          tokens: 201_500,
-          window: 1_048_576,
-          estimated: true,
-        }),
+        201_500,
       );
 
       // Idle out-of-turn compaction (no active turn).
-      c.event({ type: "compaction_start", reason: "threshold" });
-      c.event({
-        type: "compaction_end",
-        reason: "threshold",
-        result: {
-          summary: "Compacted",
-          firstKeptEntryId: "kept",
-          tokensBefore: 201_500,
-          ...(estimatedTokensAfter !== undefined && { estimatedTokensAfter }),
-        },
-        aborted: false,
-        willRetry: false,
+      emitCompaction(c.event, "threshold", {
+        result: compacted(201_500, estimatedTokensAfter),
       });
 
       const expected =
-        estimatedTokensAfter !== undefined
-          ? { tokens: estimatedTokensAfter, window: 1_048_576, estimated: true }
-          : null;
+        estimatedTokensAfter !== undefined ? estimatedContext(estimatedTokensAfter) : null;
       expect(ws.getInfo().agents[0].context).toEqual(expected);
       expect(ws.lastTurns()[0]?.replies.every((m) => m.kind === "agent")).toBe(true);
 
-      const restored = Workspace.fromState(ws.getState(), registry, {
-        onNewMessage: () => {},
-        onStreamEvent: () => {},
-        onMessageDone: () => {},
-      });
-      restored.setMessages(structuredClone(ws.getMessages()));
+      const restored = reloadWorkspace(ws, registry);
       expect(restored.getInfo().agents[0].context).toEqual(expected);
     }
   });
 
   it("clears running reply context immediately when an unestimated compaction follows an estimated one and errors", async () => {
-    const h = harness({
-      models: [{ provider: "mock", id: "test", contextWindow: 1_048_576 }],
-    });
-    const { ws, registry } = workspaceFor(h, {});
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const h = contextHarness();
+    const { ws, registry, agent } = workspaceWithPi(h);
 
     const turn = ws.sendMessage("work", agent.id);
-    await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("prompt"));
-    const c = h.clients[0];
-    c.respond(c.wire.at(-1)!);
-    c.event({ type: "agent_start" });
-    c.event({ type: "compaction_start", reason: "threshold" });
-    c.event({
-      type: "compaction_end",
-      reason: "threshold",
+    const c = await waitForWorkspacePrompt(h);
+    emitCompaction(c.event, "threshold", {
       result: {
         summary: "First",
         firstKeptEntryId: "k1",
         tokensBefore: 300_000,
         estimatedTokensAfter: 40_000,
       },
-      aborted: false,
-      willRetry: false,
     });
-    expect(ws.getInfo().agents[0].context).toEqual({
-      tokens: 40_000,
-      window: 1_048_576,
-      estimated: true,
-    });
+    expect(ws.getInfo().agents[0].context).toEqual(estimatedContext(40_000));
 
     // Second compaction lacks an estimate: must clear live context immediately.
-    c.event({ type: "compaction_start", reason: "overflow" });
-    c.event({
-      type: "compaction_end",
-      reason: "overflow",
+    emitCompaction(c.event, "overflow", {
       result: { summary: "Second", firstKeptEntryId: "k2", tokensBefore: 42_000 },
-      aborted: false,
-      willRetry: false,
     });
     expect(ws.getInfo().agents[0].context).toBeNull();
     expect(ws.getMessages().at(-1)?.context).toBeNull();
@@ -1309,19 +1330,13 @@ describe("PiSession dispatch and stream state", () => {
       type: "message_end",
       message: { role: "assistant", content: [], stopReason: "error", errorMessage: "boom" },
     });
-    c.event({ type: "agent_end", messages: [] });
-    c.event({ type: "agent_settled", aborted: false });
+    settleTurn(c.event);
     await turn;
 
     expect(ws.getInfo().agents[0].context).toBeNull();
     expect(ws.getMessages().at(-1)?.context).toBeNull();
 
-    const restored = Workspace.fromState(ws.getState(), registry, {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-    });
-    restored.setMessages(structuredClone(ws.getMessages()));
+    const restored = reloadWorkspace(ws, registry);
     expect(restored.getInfo().agents[0].context).toBeNull();
   });
 
@@ -1341,10 +1356,9 @@ describe("PiSession dispatch and stream state", () => {
 
   it("settles an interrupted workspace command even when the compact RPC rejects after its end event", async () => {
     const h = harness();
-    const { ws } = workspaceFor(h, {});
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const { ws, agent } = workspaceWithPi(h);
     const pending = ws.sendMessage("/compact", agent.id);
-    await vi.waitFor(() => expect(h.clients[0]?.wire.at(-1)?.type).toBe("compact"));
+    await waitForLastRequest(() => h.clients[0], "compact");
     const c = h.clients[0];
     const frame = c.wire.at(-1)!;
     c.event({ type: "compaction_start", reason: "manual" });
@@ -1374,14 +1388,9 @@ describe("PiSession dispatch and stream state", () => {
     await h.session.ensureStarted();
     const c = h.clients[0];
     const pending = h.session.send("/compact");
-    await vi.waitFor(() => expect(c.wire.at(-1)?.type).toBe("compact"));
-    for (const line of fs
-      .readFileSync(path.join(__dirname, "fixtures/pi-compact-empty.jsonl"), "utf8")
-      .trim()
-      .split("\n")) {
-      const frame = JSON.parse(line) as Frame;
+    await waitForLastRequest(() => c, "compact");
+    for (const frame of readPiFixture("pi-compact-empty"))
       c.event(frame.id ? { ...frame, id: c.wire.at(-1)!.id } : frame);
-    }
     await expect(pending).resolves.toEqual({ disposition: "handled" });
     expect(h.events.filter((e) => e.kind === "error")).toEqual([
       { kind: "error", content: "Compaction failed: Nothing to compact (session too small)" },
@@ -1404,12 +1413,7 @@ describe("PiSession dispatch and stream state", () => {
     }));
     vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
     vi.spyOn(h.panel, "requestSessionCheckpoint").mockReturnValue(checkpoint);
-    for (const line of fs
-      .readFileSync(path.join(__dirname, "fixtures/pi-compact-overflow.jsonl"), "utf8")
-      .trim()
-      .split("\n")) {
-      c.event(JSON.parse(line) as Frame);
-    }
+    for (const frame of readPiFixture("pi-compact-overflow")) c.event(frame);
     expect(h.events.map((e) => e.content)).toContain(
       "Context compacted (overflow): 5002 → ~2209 tokens",
     );
@@ -1593,7 +1597,7 @@ describe("PiSession dispatch and stream state", () => {
     await h.session.send("hello");
     expect(levels).toHaveBeenCalledTimes(1);
     expect(h.session.getAvailableThinkingLevels("mock/extended")).toBeUndefined();
-    expect(h.clients[0].wire.filter((f) => f.type === "set_thinking_level")).toEqual([]);
+    expect(requests(h.clients[0].wire, "set_thinking_level")).toEqual([]);
     expect(h.events.filter((e) => e.level === "warning")).toEqual([]);
   });
 
@@ -1610,12 +1614,12 @@ describe("PiSession dispatch and stream state", () => {
     // Matching startup model by bare ID should not trigger a redundant set_model RPC.
     h.session.setModel("large");
     expect(h.session.optionsPending).toBe(false);
-    expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toEqual([]);
+    expect(requests(h.clients[0].wire, "set_model")).toEqual([]);
 
     // Switching to another model by bare ID resolves and stores its canonical provider/id.
     h.session.setModel("small");
     await vi.waitFor(() =>
-      expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toEqual([
+      expect(requests(h.clients[0].wire, "set_model")).toEqual([
         expect.objectContaining({ provider: "mock", modelId: "small" }),
       ]),
     );
@@ -1626,7 +1630,7 @@ describe("PiSession dispatch and stream state", () => {
 
     // A subsequent turn does not redundantly re-send set_model.
     await h.session.send("check context");
-    expect(h.clients[0].wire.filter((f) => f.type === "set_model")).toHaveLength(1);
+    expect(requests(h.clients[0].wire, "set_model")).toHaveLength(1);
   });
 
   it.each(["startup", "idle"])(
@@ -1663,7 +1667,7 @@ describe("PiSession dispatch and stream state", () => {
       );
       expect(h.session.getState().config.effort).toBeUndefined();
       expect(h.session.effectiveEffort).toBe("low");
-      expect(h.clients[0].wire.filter((f) => f.type === "set_thinking_level")).toEqual([]);
+      expect(requests(h.clients[0].wire, "set_thinking_level")).toEqual([]);
     },
   );
 
@@ -1790,16 +1794,13 @@ describe("PiSession dispatch and stream state", () => {
     };
     const end = (error = "Antigravity quota exceeded for test.") => {
       const refusal = "Usage Limit Reached\n\nYou have reached your current quota for this period.";
-      const frame = assistantEnd([{ type: "text", text: refusal }], error ? "error" : "stop");
-      h.clients[0].event({
-        ...frame,
-        message: {
-          ...frame.message,
+      h.clients[0].event(
+        assistantEnd([{ type: "text", text: refusal }], error ? "error" : "stop", {
           provider: model.provider,
           model: model.id,
           errorMessage: error,
-        },
-      });
+        }),
+      );
       h.clients[0].event(piFrame("agent_settled"));
     };
     const response = { kind: "response" as const, model: "test", limited: true };
@@ -1849,15 +1850,12 @@ describe("PiSession dispatch and stream state", () => {
       event(piFrame("agent_start"));
       if (scenario !== "unknown-delivery") event(piFrame("message_end", { role: "user" }));
       event(assistantStart());
-      const frame = assistantEnd([{ type: "text", text: "429 refusal" }], "error");
-      event({
-        ...frame,
-        message: {
-          ...frame.message,
+      event(
+        assistantEnd([{ type: "text", text: "429 refusal" }], "error", {
           errorMessage: "429 refusal",
           ...(scenario !== "bare" && { yaatLimitReset: resetsAt }),
-        },
-      });
+        }),
+      );
       if (scenario === "retry-success") {
         event(piFrame("auto_retry_start"));
         event(assistantStart());
@@ -1929,11 +1927,7 @@ describe("PiSession dispatch and stream state", () => {
     await session.ensureStarted();
     for (const name of nested) expect(factory.mock.calls[0][0].env).not.toHaveProperty(name);
     const spawn = factory.mock.calls[0][0];
-    const headers = {
-      authorization: `Bearer ${spawn.env?.YAAT_PANEL_TOKEN ?? ""}`,
-      "content-type": "application/json",
-    };
-    const endpoint = `${spawn.env?.YAAT_PANEL_URL ?? ""}/v1/sessions/${spawn.env?.YAAT_PANEL_KEY ?? ""}`;
+    const { headers, endpoint } = piPanelConnection(spawn);
     const toolset = await fetch(`${endpoint}/toolset`, { headers });
     expect(toolset.status).toBe(200);
     expect(await toolset.json()).toMatchObject({ tools: [], instructions: "" });
@@ -1959,13 +1953,8 @@ describe("PiSession dispatch and stream state", () => {
       await session.send("work");
       const { event } = clients[0];
       event({ type: "agent_start" });
-      event({ type: "tool_execution_start", toolName: "subagent", toolCallId: "call", args });
-      event({
-        type: "tool_execution_end",
-        toolName: "subagent",
-        toolCallId: "call",
-        result: { details: { mode, results: [] } },
-      });
+      startSubagent(event, args);
+      finishSubagent(event, { mode, results: [] });
       expect(events.filter((entry) => entry.kind === "subagent_start")).toHaveLength(count);
       expect(events.filter((entry) => entry.kind === "subagent_done")).toHaveLength(count);
       event({ type: "agent_settled" });
@@ -1978,45 +1967,33 @@ describe("PiSession dispatch and stream state", () => {
     await session.send("work");
     const { event } = clients[0];
     event({ type: "agent_start" });
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "call",
-      args: { tasks: [{ agent: "A", model: "requested", thinking: "low" }, { agent: "B" }] },
+    startSubagent(event, {
+      tasks: [{ agent: "A", model: "requested", thinking: "low" }, { agent: "B" }],
     });
     for (const start of events.filter((entry) => entry.kind === "subagent_start")) {
       expect(start.subagent).not.toHaveProperty("model");
       expect(start.subagent).not.toHaveProperty("effort");
     }
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "call",
-      result: {
-        details: {
-          results: [
-            { index: 1, model: "provider/b", thinking: "off" },
-            {
-              index: 0,
-              model: "provider/a",
-              thinking: "high",
-              progressSummary: { durationMs: 321 },
-              requestedModel: "requested",
-              worktree: true,
-              toolCalls: [{ name: "read" }],
-            },
-          ],
+    finishSubagent(event, {
+      results: [
+        { index: 1, model: "provider/b", thinking: "off" },
+        {
+          index: 0,
+          model: "provider/a",
+          thinking: "high",
+          progressSummary: { durationMs: 321 },
+          requestedModel: "requested",
+          worktree: true,
+          toolCalls: [{ name: "read" }],
         },
-      },
+      ],
     });
-    const done = events
-      .filter((entry) => entry.kind === "subagent_done")
-      .map((entry) => entry.subagent!);
+    const done = subagentCards(events, "subagent_done");
     expect(done).toMatchObject([
       { taskId: "call:0", model: "provider/a", effort: "high" },
       { taskId: "call:1", model: "provider/b", effort: "off" },
     ]);
-    expect(done[0].durationMs).toBe(321);
+    expect(done[0]?.durationMs).toBe(321);
     for (const key of ["thinking", "requestedModel", "worktree", "toolCalls", "index"]) {
       expect(done[0]).not.toHaveProperty(key);
     }
@@ -2038,18 +2015,8 @@ describe("PiSession dispatch and stream state", () => {
         }),
       );
     writeStatus("running", { status: "pending", model: "p/candidate", thinking: "low" });
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "call",
-      args: { agent: "Scout", async: true },
-    });
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "call",
-      result: { details: { asyncDir: dir, runId: "observed" } },
-    });
+    startSubagent(event, { agent: "Scout", async: true });
+    finishSubagent(event, { asyncDir: dir, runId: "observed" });
     const progress = () => events.filter((ev) => ev.kind === "subagent_progress");
     await session.reconcileAsyncRuns();
     expect(progress()).toEqual([]);
@@ -2088,14 +2055,7 @@ describe("PiSession dispatch and stream state", () => {
     expect(session.isRunning).toBe(false);
     expect(session.getState().activeAsyncRuns).toEqual([]);
     expect(session.deployBusy).toBe(true);
-    event({
-      type: "message_end",
-      message: {
-        role: "custom",
-        customType: "subagent-notify",
-        details: { runId: "observed", status: "completed" },
-      },
-    });
+    notifySubagent(event, { runId: "observed", status: "completed" });
     await vi.waitFor(() => expect(session.deployBusy).toBe(false));
   });
 
@@ -2103,38 +2063,18 @@ describe("PiSession dispatch and stream state", () => {
     const h = harness({ options: { livePollIntervalMs: 10 } });
     await h.session.send("workflow");
     const event = h.clients[0].event;
-    const node = (state: string) => ({
-      kind: "pi-subagents.async-status-snapshot",
-      version: 1,
-      runs: [
-        {
-          kind: "workflow",
-          id: "wf",
-          label: "workflow",
-          state: "running",
-          children: [{ kind: "step", id: "review", label: "review", state }],
-        },
-      ],
-    });
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "call",
-      args: { workflow: "workflow", async: true },
-    });
-    event({
-      type: "extension_ui_request",
-      method: "setWidget",
-      widgetKey: "subagent-async",
-      widgetLines: ["PI_SUBAGENT_ASYNC_JSON:" + JSON.stringify(node("running"))],
-    });
-    event({ type: "extension_ui_request", method: "setWidget", widgetKey: "subagent-async" });
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "call",
-      result: { details: { mode: "workflow", runId: "wf", asyncDir: h.dir } },
-    });
+    const node = (state: string) =>
+      asyncSnapshot({
+        kind: "workflow",
+        id: "wf",
+        label: "workflow",
+        state: "running",
+        children: [{ kind: "step", id: "review", label: "review", state }],
+      });
+    startSubagent(event, { workflow: "workflow", async: true });
+    asyncWidget(event, node("running"));
+    asyncWidget(event);
+    finishSubagent(event, { mode: "workflow", runId: "wf", asyncDir: h.dir });
     fs.writeFileSync(
       path.join(h.dir, "status.json"),
       JSON.stringify({
@@ -2145,7 +2085,7 @@ describe("PiSession dispatch and stream state", () => {
       }),
     );
     await vi.waitFor(() =>
-      expect(h.session.backgroundTaskList.map((t) => t.id)).toEqual(["call:0", "call:key:build"]),
+      expect(backgroundTaskIds(h.session)).toEqual(["call:0", "call:key:build"]),
     );
     vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
     const status = vi
@@ -2153,18 +2093,11 @@ describe("PiSession dispatch and stream state", () => {
       .mockResolvedValue({ asyncSnapshot: node("failed") });
     await h.session.reconcileAsyncRuns();
     expect(status).toHaveBeenCalled();
-    expect(h.session.backgroundTaskList.map((t) => t.id)).toEqual(["call:key:build"]);
-    expect(
-      h.events.filter((e) => e.kind === "subagent_done").map((e) => e.subagent?.taskId),
-    ).toEqual(["call:0"]);
-    event({
-      type: "message_end",
-      message: {
-        role: "custom",
-        customType: "subagent-notify",
-        details: { runId: "wf", status: "completed" },
-      },
-    });
+    expect(backgroundTaskIds(h.session)).toEqual(["call:key:build"]);
+    expect(subagentCards(h.events, "subagent_done").map((card) => card?.taskId)).toEqual([
+      "call:0",
+    ]);
+    notifySubagent(event, { runId: "wf", status: "completed" });
     event({ type: "agent_settled" });
   });
 
@@ -2175,20 +2108,10 @@ describe("PiSession dispatch and stream state", () => {
     const frames = piFrames("messages/subagents-widgets");
     const asyncWidgets = frames.filter((f) => f.widgetKey === "subagent-async");
     event(asyncWidgets[0]);
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "workflow",
-      args: { workflow: "example", async: true },
-    });
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "workflow",
-      result: { details: { mode: "workflow", runId: "fixture-run", asyncDir: dir } },
-    });
+    startSubagent(event, { workflow: "example", async: true }, "workflow");
+    finishSubagent(event, { mode: "workflow", runId: "fixture-run", asyncDir: dir }, "workflow");
     for (const frame of asyncWidgets.slice(1)) event(frame);
-    expect(events.filter((e) => e.kind === "subagent_done").map((e) => e.subagent)).toMatchObject([
+    expect(subagentCards(events, "subagent_done")).toMatchObject([
       { taskId: "workflow:0", status: "completed", durationMs: 269, model: "pi-e2e/scenario" },
       {
         taskId: "workflow:key:child-2",
@@ -2209,33 +2132,26 @@ describe("PiSession dispatch and stream state", () => {
       await session.send("background");
       const { event } = clients[0];
       const widget = (state: string) =>
-        event({
-          type: "extension_ui_request",
-          method: "setWidget",
-          widgetKey: "subagent-async",
-          widgetLines: [
-            `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({ kind: "pi-subagents.async-status-snapshot", version: 1, runs: [{ id: "owned", kind: "subagent", label: "Agent", state, startedAt: 101, ...(state === terminal ? { endedAt: 122 } : {}) }] })}`,
-          ],
-        });
+        asyncWidget(
+          event,
+          asyncSnapshot({
+            id: "owned",
+            kind: "subagent",
+            label: "Agent",
+            state,
+            startedAt: 101,
+            ...(state === terminal ? { endedAt: 122 } : {}),
+          }),
+        );
       const ui = vi.fn();
       session.on("extension_ui", ui);
       widget("queued");
-      event({
-        type: "tool_execution_start",
-        toolName: "subagent",
-        toolCallId: "call",
-        args: { agent: "Agent", async: true },
-      });
-      event({
-        type: "tool_execution_end",
-        toolName: "subagent",
-        toolCallId: "call",
-        result: { details: { asyncDir: dir, runId: "owned" } },
-      });
-      expect(session.backgroundTaskList.map((t) => t.id)).toEqual(["call:0"]);
+      startSubagent(event, { agent: "Agent", async: true });
+      finishSubagent(event, { asyncDir: dir, runId: "owned" });
+      expect(backgroundTaskIds(session)).toEqual(["call:0"]);
       expect(events.at(-1)?.subagent?.status).toBe("queued");
       widget("running");
-      event({ type: "extension_ui_request", method: "setWidget", widgetKey: "subagent-async" });
+      asyncWidget(event);
       expect(session.backgroundTaskList).toHaveLength(1);
       widget(terminal);
       widget(terminal);
@@ -2243,22 +2159,17 @@ describe("PiSession dispatch and stream state", () => {
       expect(session.runState).toBe("working");
       expect(session.backgroundTaskList).toEqual([]);
       expect(ui).not.toHaveBeenCalled();
-      expect(events.filter((e) => e.kind === "subagent_done").map((e) => e.subagent)).toMatchObject(
-        [
-          {
-            taskId: "call:0",
-            status: terminal === "complete" ? "completed" : terminal,
-            durationMs: 21,
-          },
-        ],
-      );
-      event({
-        type: "message_end",
-        message: {
-          role: "custom",
-          customType: "subagent-notify",
-          details: { runId: "owned", status: terminal, children: [{ summary: "late output" }] },
+      expect(subagentCards(events, "subagent_done")).toMatchObject([
+        {
+          taskId: "call:0",
+          status: terminal === "complete" ? "completed" : terminal,
+          durationMs: 21,
         },
+      ]);
+      notifySubagent(event, {
+        runId: "owned",
+        status: terminal,
+        children: [{ summary: "late output" }],
       });
       expect(events.filter((e) => e.kind === "subagent_done")).toHaveLength(1);
       expect(events.find((e) => e.kind === "subagent_enrichment")?.subagent).toMatchObject({
@@ -2274,39 +2185,22 @@ describe("PiSession dispatch and stream state", () => {
     const { session, clients, events, dir } = harness();
     await session.send("work");
     const { event } = clients[0];
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "call",
-      args: { tasks: [{ agent: "A" }, { agent: "B" }], async: true },
-    });
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "call",
-      result: { details: { asyncDir: dir, runId: "wire" } },
-    });
-    event({
-      type: "message_end",
-      message: {
-        role: "custom",
-        customType: "subagent-notify",
-        details: {
-          runId: "wire",
-          status: "failed",
-          children: [
-            {
-              status: "completed",
-              model: "p/candidate",
-              resolvedModel: { provider: "p", model: "wire" },
-              thinking: "high",
-            },
-            { status: "queued", model: "p/never-ran", thinking: "low" },
-          ],
+    startSubagent(event, { tasks: [{ agent: "A" }, { agent: "B" }], async: true });
+    finishSubagent(event, { asyncDir: dir, runId: "wire" });
+    notifySubagent(event, {
+      runId: "wire",
+      status: "failed",
+      children: [
+        {
+          status: "completed",
+          model: "p/candidate",
+          resolvedModel: { provider: "p", model: "wire" },
+          thinking: "high",
         },
-      },
+        { status: "queued", model: "p/never-ran", thinking: "low" },
+      ],
     });
-    const done = events.filter((ev) => ev.kind === "subagent_done").map((ev) => ev.subagent);
+    const done = subagentCards(events, "subagent_done");
     expect(done).toMatchObject([
       { taskId: "call:0", status: "completed", model: "p/wire", effort: "high" },
       { taskId: "call:1", status: "failed" },
@@ -2497,8 +2391,7 @@ describe("PiSession dispatch and stream state", () => {
 
   it("preserves delayed thinking offsets through Workspace aggregation", async () => {
     const h = harness();
-    const { ws } = workspaceFor(h, {});
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    const { ws, agent } = workspaceWithPi(h);
     await ws.sendMessage("stream", agent.id);
     const { event } = h.clients[0];
     event({ type: "agent_start" });
@@ -2580,11 +2473,7 @@ describe("PiSession dispatch and stream state", () => {
       unhandled = vi.fn<(e: Frame) => void>();
     session.on("extension_ui", events);
     session.on("unhandled", unhandled);
-    const frames = fs
-      .readFileSync(path.join(__dirname, "fixtures/pi-1.6-extension-ui.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Frame);
+    const frames = readPiFixture("pi-1.6-extension-ui");
     for (const frame of frames) clients[0].event(frame);
     expect(events.mock.calls.map(([event]) => event.change)).toEqual([
       { kind: "notify", level: "info", message: "hello", id: frames[0].id },
@@ -2610,7 +2499,7 @@ describe("PiSession dispatch and stream state", () => {
       "set_editor_text",
     ]);
     expect(session.pendingUiDialogs).toEqual([]);
-    expect(clients[0].wire.some((frame) => frame.type === "extension_ui_response")).toBe(false);
+    expect(requests(clients[0].wire, "extension_ui_response")).toHaveLength(0);
   });
 
   it.each(["reset", "exit", "dispose"])(
@@ -2618,8 +2507,7 @@ describe("PiSession dispatch and stream state", () => {
     async (end) => {
       const h = harness();
       const unhandled = vi.fn();
-      const { ws } = workspaceFor(h, { onUnhandled: unhandled });
-      const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+      const { ws, agent } = workspaceWithPi(h, { onUnhandled: unhandled });
       await h.session.ensureStarted();
       const c = h.clients[0];
       const send = (method: string, fields: object) =>
@@ -2661,7 +2549,7 @@ describe("PiSession dispatch and stream state", () => {
       send("setWidget", { widgetKey: "w17", widgetLines: [42, "valid"] });
       expect(ws.getExtensionUi()[0].widgets.at(-1)?.lines).toEqual(["valid"]);
       expect(unhandled).toHaveBeenCalledTimes(8);
-      expect(c.wire.some((frame) => frame.type === "extension_ui_response")).toBe(false);
+      expect(requests(c.wire, "extension_ui_response")).toHaveLength(0);
       if (end === "reset") h.session.resetContext();
       else if (end === "exit") c.rpc.emit("exit", 1, null);
       else await h.session.dispose();
@@ -2695,7 +2583,7 @@ describe("PiSession dispatch and stream state", () => {
     session.respondToUiDialog("confirm", { requestId: "confirm", confirmed: false });
     session.respondToUiDialog("confirm", { requestId: "confirm", confirmed: true });
     await vi.waitFor(() => expect(session.pendingUiDialogs).toHaveLength(0));
-    expect(wire.filter((frame) => frame.type === "extension_ui_response")).toEqual([
+    expect(requests(wire, "extension_ui_response")).toEqual([
       { type: "extension_ui_response", id: "confirm", confirmed: false },
       { type: "extension_ui_response", id: "expires", cancelled: true },
     ]);
@@ -2705,11 +2593,85 @@ describe("PiSession dispatch and stream state", () => {
     event({ type: "agent_settled", aborted: true });
     await expect(interrupted).resolves.toBe(true);
     expect(wire).toContainEqual({ type: "extension_ui_response", id: "abort", cancelled: true });
-    expect(wire.some((frame) => frame.type === "clear_queue")).toBe(false);
+    expect(requests(wire, "clear_queue")).toHaveLength(0);
   });
 });
 
 describe("PiSession persisted first-input anchor", () => {
+  const anchorProbe = { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 };
+  const inputAnchor = { leafId: "input", entryCount: 1 };
+
+  function persistedWorkspace(h: SessionHarness, beforeSave?: () => void) {
+    const { ws } = workspaceFor(h, {
+      onSaveNow: () => {
+        beforeSave?.();
+        saveWorkspace(h.dir, ws.getState());
+      },
+    });
+    cleanup.push(() => closeHistory(h.dir));
+    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
+    saveIndex(h.dir, [ws.id]);
+    saveWorkspace(h.dir, ws.getState());
+    return { ws, agent, persisted: () => loadAll(h.dir)[0].agents[0].session };
+  }
+
+  function persistFirstInput(h: SessionHarness, text: string, tail = "") {
+    const file = path.join(h.dir, "session.jsonl");
+    writeSession(
+      file,
+      h.session.sessionId!,
+      h.dir,
+      [conversationEntry("input", null, "user", text)],
+      tail,
+    );
+    return file;
+  }
+
+  async function persistFirstReply(h: SessionHarness) {
+    await h.session.send("first");
+    const sessionId = h.session.sessionId!;
+    const file = persistFirstInput(h, "first");
+    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
+    appendConversationEntry(file, "reply", "input", "assistant", "done");
+    return { file, sessionId };
+  }
+
+  function settleWithCheckpoint(
+    h: SessionHarness,
+    sessionFile: string,
+    leafId: string,
+    entryCount: number,
+    sessionId = h.session.sessionId,
+  ) {
+    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
+    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
+      sessionId,
+      sessionFile,
+      leafId,
+      entryCount,
+    });
+    h.clients[0].event({ type: "agent_settled" });
+  }
+
+  function expectResumeWithoutPrompts(h: SessionHarness, file?: string) {
+    const args = h.factory.mock.calls[0][0].args;
+    if (file)
+      expect(args).toEqual(expect.arrayContaining(["--session", fs.realpathSync.native(file)]));
+    else expect(args).toContain("--session");
+    expect(requests(h.clients[0].wire, "prompt")).toHaveLength(0);
+  }
+
+  function answerHeldPrompt(h: SessionHarness) {
+    const prompt = h.clients[0].wire.find((frame) => frame.type === "prompt")!;
+    h.clients[0].respond(prompt, { disposition: "started" });
+  }
+
+  function waitForHeldPrompt(h: SessionHarness) {
+    return vi.waitFor(() =>
+      expect(requests(h.clients[0].wire, "prompt").length).toBeGreaterThan(0),
+    );
+  }
+
   it("treats a startup cut before write as never written", async () => {
     const h = harness();
     await h.session.ensureStarted();
@@ -2734,7 +2696,7 @@ describe("PiSession persisted first-input anchor", () => {
         },
       }),
     ).rejects.toThrow("pre-write save failed");
-    expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expect(requests(h.clients[0].wire, "prompt")).toHaveLength(0);
     expect(h.session.getState().hasUnanchoredInput).toBe(false);
 
     const restored = harness({ state: () => h.session.getState() });
@@ -2758,129 +2720,84 @@ describe("PiSession persisted first-input anchor", () => {
   });
 
   it("atomically saves durable first-input proof before settle without accepting or resending it", async () => {
-    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
-    const { ws } = workspaceFor(h, { onSaveNow: () => saveWorkspace(h.dir, ws.getState()) });
-    cleanup.push(() => closeHistory(h.dir));
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
-    saveIndex(h.dir, [ws.id]);
-    saveWorkspace(h.dir, ws.getState());
+    const h = harness({ options: anchorProbe });
+    const { ws, agent, persisted } = persistedWorkspace(h);
     await ws.sendMessage("first input", agent.id);
-    const file = path.join(h.dir, "session.jsonl");
-    writeSession(file, h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", "first input"),
-    ]);
+    const file = persistFirstInput(h, "first input");
 
-    let persisted: SessionState | undefined;
+    let snapshot: SessionState | undefined;
     await vi.waitFor(() => {
-      persisted = loadAll(h.dir)[0].agents[0].session;
-      expect(persisted.persistedSessionAnchor).toEqual({
+      snapshot = persisted();
+      expect(snapshot.persistedSessionAnchor).toEqual({
         sessionFile: fs.realpathSync.native(file),
         sessionId: h.session.sessionId,
         leafId: "input",
         entryCount: 1,
       });
     });
-    expect(persisted!.hasUnanchoredInput).toBe(false);
-    expect(persisted!.hasConfirmedTurns).toBe(false);
+    expect(snapshot!.hasUnanchoredInput).toBe(false);
+    expect(snapshot!.hasConfirmedTurns).toBe(false);
     expect(h.session.isRunning).toBe(true);
     expect(h.done).not.toHaveBeenCalled();
     expect(ws.getMessages().find((msg) => msg.content === "first input")?.status).toBe(
       "dispatching",
     );
-    expect(
-      h.clients[0].wire.filter((frame) => frame.type === "prompt").map((frame) => frame.message),
-    ).toEqual(["first input"]);
+    expect(promptTexts(h.clients[0].wire)).toEqual(["first input"]);
 
-    const restored = harness({ state: () => persisted! });
+    const restored = harness({ state: () => snapshot! });
     await restored.session.ensureStarted();
-    expect(restored.factory.mock.calls[0][0].args).toEqual(
-      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
-    );
-    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(restored, file);
   });
 
   it("proves and saves the anchor at the write boundary before the prompt reply", async () => {
     const h = harness({
       holdPromptReply: true,
-      options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 },
+      options: anchorProbe,
     });
-    const { ws } = workspaceFor(h, { onSaveNow: () => saveWorkspace(h.dir, ws.getState()) });
-    cleanup.push(() => closeHistory(h.dir));
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
-    saveIndex(h.dir, [ws.id]);
-    saveWorkspace(h.dir, ws.getState());
+    const { ws, agent, persisted } = persistedWorkspace(h);
     const pending = ws.sendMessage("before reply", agent.id);
-    await vi.waitFor(() =>
-      expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(true),
-    );
-    const file = path.join(h.dir, "session.jsonl");
-    writeSession(file, h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", "before reply"),
-    ]);
-    await vi.waitFor(() =>
-      expect(loadAll(h.dir)[0].agents[0].session.persistedSessionAnchor).toMatchObject({
-        leafId: "input",
-        entryCount: 1,
-      }),
-    );
+    await waitForHeldPrompt(h);
+    persistFirstInput(h, "before reply");
+    await vi.waitFor(() => expect(persisted().persistedSessionAnchor).toMatchObject(inputAnchor));
     expect(h.done).not.toHaveBeenCalled();
     expect(ws.getMessages().find((msg) => msg.content === "before reply")?.status).toBe(
       "dispatching",
     );
-    const prompt = h.clients[0].wire.find((frame) => frame.type === "prompt")!;
-    h.clients[0].respond(prompt, { disposition: "started" });
+    answerHeldPrompt(h);
     await pending;
-    expect(h.clients[0].wire.filter((frame) => frame.type === "prompt")).toHaveLength(1);
+    expect(requests(h.clients[0].wire, "prompt")).toHaveLength(1);
   });
 
   it("retries the atomic snapshot commit after an anchor-save failure", async () => {
     const h = harness({
       holdPromptReply: true,
-      options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 },
+      options: anchorProbe,
     });
     let failNextAnchorSave = true;
-    const { ws } = workspaceFor(h, {
-      onSaveNow: () => {
-        if (failNextAnchorSave && h.session.getState().persistedSessionAnchor) {
-          failNextAnchorSave = false;
-          throw new Error("snapshot write failed");
-        }
-        saveWorkspace(h.dir, ws.getState());
-      },
+    const { ws, agent, persisted } = persistedWorkspace(h, () => {
+      if (failNextAnchorSave && h.session.getState().persistedSessionAnchor) {
+        failNextAnchorSave = false;
+        throw new Error("snapshot write failed");
+      }
     });
-    cleanup.push(() => closeHistory(h.dir));
-    const agent = ws.addAgent("Pi", "mock/test", "", "", { backend: "pi" });
-    saveIndex(h.dir, [ws.id]);
-    saveWorkspace(h.dir, ws.getState());
     const pending = ws.sendMessage("retry save", agent.id);
-    await vi.waitFor(() =>
-      expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(true),
-    );
-    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", "retry save"),
-    ]);
+    await waitForHeldPrompt(h);
+    persistFirstInput(h, "retry save");
     await vi.waitFor(() => {
       expect(failNextAnchorSave).toBe(false);
-      expect(loadAll(h.dir)[0].agents[0].session.persistedSessionAnchor).toMatchObject({
-        leafId: "input",
-        entryCount: 1,
-      });
+      expect(persisted().persistedSessionAnchor).toMatchObject(inputAnchor);
     });
     expect(h.done).not.toHaveBeenCalled();
-    const prompt = h.clients[0].wire.find((frame) => frame.type === "prompt")!;
-    h.clients[0].respond(prompt, { disposition: "started" });
+    answerHeldPrompt(h);
     await pending;
   });
 
   it("matches the finalized skill-expanded user message instead of the raw RPC text", async () => {
-    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    const h = harness({ options: anchorProbe });
     await h.session.send("/skill:example");
     const expanded =
       '<skill name="example" location="/tmp/example.md">\nExpanded instructions\n</skill>';
-    const file = path.join(h.dir, "session.jsonl");
-    writeSession(file, h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", expanded),
-    ]);
+    persistFirstInput(h, expanded);
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
     expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
     h.clients[0].event({
@@ -2888,16 +2805,12 @@ describe("PiSession persisted first-input anchor", () => {
       message: { role: "user", content: [{ type: "text", text: expanded }] },
     });
     await vi.waitFor(() =>
-      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
-        leafId: "input",
-        entryCount: 1,
-      }),
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject(inputAnchor),
     );
 
     const restored = harness({ state: () => h.session.getState() });
     await restored.session.ensureStarted();
-    expect(restored.factory.mock.calls[0][0].args).toContain("--session");
-    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(restored);
   });
 
   it("gives finalization a fresh proof window before the original write deadline expires", async () => {
@@ -2910,14 +2823,9 @@ describe("PiSession persisted first-input anchor", () => {
       message: { role: "user", content: finalized },
     });
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    writeSession(path.join(h.dir, "session.jsonl"), h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", finalized),
-    ]);
+    persistFirstInput(h, finalized);
     await vi.waitFor(() =>
-      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
-        leafId: "input",
-        entryCount: 1,
-      }),
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject(inputAnchor),
     );
     expect(h.session.getState().hasConfirmedTurns).toBe(false);
     expect(h.done).not.toHaveBeenCalled();
@@ -2932,51 +2840,30 @@ describe("PiSession persisted first-input anchor", () => {
       hasConfirmedTurns: false,
     });
     expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
-    const file = path.join(h.dir, "session.jsonl");
-    writeSession(file, h.session.sessionId!, h.dir, [
-      conversationEntry("input", null, "user", "late write"),
-    ]);
-    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
-    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
-      sessionId: h.session.sessionId,
-      sessionFile: file,
-      leafId: "input",
-      entryCount: 1,
-    });
-    h.clients[0].event({ type: "agent_settled" });
+    const file = persistFirstInput(h, "late write");
+    settleWithCheckpoint(h, file, "input", 1);
     await vi.waitFor(() =>
       expect(h.session.getState()).toMatchObject({
         hasConfirmedTurns: true,
         hasUnanchoredInput: false,
-        persistedSessionAnchor: { leafId: "input", entryCount: 1 },
+        persistedSessionAnchor: inputAnchor,
       }),
     );
 
     const restored = harness({ state: () => h.session.getState() });
     await restored.session.ensureStarted();
-    expect(restored.factory.mock.calls[0][0].args).toContain("--session");
-    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(restored);
   });
 
   it("anchors a delayed complete prefix but refuses a malformed unterminated tail on restore", async () => {
-    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
+    const h = harness({ options: anchorProbe });
     await h.session.send("delayed");
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
     expect(h.session.getState().persistedSessionAnchor).toBeUndefined();
-    const file = path.join(h.dir, "session.jsonl");
     const assistant = `${JSON.stringify(conversationEntry("reply", "input", "assistant", "later"))}\n`;
-    writeSession(
-      file,
-      h.session.sessionId!,
-      h.dir,
-      [conversationEntry("input", null, "user", "delayed")],
-      assistant.slice(0, 24),
-    );
+    persistFirstInput(h, "delayed", assistant.slice(0, 24));
     await vi.waitFor(() =>
-      expect(h.session.getState().persistedSessionAnchor).toMatchObject({
-        leafId: "input",
-        entryCount: 1,
-      }),
+      expect(h.session.getState().persistedSessionAnchor).toMatchObject(inputAnchor),
     );
 
     // Pi appends LF when it loads a torn tail but leaves the malformed bytes.
@@ -2995,26 +2882,17 @@ describe("PiSession persisted first-input anchor", () => {
     );
     const first = harness({
       state: () => h.state!,
-      ready: (report) => {
-        report.sessionProof.entryCount = 2;
-        report.sessionProof.leafId = "reply";
-      },
+      ready: proofAt("reply", 2),
     });
     await first.session.ensureStarted();
     expect(first.factory.mock.calls[0][0].args).toContain("--session");
 
     // This is Pi 1.6.0's actual repair: add LF, retain all records, then append.
     fs.appendFileSync(file, "\n");
-    fs.appendFileSync(
-      file,
-      `${JSON.stringify(conversationEntry("next", "reply", "user", "next"))}\n`,
-    );
+    appendConversationEntry(file, "next", "reply", "user", "next");
     const second = harness({
       state: () => first.session.getState(),
-      ready: (report) => {
-        report.sessionProof.entryCount = 3;
-        report.sessionProof.leafId = "next";
-      },
+      ready: proofAt("next", 3),
     });
     await second.session.ensureStarted();
     expect(second.session.getState()).toMatchObject({
@@ -3026,13 +2904,7 @@ describe("PiSession persisted first-input anchor", () => {
   it("does not turn a corrupt complete JSONL tail into durable input proof", async () => {
     const h = harness({ options: { anchorTimeoutMs: 30, anchorPollIntervalMs: 2 } });
     await h.session.send("first");
-    writeSession(
-      path.join(h.dir, "session.jsonl"),
-      h.session.sessionId!,
-      h.dir,
-      [conversationEntry("input", null, "user", "first")],
-      "{broken}\n",
-    );
+    persistFirstInput(h, "first", "{broken}\n");
     await new Promise<void>((resolve) => setTimeout(resolve, 60));
     expect(h.session.getState()).toMatchObject({
       hasUnanchoredInput: true,
@@ -3045,12 +2917,10 @@ describe("PiSession persisted first-input anchor", () => {
     [
       "an invalid content block",
       [
-        {
-          type: "message",
-          id: "input",
-          parentId: null,
-          message: { role: "user", content: [null, { type: "text", text: "first" }] },
-        },
+        messageEntry("input", null, {
+          role: "user",
+          content: [null, { type: "text", text: "first" }],
+        }),
       ],
     ],
     [
@@ -3063,30 +2933,20 @@ describe("PiSession persisted first-input anchor", () => {
     [
       "an image without its required data",
       [
-        {
-          type: "message",
-          id: "input",
-          parentId: null,
-          message: {
-            role: "user",
-            content: [{ type: "text", text: "first" }, { type: "image" }],
-          },
-        },
+        messageEntry("input", null, {
+          role: "user",
+          content: [{ type: "text", text: "first" }, { type: "image" }],
+        }),
       ],
     ],
     [
       "a malformed assistant tool call after the valid input",
       [
         conversationEntry("input", null, "user", "first"),
-        {
-          type: "message",
-          id: "broken",
-          parentId: "input",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", id: "call", name: "read" }],
-          },
-        },
+        messageEntry("broken", "input", {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call", name: "read" }],
+        }),
       ],
     ],
   ])("rejects %s instead of counting it as durable proof", async (_, entries) => {
@@ -3128,11 +2988,7 @@ describe("PiSession persisted first-input anchor", () => {
       if (damage === "missing") fs.rmSync(file);
       if (damage === "header")
         writeSession(file, "wrong", h.dir, [conversationEntry("input", null, "user", "first")]);
-      if (damage === "branch")
-        fs.appendFileSync(
-          file,
-          `${JSON.stringify(conversationEntry("other", null, "assistant", "other"))}\n`,
-        );
+      if (damage === "branch") appendConversationEntry(file, "other", null, "assistant", "other");
       if (damage === "corrupt") fs.appendFileSync(file, "{broken}\n");
       if (damage === "symlink") {
         const copy = `${file}.copy`;
@@ -3166,32 +3022,16 @@ describe("PiSession persisted first-input anchor", () => {
       found: true,
       anchorMissing: false,
     });
-    expect(h.factory.mock.calls[0][0].args).toContain("--session");
-    expect(h.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(h);
     expect(h.session.getState().hasConfirmedTurns).toBe(true);
   });
 
   it("preserves the canonical anchor when a settlement checkpoint uses a symlinked path", async () => {
-    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
-    await h.session.send("first");
-    const file = path.join(h.dir, "session.jsonl");
-    const sessionId = h.session.sessionId!;
-    writeSession(file, sessionId, h.dir, [conversationEntry("input", null, "user", "first")]);
-    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
-    fs.appendFileSync(
-      file,
-      `${JSON.stringify(conversationEntry("reply", "input", "assistant", "done"))}\n`,
-    );
+    const h = harness({ options: anchorProbe });
+    const { file, sessionId } = await persistFirstReply(h);
     const alias = path.join(h.dir, "session-dir-alias");
     fs.symlinkSync(h.dir, alias);
-    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
-    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
-      sessionId,
-      sessionFile: path.join(alias, "session.jsonl"),
-      leafId: "reply",
-      entryCount: 2,
-    });
-    h.clients[0].event({ type: "agent_settled" });
+    settleWithCheckpoint(h, path.join(alias, "session.jsonl"), "reply", 2, sessionId);
     await vi.waitFor(() =>
       expect(h.session.getState()).toMatchObject({
         expectedLeafAnchorId: "reply",
@@ -3202,31 +3042,13 @@ describe("PiSession persisted first-input anchor", () => {
 
     const restored = harness({ state: () => h.session.getState() });
     await restored.session.ensureStarted();
-    expect(restored.factory.mock.calls[0][0].args).toEqual(
-      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
-    );
-    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(restored, file);
   });
 
   it("resumes a confirmed second-turn cut from the exact file without replaying either input", async () => {
-    const h = harness({ options: { anchorTimeoutMs: 500, anchorPollIntervalMs: 5 } });
-    await h.session.send("first");
-    const file = path.join(h.dir, "session.jsonl");
-    const sessionId = h.session.sessionId!;
-    writeSession(file, sessionId, h.dir, [conversationEntry("input", null, "user", "first")]);
-    await vi.waitFor(() => expect(h.session.getState().persistedSessionAnchor).toBeDefined());
-    fs.appendFileSync(
-      file,
-      `${JSON.stringify(conversationEntry("reply", "input", "assistant", "done"))}\n`,
-    );
-    vi.spyOn(h.panel, "isControlConnected").mockReturnValue(true);
-    vi.spyOn(h.panel, "requestSessionCheckpoint").mockResolvedValue({
-      sessionId,
-      sessionFile: file,
-      leafId: "reply",
-      entryCount: 2,
-    });
-    h.clients[0].event({ type: "agent_settled" });
+    const h = harness({ options: anchorProbe });
+    const { file, sessionId } = await persistFirstReply(h);
+    settleWithCheckpoint(h, file, "reply", 2, sessionId);
     await vi.waitFor(() =>
       expect(h.session.getState()).toMatchObject({
         hasConfirmedTurns: true,
@@ -3236,34 +3058,23 @@ describe("PiSession persisted first-input anchor", () => {
     );
 
     await h.session.send("second");
-    fs.appendFileSync(
-      file,
-      `${JSON.stringify(conversationEntry("second", "reply", "user", "second"))}\n`,
-    );
+    appendConversationEntry(file, "second", "reply", "user", "second");
     const cut = h.session.getState();
     expect(cut.hasConfirmedTurns).toBe(true);
-    expect(cut.persistedSessionAnchor).toMatchObject({ leafId: "input", entryCount: 1 });
+    expect(cut.persistedSessionAnchor).toMatchObject(inputAnchor);
 
     const restored = harness({
       state: () => cut,
-      ready: (report) => {
-        report.sessionProof.entryCount = 3;
-        report.sessionProof.leafId = "second";
-      },
+      ready: proofAt("second", 3),
     });
     await restored.session.ensureStarted();
-    expect(restored.factory.mock.calls[0][0].args).toEqual(
-      expect.arrayContaining(["--session", fs.realpathSync.native(file)]),
-    );
-    expect(restored.clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expectResumeWithoutPrompts(restored, file);
     expect(restored.session.getState()).toMatchObject({
       hasConfirmedTurns: true,
       expectedLeafAnchorId: "second",
       minEntryCount: 3,
     });
-    expect(
-      h.clients[0].wire.filter((frame) => frame.type === "prompt").map((frame) => frame.message),
-    ).toEqual(["first", "second"]);
+    expect(promptTexts(h.clients[0].wire)).toEqual(["first", "second"]);
   });
 });
 
@@ -3299,7 +3110,7 @@ describe("PiSession bounded recovery", () => {
     expect(factory.mock.calls[0][0].args).toEqual(
       expect.arrayContaining(["--session", before.sessionFile]),
     );
-    expect(clients[0].wire.some((frame) => frame.type === "prompt")).toBe(false);
+    expect(requests(clients[0].wire, "prompt")).toHaveLength(0);
     expect(clients[0].rpc.stdin.writableEnded).toBe(true);
     expect(hook).not.toHaveBeenCalled();
     expect(session.getState()).toEqual(before);
@@ -3315,63 +3126,40 @@ describe("PiSession bounded recovery", () => {
   it("accepts valid legacy Bash, image, thinking, tool-call and tool-result records", async () => {
     const h = harness({
       state: confirmed,
-      ready: (report) => {
-        report.sessionProof.entryCount = 8;
-        report.sessionProof.leafId = "bash";
-      },
+      ready: proofAt("bash", 8),
     });
     const file = h.state!.sessionFile!;
     const entries = [
-      {
-        type: "message",
-        id: "image",
-        parentId: "anchor",
-        message: {
-          role: "user",
-          content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
-        },
-      },
-      {
-        type: "message",
-        id: "call",
-        parentId: "image",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "plan" },
-            { type: "toolCall", id: "call-1", name: "read", arguments: {} },
-          ],
-        },
-      },
-      {
-        type: "message",
-        id: "result",
-        parentId: "call",
-        message: {
-          role: "toolResult",
-          toolCallId: "call-1",
-          toolName: "read",
-          content: [
-            { type: "text", text: "result" },
-            { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
-          ],
-          isError: false,
-        },
-      },
-      {
-        type: "message",
-        id: "bash",
-        parentId: "result",
-        message: {
-          role: "bashExecution",
-          command: "pwd",
-          output: "/tmp\n",
-          exitCode: 0,
-          cancelled: false,
-          truncated: false,
-          timestamp: 1,
-        },
-      },
+      messageEntry("image", "anchor", {
+        role: "user",
+        content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+      }),
+      messageEntry("call", "image", {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "plan" },
+          { type: "toolCall", id: "call-1", name: "read", arguments: {} },
+        ],
+      }),
+      messageEntry("result", "call", {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read",
+        content: [
+          { type: "text", text: "result" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+        ],
+        isError: false,
+      }),
+      messageEntry("bash", "result", {
+        role: "bashExecution",
+        command: "pwd",
+        output: "/tmp\n",
+        exitCode: 0,
+        cancelled: false,
+        truncated: false,
+        timestamp: 1,
+      }),
     ];
     for (const entry of entries) fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
     await h.session.ensureStarted();
@@ -3424,10 +3212,7 @@ describe("PiSession bounded recovery", () => {
   it("promotes an unconfirmed session only after a positive report probe", async () => {
     const h = harness({
       state: saved,
-      ready: (report) => {
-        report.sessionProof.entryCount = 2;
-        report.sessionProof.leafId = "found";
-      },
+      ready: proofAt("found", 2),
     });
     const probe = vi
       .spyOn(h.panel, "probeDispatchedReport")
@@ -3471,8 +3256,8 @@ describe("PiSession interrupt recovery", () => {
     await h.session.send("timeout");
     await expect(h.session.interrupt()).resolves.toBe(false);
     await vi.waitFor(() => expect(old.end).toHaveBeenCalledOnce());
-    expect(old.wire.filter((frame) => frame.type === "abort")).toHaveLength(1);
-    expect(old.wire.some((frame) => frame.type === "clear_queue")).toBe(false);
+    expect(requests(old.wire, "abort")).toHaveLength(1);
+    expect(requests(old.wire, "clear_queue")).toHaveLength(0);
     expect(h.session).toMatchObject({ tainted: true, processGeneration: 1 });
     // Inject late callbacks directly as queued emitter work even after stdin closes.
     old.rpc.emit("event", { type: "agent_settled" });
@@ -3533,21 +3318,11 @@ describe("PiSession interrupt recovery", () => {
     const write = () => fs.writeFileSync(file, JSON.stringify(status));
     write();
     const { event } = h.clients[0];
-    event({
-      type: "tool_execution_start",
-      toolName: "subagent",
-      toolCallId: "batch",
-      args: { async: true, tasks: [{ agent: "A" }, { agent: "B" }] },
-    });
-    event({
-      type: "tool_execution_end",
-      toolName: "subagent",
-      toolCallId: "batch",
-      result: { details: { runId: "run", asyncDir, mode: "parallel" } },
-    });
+    startSubagent(event, { async: true, tasks: [{ agent: "A" }, { agent: "B" }] }, "batch");
+    finishSubagent(event, { runId: "run", asyncDir, mode: "parallel" }, "batch");
     event({ type: "agent_settled" });
     expect(h.session.runState).toBe("waiting");
-    expect(h.session.backgroundTaskList.map((task) => task.id)).toEqual(["batch:0", "batch:1"]);
+    expect(backgroundTaskIds(h.session)).toEqual(["batch:0", "batch:1"]);
     for (const [mode, state] of [
       ["workflow", "running"],
       ["parallel", "paused"],
@@ -3602,23 +3377,18 @@ describe("PiSession interrupt recovery", () => {
       childId: "actual-A",
       source: "panel-host-fallback",
     });
-    await vi.waitFor(() =>
-      expect(h.session.backgroundTaskList.map((task) => task.id)).toEqual(["batch:1"]),
-    );
-    expect(
-      h.events
-        .filter((event) => event.kind === "subagent_done")
-        .map((event) => event.subagent?.status),
-    ).toEqual(["stopped"]);
+    await vi.waitFor(() => expect(backgroundTaskIds(h.session)).toEqual(["batch:1"]));
+    expect(subagentCards(h.events, "subagent_done").map((card) => card?.status)).toEqual([
+      "stopped",
+    ]);
     fs.writeFileSync(finishB, "");
     await expect(exited).resolves.toEqual([0, null]);
     await h.session.reconcileAsyncRuns();
     await vi.waitFor(() => expect(h.session.runState).toBe("idle"));
-    expect(
-      h.events
-        .filter((event) => event.kind === "subagent_done")
-        .map((event) => event.subagent?.status),
-    ).toEqual(["stopped", "completed"]);
+    expect(subagentCards(h.events, "subagent_done").map((card) => card?.status)).toEqual([
+      "stopped",
+      "completed",
+    ]);
   });
 });
 

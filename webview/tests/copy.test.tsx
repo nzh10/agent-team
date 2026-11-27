@@ -3,11 +3,10 @@ import { render, fireEvent, act } from "@testing-library/react";
 import { EventItem, MessageItem } from "../src/chat/messages";
 import { MdBlock } from "../src/chat/markdown";
 import { FileOpenContext } from "../src/chat/fileRef";
-import type { AgentInfo, Message, StreamEvent } from "../src/state/useServer";
+import type { Message, StreamEvent } from "../src/state/useServer";
+import { agent, message as makeMessage } from "./helpers/fixtures";
 
-const agents: AgentInfo[] = [
-  { id: "a1", name: "Alice", model: "m", avatar: "🤖", color: "#888", isDefault: true },
-];
+const agents = [agent("a1", { name: "Alice", model: "m", avatar: "🤖" })];
 
 const reply = [
   "## Done",
@@ -22,16 +21,14 @@ const reply = [
   "```",
 ].join("\n");
 
-const message = (over: Partial<Message> = {}): Message => ({
-  id: "m1",
-  kind: "agent",
-  agentId: "a1",
-  content: reply,
-  timestamp: 0,
-  status: "done",
-  events: [],
-  ...over,
-});
+const message = (over: Partial<Message> = {}) =>
+  makeMessage("m1", {
+    agentId: "a1",
+    content: reply,
+    timestamp: 0,
+    events: [],
+    ...over,
+  });
 
 function select(range: Range) {
   const sel = window.getSelection()!;
@@ -71,7 +68,8 @@ afterEach(() => {
 });
 
 describe("copying a selection from a reply", () => {
-  const renderReply = () => render(<MessageItem msg={message()} agents={agents} />).container;
+  const renderReply = (fields?: Partial<Message>) =>
+    render(<MessageItem msg={message(fields)} agents={agents} />).container;
 
   it("copies paths in prose as they read, without markdown escapes", () => {
     const c = renderReply();
@@ -154,9 +152,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("copies a code block's line taken by a triple click without its fence", () => {
-    const c = render(
-      <MessageItem msg={message({ content: "```bash\nnpm test\n```\n\nafter" })} agents={agents} />,
-    ).container;
+    const c = renderReply({ content: "```bash\nnpm test\n```\n\nafter" });
     const code = c.querySelector(".message-content pre code")!;
     const after = [...c.querySelectorAll(".message-content p")].at(-1)!;
     select(rangeOver(textNodeOf(code), 0, after, 0));
@@ -164,12 +160,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("copies a path taken by a triple click as the path, the next one starting with code", () => {
-    const c = render(
-      <MessageItem
-        msg={message({ content: "`src/a_b.ts`\n\n`next.ts` follows" })}
-        agents={agents}
-      />,
-    ).container;
+    const c = renderReply({ content: "`src/a_b.ts`\n\n`next.ts` follows" });
     const [first, next] = c.querySelectorAll(".message-content p code");
     select(rangeOver(textNodeOf(first), 0, textNodeOf(next), 0));
     expect(copied(first)).toBe("src/a_b.ts");
@@ -183,9 +174,7 @@ describe("copying a selection from a reply", () => {
       content: "**Read** `a.ts`",
       contentOffset: content.indexOf("after"),
     };
-    const c = render(
-      <MessageItem msg={message({ content, events: [read] })} agents={agents} />,
-    ).container;
+    const c = renderReply({ content, events: [read] });
     const code = c.querySelector(".message-content pre code")!;
     const after = [...c.querySelectorAll(".message-content p")].at(-1)!;
     expect(c.querySelector(".step-header")).not.toBeNull();
@@ -194,9 +183,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("copies a path in a link as the path", () => {
-    const c = render(
-      <MessageItem msg={message({ content: "[`src/a_b.ts`](src/a_b.ts)" })} agents={agents} />,
-    ).container;
+    const c = renderReply({ content: "[`src/a_b.ts`](src/a_b.ts)" });
     const p = c.querySelector(".message-content p")!;
     const r = document.createRange();
     r.selectNodeContents(p);
@@ -205,12 +192,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("leaves table cells Firefox selected one by one to the browser", () => {
-    const c = render(
-      <MessageItem
-        msg={message({ content: "| a | b |\n|---|---|\n| x_y | 2 |" })}
-        agents={agents}
-      />,
-    ).container;
+    const c = renderReply({ content: "| a | b |\n|---|---|\n| x_y | 2 |" });
     const cells = [...c.querySelectorAll(".message-content td")].map((td) => {
       const r = document.createRange();
       r.selectNode(td);
@@ -225,12 +207,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("fences a code block holding a fence of its own with a longer one", () => {
-    const c = render(
-      <MessageItem
-        msg={message({ content: "Write:\n\n````md\n```ts\nx\n```\n````" })}
-        agents={agents}
-      />,
-    ).container;
+    const c = renderReply({ content: "Write:\n\n````md\n```ts\nx\n```\n````" });
     const content = c.querySelector(".message-content")!;
     const r = document.createRange();
     r.selectNodeContents(content);
@@ -239,9 +216,7 @@ describe("copying a selection from a reply", () => {
   });
 
   it("copies all of a selection Firefox splits around a Copy button", () => {
-    const c = render(
-      <MessageItem msg={message({ content: "intro\n\n```\nls\n```\n\noutro" })} agents={agents} />,
-    ).container;
+    const c = renderReply({ content: "intro\n\n```\nls\n```\n\noutro" });
     const content = c.querySelector(".message-content")!;
     // Split around the button, the code block's first child.
     const block = content.querySelector(".code-block")!;
@@ -264,7 +239,7 @@ describe("copying a selection from a reply", () => {
       content: "**Bash**\n```bash\nrm -rf build_dir/*\nnpm test -- --filter=a_b\n```",
       contentOffset: reply.length,
     };
-    const c = render(<MessageItem msg={message({ events: [bash] })} agents={agents} />).container;
+    const c = renderReply({ events: [bash] });
     fireEvent.click(c.querySelector(".step-header")!);
     const code = c.querySelector(".event-content pre code")!;
     select(rangeOver(code, 0, code, code.childNodes.length));
@@ -278,7 +253,7 @@ describe("copying a selection from a reply", () => {
       content: "**Read** `/home/u/snap_test/a_b.ts`",
       contentOffset: reply.length,
     };
-    const c = render(<MessageItem msg={message({ events: [read] })} agents={agents} />).container;
+    const c = renderReply({ events: [read] });
     fireEvent.click(c.querySelector(".step-header")!);
     const line = c.querySelector(".event-summary-line")!;
     const r = document.createRange();

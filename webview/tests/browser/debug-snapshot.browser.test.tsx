@@ -4,19 +4,14 @@ import { page } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { MessageItem } from "../../src/chat/messages";
 import { collectSnapshot } from "../../src/dev/debugSnapshot";
-import type { AgentInfo, Message } from "../../src/state/useServer";
+import type { Message } from "../../src/state/useServer";
+import { nextPaint } from "../helpers/browser";
+import { agent as makeAgent, message } from "../helpers/fixtures";
 import "../../src/styles.css";
 
 const NOW = 1_800_000_000_000;
 
-const agent: AgentInfo = {
-  id: "a1",
-  name: "Alice",
-  model: "claude-opus-4-6",
-  color: "#528bff",
-  avatar: "A",
-  isDefault: true,
-};
+const agent = makeAgent("a1", { name: "Alice", model: "claude-opus-4-6", color: "#528bff" });
 
 const activeContent = "Working through the layout diagnostics.";
 
@@ -61,45 +56,25 @@ const activeTurn: Message = {
   ],
 };
 
-const trailingMessages: Message[] = [
-  {
-    id: "q1",
+const queued = (i: number, timestamp: number) =>
+  message(`q${i}`, {
     kind: "user",
     agentId: null,
     status: "queued",
-    timestamp: NOW - 4_000,
-    content: "Queued follow-up 1",
-  },
-  {
-    id: "sys1",
+    timestamp,
+    content: `Queued follow-up ${i}`,
+  });
+const trailingMessages = [
+  queued(1, NOW - 4_000),
+  message("sys1", {
     kind: "system",
     agentId: null,
-    status: "done",
     timestamp: NOW - 3_000,
     content: "Bob joined the team",
-  },
-  {
-    id: "q2",
-    kind: "user",
-    agentId: null,
-    status: "queued",
-    timestamp: NOW - 2_000,
-    content: "Queued follow-up 2",
-  },
-  {
-    id: "q3",
-    kind: "user",
-    agentId: null,
-    status: "queued",
-    timestamp: NOW - 1_000,
-    content: "Queued follow-up 3",
-  },
+  }),
+  queued(2, NOW - 2_000),
+  queued(3, NOW - 1_000),
 ];
-
-const nextPaint = () =>
-  new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
 
 afterEach(() => {
   cleanup();

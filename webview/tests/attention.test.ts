@@ -1,38 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { describeAttention, sessionAttention, summarizeAttention } from "../src/sidebar/attention";
-import type { AgentInfo, Project, Workspace } from "../src/state/useServer";
+import type { AgentInfo, Workspace } from "../src/state/useServer";
+import { agent as makeAgent, project as makeProject, workspace } from "./helpers/fixtures";
 
 const NOW = 1_800_000_000_000;
-const agent = (state: AgentInfo["state"]): AgentInfo => ({
-  id: "a",
-  name: "Agent",
-  model: "m",
-  avatar: "A",
-  color: "#fff",
-  isDefault: true,
-  state,
-});
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 1000,
-  lastMessageAt: NOW,
-  ...over,
-});
-const project = (id: string, archivedAt?: number): Project => ({
-  id,
-  name: id,
-  root: `/repo/${id}`,
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [],
-  ...(archivedAt !== undefined && { archivedAt }),
-});
+const agent = (state: AgentInfo["state"]) => makeAgent("a", { model: "m", color: "#fff", state });
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, { cwd: `/repo/${id}`, createdAt: NOW - 1000, lastMessageAt: NOW, ...over });
+const project = (id: string, archivedAt?: number) =>
+  makeProject(id, {
+    name: id,
+    root: `/repo/${id}`,
+    createdAt: NOW - 10_000,
+    ...(archivedAt !== undefined && { archivedAt }),
+  });
 const linked = (id: string, role: "lead" | "worker", over: Partial<Workspace> = {}) =>
   ws(id, { projectLink: { projectId: "p1", role }, ...over });
 

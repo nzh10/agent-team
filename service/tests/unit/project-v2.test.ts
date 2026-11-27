@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectManager, awaitsUser } from "../../src/project/manager";
 import { ReportJournalStore } from "../../src/project/report-journal";
 import { localPiBinary } from "../local-pi";
@@ -23,12 +23,19 @@ import {
   loadWorkspaceMessages,
 } from "../../src/workspace/state";
 import { Workspace, type WorkspaceCallbacks } from "../../src/workspace/workspace";
-import { setupProjects, withTask } from "./projectHarness";
+import { setupProjects } from "./projectHarness";
+import { createTaskAndStartWorker } from "./helpers/project-worker";
 
 const objective = "core/modules";
 const callId = "worker-tool-call-1";
 
-async function fixture() {
+const closeRestoredManagers = new Set<() => void>();
+afterEach(() => {
+  for (const close of closeRestoredManagers) close();
+  closeRestoredManagers.clear();
+});
+
+async function reportFixture() {
   const f = setupProjects();
   let manager = f.manager;
   let online = true;
@@ -40,15 +47,7 @@ async function fixture() {
   };
   f.host.saveWorkspaceNow = save;
   const { lead, project } = f.create("journal");
-  await withTask(f.call, lead);
-  await f.call(lead, "start_session", {
-    title: "worker",
-    cwd: "wt",
-    task: "implement",
-    objective_id: objective,
-    task_id: "t1",
-  });
-  const worker = f.workers()[0];
+  const worker = await createTaskAndStartWorker(f, lead, { title: "worker", task: "implement" });
   const initialInput = worker.lastDelivered()[0].input.id;
   const inboxFile = path.join(f.base, ".agent-team", "projects", project.id, "inbox.json");
   const journal = () => new ReportJournalStore().load(path.dirname(inboxFile));
@@ -89,7 +88,22 @@ async function fixture() {
       .handler(args, undefined, id);
   const finish = (w = worker) =>
     call(w, "finish_task", { summary: "done", context: "frozen context" }, callId);
-  const close = () => manager.close();
+  const finishOffline = () => {
+    online = false;
+    return finish();
+  };
+  const restartOnline = () => {
+    const next = restart();
+    online = true;
+    return next;
+  };
+  const stageQueuedReport = async () => {
+    await finishOffline();
+    const next = restartOnline();
+    await next.manager.drainInbox(project.id, false);
+    return next;
+  };
+  closeRestoredManagers.add(() => manager.close());
   save(lead);
   save(worker);
   return {
@@ -98,16 +112,15 @@ async function fixture() {
     worker,
     project,
     initialInput,
-    setOnline: (value: boolean) => {
-      online = value;
-    },
+    finishOffline,
+    restartOnline,
+    stageQueuedReport,
     inboxFile,
     journal,
     restart,
     call,
     finish,
     save,
-    close,
   };
 }
 
@@ -188,7 +201,7 @@ describe("Project v2", () => {
 
 describe("Report outbox crash boundaries", () => {
   it("1: no ACK or dirty board before the first journal commit; same callId can retry", async () => {
-    const f = await fixture();
+    const f = await reportFixture();
     const append = vi.spyOn(ReportJournalStore.prototype, "append").mockImplementationOnce(() => {
       throw new Error("crash before rename");
     });
@@ -197,47 +210,39 @@ describe("Report outbox crash boundaries", () => {
       expect(fs.existsSync(f.inboxFile)).toBe(false);
       expect(f.objectives()[0].tasks[0].state).toBe("doing");
       expect(f.worker.lastDelivered()[0].answered).toBe(false);
-      f.setOnline(false);
-      await f.finish();
+      await f.finishOffline();
       await f.finish();
       expect(f.journal()).toHaveLength(1);
       expect(f.journal()[0].callId).toBe(callId);
     } finally {
       append.mockRestore();
-      f.close();
     }
   });
 
   it("2: journal alone survives an offline ACK and replays without the worker retrying", async () => {
-    const f = await fixture();
-    try {
-      f.setOnline(false);
-      await expect(f.finish()).resolves.toContain("offline");
-      expect(f.journal()[0]).toMatchObject({
-        boardState: "pending",
-        leadDelivery: { state: "pending" },
-      });
-      expect(f.objectives()[0].tasks[0].state).toBe("doing");
-      const next = f.restart();
-      f.setOnline(true);
-      await next.manager.drainInbox(f.project.id);
-      expect(f.journal()[0]).toMatchObject({
-        boardState: "applied",
-        leadDelivery: { state: "sent_to_pi" },
-      });
-      expect(next.manager.list()[0].objectives[0]).toMatchObject({
-        context: "frozen context",
-        tasks: [{ state: "review" }],
-      });
-      expect(next.worker.lastDelivered()[0].answered).toBe(true);
-      expect(next.session.sent).toHaveLength(1);
-    } finally {
-      f.close();
-    }
+    const f = await reportFixture();
+    await expect(f.finishOffline()).resolves.toContain("offline");
+    expect(f.journal()[0]).toMatchObject({
+      boardState: "pending",
+      leadDelivery: { state: "pending" },
+    });
+    expect(f.objectives()[0].tasks[0].state).toBe("doing");
+    const next = f.restartOnline();
+    await next.manager.drainInbox(f.project.id);
+    expect(f.journal()[0]).toMatchObject({
+      boardState: "applied",
+      leadDelivery: { state: "sent_to_pi" },
+    });
+    expect(next.manager.list()[0].objectives[0]).toMatchObject({
+      context: "frozen context",
+      tasks: [{ state: "review" }],
+    });
+    expect(next.worker.lastDelivered()[0].answered).toBe(true);
+    expect(next.session.sent).toHaveLength(1);
   });
 
   it("3: replay after board mutation does not consume later tasks, contexts, or lead inputs", async () => {
-    const f = await fixture();
+    const f = await reportFixture();
     const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
     const update = vi
       .spyOn(ReportJournalStore.prototype, "updateBoardState")
@@ -279,318 +284,273 @@ describe("Report outbox crash boundaries", () => {
     } finally {
       update.mockRestore();
       quiet.mockRestore();
-      f.close();
     }
   });
 
   it.each(["4a", "4b"])(
     "%s: a persisted queued report is dispatched exactly once",
     async (window) => {
-      const f = await fixture();
+      const f = await reportFixture();
+      await f.finishOffline();
+      const next = f.restartOnline();
+      const update = vi.spyOn(ReportJournalStore.prototype, "updateLeadDelivery");
+      if (window === "4a")
+        update.mockImplementationOnce(() => {
+          throw new Error("crash after history enqueue");
+        });
       try {
-        f.setOnline(false);
-        await f.finish();
-        const next = f.restart();
-        f.setOnline(true);
-        const update = vi.spyOn(ReportJournalStore.prototype, "updateLeadDelivery");
         if (window === "4a")
-          update.mockImplementationOnce(() => {
-            throw new Error("crash after history enqueue");
-          });
-        try {
-          if (window === "4a")
-            await expect(next.manager.drainInbox(f.project.id, false)).rejects.toThrow(
-              "crash after history enqueue",
-            );
-          else await next.manager.drainInbox(f.project.id, false);
-        } finally {
-          update.mockRestore();
-        }
-        const [pending] = f.journal();
-        expect(pending.leadDelivery.state).toBe(window === "4a" ? "pending" : "enqueued");
-        expect(
-          loadWorkspaceMessages(f.base, next.lead.id).find((m) => m.id === pending.leadMessageId)
-            ?.status,
-        ).toBe("queued");
-        expect(next.session.sent).toEqual([]);
-        const recovered = f.restart();
-        await recovered.manager.drainInbox(f.project.id);
-        await recovered.manager.drainInbox(f.project.id);
-        expect(recovered.lead.messages.filter((m) => m.id === pending.leadMessageId)).toHaveLength(
-          1,
-        );
-        expect(recovered.session.sent).toHaveLength(1);
+          await expect(next.manager.drainInbox(f.project.id, false)).rejects.toThrow(
+            "crash after history enqueue",
+          );
+        else await next.manager.drainInbox(f.project.id, false);
       } finally {
-        f.close();
+        update.mockRestore();
       }
+      const [pending] = f.journal();
+      expect(pending.leadDelivery.state).toBe(window === "4a" ? "pending" : "enqueued");
+      expect(
+        loadWorkspaceMessages(f.base, next.lead.id).find((m) => m.id === pending.leadMessageId)
+          ?.status,
+      ).toBe("queued");
+      expect(next.session.sent).toEqual([]);
+      const recovered = f.restart();
+      await recovered.manager.drainInbox(f.project.id);
+      await recovered.manager.drainInbox(f.project.id);
+      expect(recovered.lead.messages.filter((m) => m.id === pending.leadMessageId)).toHaveLength(1);
+      expect(recovered.session.sent).toHaveLength(1);
     },
   );
 
   it("keeps a queued report through removal of the last Lead and delivers it to the successor", async () => {
-    const f = await fixture();
-    try {
-      f.setOnline(false);
-      await f.finish();
-      const before = f.restart();
-      f.setOnline(true);
-      await before.manager.drainInbox(f.project.id, false);
-      const [report] = f.journal();
-      expect(before.lead.findMessage(report.leadMessageId)?.status).toBe("queued");
-      before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
-      f.save(before.lead);
-      const after = f.restart();
-      expect(after.lead.agents.size).toBe(0);
-      after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
-      after.manager.leadAgentsChanged(after.lead);
-      await vi.waitFor(() => expect(after.session.sent).toHaveLength(1));
-      expect(after.lead.findMessage(report.leadMessageId)?.status).toBe("done");
-    } finally {
-      f.close();
-    }
+    const f = await reportFixture();
+    const before = await f.stageQueuedReport();
+    const [report] = f.journal();
+    expect(before.lead.findMessage(report.leadMessageId)?.status).toBe("queued");
+    before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
+    f.save(before.lead);
+    const after = f.restart();
+    expect(after.lead.agents.size).toBe(0);
+    after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+    after.manager.leadAgentsChanged(after.lead);
+    await vi.waitFor(() => expect(after.session.sent).toHaveLength(1));
+    expect(after.lead.findMessage(report.leadMessageId)?.status).toBe("done");
   });
 
   it.each(["rejected", "received", "unknown"])(
     "recovers a removed Lead's dispatching report: %s",
     async (evidence) => {
-      const f = await fixture();
-      try {
-        f.setOnline(false);
-        await f.finish();
-        const before = f.restart();
-        f.setOnline(true);
-        await before.manager.drainInbox(f.project.id, false);
-        const [report] = f.journal();
-        const file = path.join(f.base, "removed-pi.jsonl");
-        const id = "removed-session";
-        let respond!: (receipt: SendReceipt) => void;
-        Object.assign(before.session, {
-          send: (envelope: PromptEnvelope, hooks: SendHooks) => {
-            hooks.onBeforeWrite?.({ ...attempt(envelope), piSession: { file, id } });
-            return new Promise<SendReceipt>((resolve) => {
-              respond = resolve;
-            });
-          },
-        });
-        const oldAgent = before.lead.resolveAgent()!.info.id;
-        before.lead.dequeueNext(oldAgent);
-        expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
-        before.lead.removeAgent(oldAgent);
-        f.save(before.lead);
-        if (evidence === "received") {
-          const timestamp = new Date().toISOString();
-          fs.writeFileSync(
-            file,
-            [
-              { type: "session", id, cwd: before.lead.cwd },
-              {
-                type: "message",
-                id: "entry",
-                parentId: null,
-                message: {
-                  role: "user",
-                  content: formatReportMarker(report.reportId),
-                  timestamp: Date.now(),
-                },
-                timestamp,
-              },
-            ]
-              .map((row) => JSON.stringify(row))
-              .join("\n") + "\n",
-          );
-        } else if (evidence === "rejected") {
-          respond({ disposition: "rejected", retryable: true });
-          await vi.waitFor(() => expect(f.journal()[0].leadDelivery.state).toBe("enqueued"));
-        }
-        const after = f.restart();
-        after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
-        after.manager.leadAgentsChanged(after.lead);
-        await vi.waitFor(() =>
-          expect(after.lead.findMessage(report.leadMessageId)?.status).toBe(
-            evidence === "unknown" ? "outcome_unknown" : "done",
-          ),
-        );
-        expect(after.session.sent).toHaveLength(evidence === "rejected" ? 1 : 0);
-        if (evidence === "received") expect(f.journal()[0].leadDelivery.state).toBe("sent_to_pi");
-      } finally {
-        f.close();
-      }
-    },
-  );
-
-  it("does not let recovery of a removed Lead settle the successor's in-flight dispatch", async () => {
-    const f = await fixture();
-    try {
-      f.setOnline(false);
-      await f.finish();
-      const { lead, manager, session } = f.restart();
-      f.setOnline(true);
-      await manager.drainInbox(f.project.id, false);
+      const f = await reportFixture();
+      const before = await f.stageQueuedReport();
       const [report] = f.journal();
-      const original = lead.resolveAgent()!.info.id;
+      const file = path.join(f.base, "removed-pi.jsonl");
+      const id = "removed-session";
       let respond!: (receipt: SendReceipt) => void;
-      let stopOld!: () => void;
-      vi.spyOn(f.registry.get("local")!, "destroySession").mockImplementationOnce(
-        () =>
-          new Promise<void>((resolve) => {
-            stopOld = resolve;
-          }),
-      );
-      Object.assign(session, {
-        send(envelope: PromptEnvelope, hooks: SendHooks) {
-          hooks.onBeforeWrite?.(attempt(envelope));
+      Object.assign(before.session, {
+        send: (envelope: PromptEnvelope, hooks: SendHooks) => {
+          hooks.onBeforeWrite?.({ ...attempt(envelope), piSession: { file, id } });
           return new Promise<SendReceipt>((resolve) => {
             respond = resolve;
           });
         },
       });
-      const successor = lead.addAgent("successor", "test", "", "", { backend: "codex" });
-      let newWrite!: () => void;
-      const started = new Promise<void>((resolve) => {
-        newWrite = resolve;
-      });
-      Object.assign(lead.agents.get(successor.id)!.session, {
-        send(envelope: PromptEnvelope, hooks: SendHooks) {
-          hooks.onBeforeWrite?.(attempt(envelope));
-          newWrite();
-          return new Promise<SendReceipt>(() => {});
-        },
-      });
-      lead.dequeueNext(original);
-      lead.removeAgent(original);
-      f.save(lead);
-      const recovering = manager.drainInbox(f.project.id);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      respond({ disposition: "rejected" });
-      await started;
-      stopOld();
-      await recovering;
-      expect(lead.findMessage(report.leadMessageId)).toMatchObject({
-        status: "dispatching",
-        queuedFor: successor.id,
-      });
+      const oldAgent = before.lead.resolveAgent()!.info.id;
+      before.lead.dequeueNext(oldAgent);
       expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
-    } finally {
-      f.close();
-    }
+      before.lead.removeAgent(oldAgent);
+      f.save(before.lead);
+      if (evidence === "received") {
+        const timestamp = new Date().toISOString();
+        fs.writeFileSync(
+          file,
+          [
+            { type: "session", id, cwd: before.lead.cwd },
+            {
+              type: "message",
+              id: "entry",
+              parentId: null,
+              message: {
+                role: "user",
+                content: formatReportMarker(report.reportId),
+                timestamp: Date.now(),
+              },
+              timestamp,
+            },
+          ]
+            .map((row) => JSON.stringify(row))
+            .join("\n") + "\n",
+        );
+      } else if (evidence === "rejected") {
+        respond({ disposition: "rejected", retryable: true });
+        await vi.waitFor(() => expect(f.journal()[0].leadDelivery.state).toBe("enqueued"));
+      }
+      const after = f.restart();
+      after.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+      after.manager.leadAgentsChanged(after.lead);
+      await vi.waitFor(() =>
+        expect(after.lead.findMessage(report.leadMessageId)?.status).toBe(
+          evidence === "unknown" ? "outcome_unknown" : "done",
+        ),
+      );
+      expect(after.session.sent).toHaveLength(evidence === "rejected" ? 1 : 0);
+      if (evidence === "received") expect(f.journal()[0].leadDelivery.state).toBe("sent_to_pi");
+    },
+  );
+
+  it("does not let recovery of a removed Lead settle the successor's in-flight dispatch", async () => {
+    const f = await reportFixture();
+    const { lead, manager, session } = await f.stageQueuedReport();
+    const [report] = f.journal();
+    const original = lead.resolveAgent()!.info.id;
+    let respond!: (receipt: SendReceipt) => void;
+    let stopOld!: () => void;
+    vi.spyOn(f.registry.get("local")!, "destroySession").mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          stopOld = resolve;
+        }),
+    );
+    Object.assign(session, {
+      send(envelope: PromptEnvelope, hooks: SendHooks) {
+        hooks.onBeforeWrite?.(attempt(envelope));
+        return new Promise<SendReceipt>((resolve) => {
+          respond = resolve;
+        });
+      },
+    });
+    const successor = lead.addAgent("successor", "test", "", "", { backend: "codex" });
+    let newWrite!: () => void;
+    const started = new Promise<void>((resolve) => {
+      newWrite = resolve;
+    });
+    Object.assign(lead.agents.get(successor.id)!.session, {
+      send(envelope: PromptEnvelope, hooks: SendHooks) {
+        hooks.onBeforeWrite?.(attempt(envelope));
+        newWrite();
+        return new Promise<SendReceipt>(() => {});
+      },
+    });
+    lead.dequeueNext(original);
+    lead.removeAgent(original);
+    f.save(lead);
+    const recovering = manager.drainInbox(f.project.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    respond({ disposition: "rejected" });
+    await started;
+    stopOld();
+    await recovering;
+    expect(lead.findMessage(report.leadMessageId)).toMatchObject({
+      status: "dispatching",
+      queuedFor: successor.id,
+    });
+    expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
   });
 
   it("journals a report with no Lead agent and retains the worker's report-time commit", async () => {
-    const f = await fixture();
-    try {
-      const git = (...args: string[]) =>
-        execFileSync("git", args, { cwd: f.worker.cwd, encoding: "utf8" }).trim();
-      git("init", "-q");
-      const commit = (message: string) => {
-        git(
-          "-c",
-          "user.name=Test",
-          "-c",
-          "user.email=test@example.com",
-          "commit",
-          "--allow-empty",
-          "-qm",
-          message,
-        );
-        return git("rev-parse", "--short=9", "HEAD");
-      };
-      const original = commit("before report");
-      const before = f.restart();
-      before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
-      f.save(before.lead);
-      // Dispatch admission can independently defer the drain during deploy.
-      let allowed = false;
-      f.host.dispatchAllowed = () => allowed;
-      expect(await f.finish(before.worker)).toMatch(/saved.*awaiting a Lead/);
-      expect(f.journal()[0]).toMatchObject({
-        boardState: "pending",
-        leadDelivery: { state: "pending" },
-      });
-      expect(commit("after report")).not.toBe(original);
-      allowed = true;
-      before.lead.addAgent("successor", "test", "", "", { backend: "codex" });
-      before.manager.leadAgentsChanged(before.lead);
-      await vi.waitFor(() => expect(before.session.sent).toHaveLength(1));
-      expect(f.frames.filter((frame) => frame.type === "project_updated").at(-1)).toMatchObject({
-        project: {
-          objectives: [
-            { id: objective, contextCommit: original, contextWritten: f.journal()[0].createdAt },
-          ],
-        },
-      });
-    } finally {
-      f.close();
-    }
+    const f = await reportFixture();
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: f.worker.cwd, encoding: "utf8" }).trim();
+    git("init", "-q");
+    const commit = (message: string) => {
+      git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        message,
+      );
+      return git("rev-parse", "--short=9", "HEAD");
+    };
+    const original = commit("before report");
+    const before = f.restart();
+    before.lead.removeAgent(before.lead.resolveAgent()!.info.id);
+    f.save(before.lead);
+    // Dispatch admission can independently defer the drain during deploy.
+    let allowed = false;
+    f.host.dispatchAllowed = () => allowed;
+    expect(await f.finish(before.worker)).toMatch(/saved.*awaiting a Lead/);
+    expect(f.journal()[0]).toMatchObject({
+      boardState: "pending",
+      leadDelivery: { state: "pending" },
+    });
+    expect(commit("after report")).not.toBe(original);
+    allowed = true;
+    before.lead.addAgent("successor", "test", "", "", { backend: "codex" });
+    before.manager.leadAgentsChanged(before.lead);
+    await vi.waitFor(() => expect(before.session.sent).toHaveLength(1));
+    expect(f.frames.filter((frame) => frame.type === "project_updated").at(-1)).toMatchObject({
+      project: {
+        objectives: [
+          { id: objective, contextCommit: original, contextWritten: f.journal()[0].createdAt },
+        ],
+      },
+    });
   });
 
   it.each(["5a", "5b", "5c"])("%s: dispatching recovery never resends a report", async (window) => {
-    const f = await fixture();
-    try {
-      f.setOnline(false);
-      await f.finish();
-      const next = f.restart();
-      f.setOnline(true);
-      await next.manager.drainInbox(f.project.id, false);
-      const [report] = f.journal();
-      const msg = next.lead.findMessage(report.leadMessageId)!;
-      const hook =
-        window === "5a"
-          ? vi
-              .spyOn(ReportJournalStore.prototype, "updateLeadDelivery")
-              .mockImplementationOnce(() => {
-                throw new Error("crash before inbox mirror");
-              })
-          : undefined;
-      let sends = 0;
-      const wire = next.session as unknown as {
-        send: (envelope: PromptEnvelope, hooks: SendHooks) => Promise<unknown>;
-      };
-      wire.send = async (envelope, hooks) => {
-        next.session.sessionId = "allocated-first-session-id";
-        try {
-          hooks.onBeforeWrite?.(attempt(envelope));
-        } catch (error) {
-          if (window !== "5a") throw error;
-        }
-        if (window !== "5a") sends++;
-        return new Promise(() => {});
-      };
-      next.lead.dequeueNext(msg.queuedFor!);
-      hook?.mockRestore();
-      expect(loadWorkspaceMessages(f.base, next.lead.id).find((m) => m.id === msg.id)?.status).toBe(
-        "dispatching",
-      );
-      expect(f.journal()[0].leadDelivery.state).toBe(window === "5a" ? "enqueued" : "dispatching");
+    const f = await reportFixture();
+    const next = await f.stageQueuedReport();
+    const [report] = f.journal();
+    const msg = next.lead.findMessage(report.leadMessageId)!;
+    const hook =
+      window === "5a"
+        ? vi
+            .spyOn(ReportJournalStore.prototype, "updateLeadDelivery")
+            .mockImplementationOnce(() => {
+              throw new Error("crash before inbox mirror");
+            })
+        : undefined;
+    let sends = 0;
+    const wire = next.session as unknown as {
+      send: (envelope: PromptEnvelope, hooks: SendHooks) => Promise<unknown>;
+    };
+    wire.send = async (envelope, hooks) => {
+      next.session.sessionId = "allocated-first-session-id";
+      try {
+        hooks.onBeforeWrite?.(attempt(envelope));
+      } catch (error) {
+        if (window !== "5a") throw error;
+      }
+      if (window !== "5a") sends++;
+      return new Promise(() => {});
+    };
+    next.lead.dequeueNext(msg.queuedFor!);
+    hook?.mockRestore();
+    expect(loadWorkspaceMessages(f.base, next.lead.id).find((m) => m.id === msg.id)?.status).toBe(
+      "dispatching",
+    );
+    expect(f.journal()[0].leadDelivery.state).toBe(window === "5a" ? "enqueued" : "dispatching");
+    expect(
+      loadAll(f.base).find((state) => state.id === next.lead.id)?.agents[0].session.sessionId,
+    ).toBe("allocated-first-session-id");
+    const recovered = f.restart();
+    const found = window === "5b";
+    const probe = vi.fn(() => {
+      expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
+      return Promise.resolve({ found, anchorMissing: false });
+    });
+    Object.assign(recovered.session, { probeDispatchedReport: probe });
+    await recovered.manager.drainInbox(f.project.id);
+    expect(probe).toHaveBeenCalledExactlyOnceWith(null, report.reportId);
+    expect(f.journal()[0].leadDelivery.state).toBe(found ? "sent_to_pi" : "outcome_unknown");
+    expect(
+      loadWorkspaceMessages(f.base, recovered.lead.id).find((m) => m.id === msg.id)?.status,
+    ).toBe(found ? "done" : "outcome_unknown");
+    expect(recovered.session.sent).toEqual([]);
+    expect(sends).toBe(window === "5a" ? 0 : 1);
+    if (!found)
       expect(
-        loadAll(f.base).find((state) => state.id === next.lead.id)?.agents[0].session.sessionId,
-      ).toBe("allocated-first-session-id");
-      const recovered = f.restart();
-      const found = window === "5b";
-      const probe = vi.fn(() => {
-        expect(f.journal()[0].leadDelivery.state).toBe("dispatching");
-        return Promise.resolve({ found, anchorMissing: false });
-      });
-      Object.assign(recovered.session, { probeDispatchedReport: probe });
-      await recovered.manager.drainInbox(f.project.id);
-      expect(probe).toHaveBeenCalledExactlyOnceWith(null, report.reportId);
-      expect(f.journal()[0].leadDelivery.state).toBe(found ? "sent_to_pi" : "outcome_unknown");
-      expect(
-        loadWorkspaceMessages(f.base, recovered.lead.id).find((m) => m.id === msg.id)?.status,
-      ).toBe(found ? "done" : "outcome_unknown");
-      expect(recovered.session.sent).toEqual([]);
-      expect(sends).toBe(window === "5a" ? 0 : 1);
-      if (!found)
-        expect(
-          recovered.lead.messages.some((m) => m.content.includes("Delivery outcome unknown")),
-        ).toBe(true);
-    } finally {
-      f.close();
-    }
+        recovered.lead.messages.some((m) => m.content.includes("Delivery outcome unknown")),
+      ).toBe(true);
   });
 
   it.skipIf(!localPiBinary).each(["unique marker", "handled extension"])(
     "5b/5c: actual Pi recovery of a first %s",
     async (kind) => {
-      const f = await fixture();
+      const f = await reportFixture();
       const host = f.registry.get("local")!;
       const restore = host.restoreSession.bind(host);
       const live: PiSession[] = [];
@@ -603,11 +563,7 @@ describe("Report outbox crash boundaries", () => {
       });
       try {
         const positive = kind === "unique marker";
-        f.setOnline(false);
-        await f.finish();
-        const staged = f.restart();
-        f.setOnline(true);
-        await staged.manager.drainInbox(f.project.id, false);
+        const staged = await f.stageQueuedReport();
         const [report] = f.journal();
         const home = path.join(f.base, "pi-home");
         const sessions = path.join(f.base, "pi-sessions");
@@ -735,7 +691,6 @@ export default (pi) => {
         wrap.mockRestore();
         await server?.close();
         await Promise.allSettled(live.map((pi) => pi.dispose()));
-        f.close();
       }
     },
     30_000,
@@ -744,109 +699,95 @@ export default (pi) => {
   it.each(["preflight throw", "explicit rejection"])(
     "5c: preserves a known %s after restart, with no dispatch loop",
     async (mode) => {
-      const f = await fixture();
-      try {
-        f.setOnline(false);
-        await f.finish();
-        const next = f.restart();
-        f.setOnline(true);
-        const send = vi.fn((envelope: PromptEnvelope, hooks: SendHooks) => {
-          if (mode === "preflight throw") return Promise.reject(new Error(mode));
-          hooks.onBeforeWrite?.(attempt(envelope));
-          return Promise.resolve({ disposition: "rejected", error: mode });
-        });
-        Object.assign(next.session, { send });
-        await next.manager.drainInbox(f.project.id);
-        await vi.waitFor(() => expect(f.journal()[0].leadDelivery.state).toBe("error"));
-        expect(send).toHaveBeenCalledTimes(1);
-        const recovered = f.restart();
-        await recovered.manager.drainInbox(f.project.id);
-        expect(recovered.session.sent).toEqual([]);
-        expect(recovered.lead.findMessage(f.journal()[0].leadMessageId)?.status).toBe("error");
-      } finally {
-        f.close();
-      }
+      const f = await reportFixture();
+      await f.finishOffline();
+      const next = f.restartOnline();
+      const send = vi.fn((envelope: PromptEnvelope, hooks: SendHooks) => {
+        if (mode === "preflight throw") return Promise.reject(new Error(mode));
+        hooks.onBeforeWrite?.(attempt(envelope));
+        return Promise.resolve({ disposition: "rejected", error: mode });
+      });
+      Object.assign(next.session, { send });
+      await next.manager.drainInbox(f.project.id);
+      await vi.waitFor(() => expect(f.journal()[0].leadDelivery.state).toBe("error"));
+      expect(send).toHaveBeenCalledTimes(1);
+      const recovered = f.restart();
+      await recovered.manager.drainInbox(f.project.id);
+      expect(recovered.session.sent).toEqual([]);
+      expect(recovered.lead.findMessage(f.journal()[0].leadMessageId)?.status).toBe("error");
     },
   );
 
   it("5d: settles ordinary uncertainty without cold start, content guessing, or dropping the index entry", async () => {
-    const f = await fixture();
-    try {
-      const next = f.restart();
-      const send = vi.fn((envelope: PromptEnvelope, hooks: SendHooks) => {
-        hooks.onBeforeWrite?.(attempt(envelope));
-        return Promise.resolve({ disposition: "started" });
-      });
-      Object.assign(next.session, { send });
-      await next.lead.sendMessage("ordinary uncertain sentinel");
-      const state = next.lead.getState();
-      const pending = state.messages!.find((m) => m.status === "dispatching")!;
-      pending.queuedEnvelope!.attachmentIds = ["same.png"];
-      const extensionHistory = path.join(f.base, "extension-input.jsonl");
-      fs.writeFileSync(
-        extensionHistory,
-        JSON.stringify({
-          type: "message",
-          message: {
-            role: "user",
-            content: [
-              { type: "text", text: pending.queuedEnvelope!.text },
-              { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
-            ],
-          },
-        }) + "\n",
-      );
-      const leadSession = state.agents[0].session;
-      leadSession.sessionFile = extensionHistory;
-      saveWorkspace(f.base, state);
-      const recovered = f.restart();
-      const probe = vi.fn(() => Promise.resolve({ found: true, anchorMissing: false }));
-      Object.assign(recovered.session, { probeDispatchedReport: probe });
-      recovered.lead.settlePlainDispatchingOnRestore();
-      expect(recovered.lead.isIdle).toBe(true);
-      expect(recovered.session.sent).toEqual([]);
-      expect(probe).not.toHaveBeenCalled();
-      const stored = loadWorkspaceMessages(f.base, recovered.lead.id);
-      expect(stored.find((m) => m.kind === "user")?.status).toBe("outcome_unknown");
-      expect(stored.some((m) => m.content.includes("Verify it before retrying"))).toBe(true);
-      const hits = await f.host.history.search({
-        terms: ["ordinary uncertain sentinel"],
-        limit: 20,
-      });
-      expect(hits.hits).toHaveLength(1);
-    } finally {
-      f.close();
-    }
+    const f = await reportFixture();
+    const next = f.restart();
+    const send = vi.fn((envelope: PromptEnvelope, hooks: SendHooks) => {
+      hooks.onBeforeWrite?.(attempt(envelope));
+      return Promise.resolve({ disposition: "started" });
+    });
+    Object.assign(next.session, { send });
+    await next.lead.sendMessage("ordinary uncertain sentinel");
+    const state = next.lead.getState();
+    const pending = state.messages!.find((m) => m.status === "dispatching")!;
+    pending.queuedEnvelope!.attachmentIds = ["same.png"];
+    const extensionHistory = path.join(f.base, "extension-input.jsonl");
+    fs.writeFileSync(
+      extensionHistory,
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: pending.queuedEnvelope!.text },
+            { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+          ],
+        },
+      }) + "\n",
+    );
+    const leadSession = state.agents[0].session;
+    leadSession.sessionFile = extensionHistory;
+    saveWorkspace(f.base, state);
+    const recovered = f.restart();
+    const probe = vi.fn(() => Promise.resolve({ found: true, anchorMissing: false }));
+    Object.assign(recovered.session, { probeDispatchedReport: probe });
+    recovered.lead.settlePlainDispatchingOnRestore();
+    expect(recovered.lead.isIdle).toBe(true);
+    expect(recovered.session.sent).toEqual([]);
+    expect(probe).not.toHaveBeenCalled();
+    const stored = loadWorkspaceMessages(f.base, recovered.lead.id);
+    expect(stored.find((m) => m.kind === "user")?.status).toBe("outcome_unknown");
+    expect(stored.some((m) => m.content.includes("Verify it before retrying"))).toBe(true);
+    const hits = await f.host.history.search({
+      terms: ["ordinary uncertain sentinel"],
+      limit: 20,
+    });
+    expect(hits.hits).toHaveLength(1);
   });
 
   it("6: persists the seal fence before stopping sessions and rejects concurrent new board writes and reports", async () => {
-    const f = await fixture();
-    try {
-      const next = f.restart();
-      let stop!: () => void;
-      const blocked = new Promise<void>((resolve) => {
-        stop = resolve;
-      });
-      const destroy = vi
-        .spyOn(f.registry.get("local")!, "destroySession")
-        .mockImplementationOnce(() => blocked);
-      const seal = next.manager.sealProject(f.project.id, "done");
-      const board = expect(
-        f.call(next.lead, "write_objective", { id: objective, context: "late" }),
-      ).rejects.toThrow(/sealed/);
-      const report = expect(f.finish(next.worker)).rejects.toThrow(/sealed/);
-      await vi.waitFor(() => expect(next.manager.get(f.project.id)?.status).toBe("sealed"));
-      const manifest = path.join(path.dirname(f.inboxFile), "project.json");
-      expect(JSON.parse(fs.readFileSync(manifest, "utf8"))).toMatchObject({
-        status: "sealed",
-        sealedReason: "done",
-      });
-      stop();
-      await Promise.all([seal, board, report]);
-      destroy.mockRestore();
-      expect(fs.existsSync(f.inboxFile)).toBe(false);
-    } finally {
-      f.close();
-    }
+    const f = await reportFixture();
+    const next = f.restart();
+    let stop!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    const destroy = vi
+      .spyOn(f.registry.get("local")!, "destroySession")
+      .mockImplementationOnce(() => blocked);
+    const seal = next.manager.sealProject(f.project.id, "done");
+    const board = expect(
+      f.call(next.lead, "write_objective", { id: objective, context: "late" }),
+    ).rejects.toThrow(/sealed/);
+    const report = expect(f.finish(next.worker)).rejects.toThrow(/sealed/);
+    await vi.waitFor(() => expect(next.manager.get(f.project.id)?.status).toBe("sealed"));
+    const manifest = path.join(path.dirname(f.inboxFile), "project.json");
+    expect(JSON.parse(fs.readFileSync(manifest, "utf8"))).toMatchObject({
+      status: "sealed",
+      sealedReason: "done",
+    });
+    stop();
+    await Promise.all([seal, board, report]);
+    destroy.mockRestore();
+    expect(fs.existsSync(f.inboxFile)).toBe(false);
   });
 });

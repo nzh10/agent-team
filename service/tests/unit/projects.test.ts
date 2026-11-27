@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
@@ -19,11 +19,45 @@ import { historyOf, saveIndex, saveWorkspace, loadAll } from "../../src/workspac
 import { summarizeMessages } from "../../src/workspace/summary";
 import { FakeHost, FakeSession } from "./fakes";
 import { HostRegistry } from "../../src/session/host";
-import { setupProjects as setup, tick, tmpDir as tmp, withTask } from "./projectHarness";
+import {
+  setupProjects as setup,
+  tick,
+  tmpDir as tmp,
+  useRecoveryClock,
+  withTask,
+} from "./projectHarness";
+import {
+  createTaskAndStartWorker,
+  setupTaskWorkerProject,
+  setupWorkerProject,
+  startTaskWorker,
+  startWorker,
+} from "./helpers/project-worker";
 
-// Fake setTimeout and Date without hijacking DirWatcher's 250ms setInterval
-// polling, which otherwise runs thousands of sync fs scans on long jumps.
-const useFakeTimers = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+function emitFinishTask(session: FakeSession, toolUseId: string) {
+  session.emit("event", {
+    kind: "tool_use",
+    toolName: "mcp__panel__finish_task",
+    toolUseId,
+    content: "**finish_task**",
+  });
+}
+
+const firstTask = { title: "w", task: "first task" };
+
+const firstPass = { title: "w", task: "first pass" };
+
+const moduleTask = { title: "modules", task: "t" };
+
+const recoveryTest = (name: string, run: () => Promise<void>) =>
+  it(name, async () => {
+    useRecoveryClock();
+    try {
+      await run();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
 describe("ProjectStore", () => {
   it("persists projects outside the repository and removes them whole", () => {
@@ -794,7 +828,7 @@ describe("ProjectManager", () => {
   });
 
   it("takes a Codex model for the lead and its workers, not an unknown one", async () => {
-    const { manager, root, workspaces, call } = setup();
+    const { manager, root, workspaces, workers, call } = setup();
     fs.mkdirSync(path.join(root, "wt"), { recursive: true });
     expect(() => manager.create("x", root, "gpt-5")).toThrow(
       "The selected model is not in the available model catalog.",
@@ -802,13 +836,11 @@ describe("ProjectManager", () => {
     const project = manager.create("clice", root, "gpt-5.5");
     const lead = workspaces.get(project.leadWorkspaceId!)!;
     expect([...lead.agents.values()][0].info.model).toBe("gpt-5.5");
-    await call(lead, "start_session", {
+    const worker = await startWorker({ call, workers }, lead, {
       title: "w",
-      cwd: "wt",
       task: "t",
       model: "gpt-5.6-luna",
     });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
     expect([...worker.agents.values()][0].info.model).toBe("gpt-5.6-luna");
     await call(lead, "start_session", { title: "c", cwd: "wt", task: "t", model: "gpt-5.5" });
     const codex = [...workspaces.values()].filter((w) => w.projectLink?.role === "worker")[1];
@@ -866,19 +898,15 @@ describe("ProjectManager", () => {
   });
 
   it("tells a worker what it is on, as it stands: the task, the lead's word since, its objective", async () => {
-    const { create, call, workspaces, endTurn } = setup();
+    const { create, call, workers, endTurn } = setup();
     const { lead } = create("clice");
     await withTask(call, lead);
     await call(lead, "add_items", { objective_id: "core/modules", decisions: ["which std?"] });
     await call(lead, "write_objective", { id: "core/lexer", title: "Lexer", goal: "tokens" });
-    await call(lead, "start_session", {
+    const worker = await startTaskWorker({ call, workers }, lead, {
       title: "modules",
-      cwd: "wt",
       task: "Implement C++20 modules in the scanner.",
-      objective_id: "core/modules",
-      task_id: "t1",
     });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
     await call(lead, "update_item", {
       objective_id: "core/modules",
       item_id: "d1",
@@ -904,14 +932,10 @@ describe("ProjectManager", () => {
   });
 
   it("omits still-queued lead messages from current_task while keeping delivered ones", async () => {
-    const { create, call, session, workspaces, endTurn } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", {
+    const { worker, lead, call, session, endTurn } = await setupWorkerProject({
       title: "modules",
-      cwd: "wt",
       task: "Implement scanner.",
     });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
 
     await call(lead, "message_session", { session_id: worker.id, message: "Use C++20." });
     endTurn(worker);
@@ -949,7 +973,7 @@ describe("ProjectManager", () => {
   });
 
   it("starts an isolated worker that sees its own tasks and nothing else of the board", async () => {
-    const { create, call, session, workspaces, objectives } = setup();
+    const { create, call, session, workers, objectives } = setup();
     const { lead, project } = create("clice");
     await withTask(call, lead);
     await call(lead, "add_items", {
@@ -958,15 +982,11 @@ describe("ProjectManager", () => {
       decisions: ["which std?"],
     });
     await call(lead, "write_objective", { id: "core/modules", context: "lexer half done" });
-    await call(lead, "start_session", {
+    const worker = await startTaskWorker({ call, workers }, lead, {
       title: "modules",
-      cwd: "wt",
       task: "Implement it.",
-      objective_id: "core/modules",
-      task_id: "t1",
       isolated: true,
     });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
     expect(worker.projectLink).toEqual({ projectId: project.id, role: "worker", isolated: true });
     expect(session(worker).panelTools!.tools.map((t) => t.name)).toEqual([
       "report_progress",
@@ -993,17 +1013,8 @@ describe("ProjectManager", () => {
   });
 
   it("delivers a worker's report to the lead and moves its task to review", async () => {
-    const { create, call, session, workspaces, objectives, manager, endTurn } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
-      title: "modules",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, lead, call, session, objectives, manager, endTurn } =
+      await setupTaskWorkerProject(moduleTask);
 
     // The lead is busy: the report waits in its queue.
     session(lead).isRunning = true;
@@ -1024,17 +1035,7 @@ describe("ProjectManager", () => {
   });
 
   it("writes the objective's context with the finished report, and sends nothing when it is refused", async () => {
-    const { create, call, workspaces, objectives, session } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
-      title: "modules",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, lead, call, objectives, session } = await setupTaskWorkerProject(moduleTask);
     session(lead).isRunning = true;
     await expect(
       call(worker, "finish_task", { summary: "done", context: "x".repeat(1001) }),
@@ -1048,17 +1049,7 @@ describe("ProjectManager", () => {
   });
 
   it("still reports when the context has nowhere to go, and says so", async () => {
-    const { create, call, workspaces, objectives } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
-      title: "modules",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, lead, call, objectives } = await setupTaskWorkerProject(moduleTask);
     const reports = () => lead.messages.filter((m) => m.from?.role === "worker").length;
     // An empty context is none.
     expect(await call(worker, "finish_task", { summary: "a", context: "" })).toBe(
@@ -1080,17 +1071,12 @@ describe("ProjectManager", () => {
   });
 
   it("takes back a context over the limit that is already there", async () => {
-    const { create, call, workspaces, objectives, base } = setup();
+    const { create, call, workers, objectives, base } = setup();
     const { project, lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
+    const worker = await createTaskAndStartWorker({ call, workers }, lead, {
       title: "modules",
-      cwd: "wt",
       task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
     });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
     const long = "x".repeat(1500);
     const file = path.join(
       base,
@@ -1113,7 +1099,7 @@ describe("ProjectManager", () => {
   });
 
   it("gives a worker its task and objectives without who else worked there or needs them", async () => {
-    const { create, call, workspaces } = setup();
+    const { create, call, workers } = setup();
     const { lead } = create("clice");
     await withTask(call, lead);
     await call(lead, "write_objective", {
@@ -1122,14 +1108,7 @@ describe("ProjectManager", () => {
       goal: "g",
       depends_on: ["core/modules"],
     });
-    await call(lead, "start_session", {
-      title: "modules",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const worker = await startTaskWorker({ call, workers }, lead, { title: "modules", task: "t" });
     const now = await call(worker, "current_task");
     expect(now).toContain("core/modules — Modules");
     expect(now).not.toContain("needed by:");
@@ -1218,10 +1197,7 @@ describe("ProjectManager", () => {
   });
 
   it("archives only an idle worker", async () => {
-    const { create, call, session, workspaces } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, lead, call, session } = await setupWorkerProject({ title: "w", task: "t" });
     await expect(call(lead, "archive_session", { session_id: worker.id })).rejects.toThrow(
       "still working",
     );
@@ -1233,11 +1209,10 @@ describe("ProjectManager", () => {
   });
 
   it("lets the user switch a worker's reports to the lead off and on: it then only reads the project", async () => {
-    const { create, call, session, workspaces, frames, manager } = setup();
+    const { create, call, session, workers, frames, manager } = setup();
     const { lead } = create("clice");
     await withTask(call, lead);
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const worker = await startWorker({ call, workers }, lead, { title: "w", task: "t" });
     const names = () => session(worker).panelTools!.tools.map((t) => t.name);
     expect(names()).toContain("finish_task");
     const finish = session(worker).panelTools!.tools.find((t) => t.name === "finish_task")!;
@@ -1299,17 +1274,8 @@ describe("ProjectManager", () => {
   });
 
   it("lets a switch off outlast what the worker's running turn holds: its writes and its report are refused, its steered message stays", async () => {
-    const { create, call, session, workers, manager, objectives, endTurn } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
-      title: "w",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const [worker] = workers();
+    const { worker, lead, call, session, manager, objectives, endTurn } =
+      await setupTaskWorkerProject({ title: "w", task: "t" });
     const s = session(worker);
     const tool = (name: string) => s.panelTools!.tools.find((t) => t.name === name)!;
 
@@ -1361,10 +1327,7 @@ describe("ProjectManager", () => {
   });
 
   it("no longer shows a switched-off worker as waiting for the user on the lead's task", async () => {
-    const { create, call, session, workers, manager } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const [worker] = workers();
+    const { worker, session, manager } = await setupWorkerProject({ title: "w", task: "t" });
     await tick();
     // The task's turn ends in a question, with no report.
     session(worker).isRunning = false;
@@ -1377,10 +1340,11 @@ describe("ProjectManager", () => {
   });
 
   it("drops a rate-limit retry of the lead's task, and gives a switched-off isolated worker the project to read", async () => {
-    const { create, call, session, workers, manager } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t", isolated: true });
-    const [worker] = workers();
+    const { worker, session, manager } = await setupWorkerProject({
+      title: "w",
+      task: "t",
+      isolated: true,
+    });
     await tick();
     const task = worker.messages.find((m) => m.from?.role === "lead")!;
     const agent = [...worker.agents.values()][0];
@@ -1405,10 +1369,8 @@ describe("ProjectManager", () => {
   });
 
   it("deletes the project and its lead, leaving its sessions as plain workspaces", async () => {
-    const { create, call, manager, session, workspaces, frames } = setup();
-    const { lead, project } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, lead, project, manager, session, workspaces, frames } =
+      await setupWorkerProject({ title: "w", task: "t" });
     manager.delete(project.id);
     expect(workspaces.has(lead.id)).toBe(false);
     expect(worker.projectLink).toBeUndefined();
@@ -1418,17 +1380,7 @@ describe("ProjectManager", () => {
   });
 
   it("forgets a deleted worker in the objectives", async () => {
-    const { create, call, manager, workspaces, objectives } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
-      title: "w",
-      cwd: "wt",
-      task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
-    });
-    const worker = [...workspaces.values()].find((w) => w.projectLink?.role === "worker")!;
+    const { worker, manager, objectives } = await setupTaskWorkerProject({ title: "w", task: "t" });
     await manager.forget(worker);
     expect(objectives()[0].sessions).toEqual([]);
     expect(objectives()[0].tasks[0].session).toBeUndefined();
@@ -1437,17 +1389,10 @@ describe("ProjectManager", () => {
 
 describe("project messages that must not be lost or looped", () => {
   it("saves a report awaiting a Lead agent but rejects direct sends to an empty worker", async () => {
-    const { create, call, workers, manager, objectives } = setup();
-    const { lead } = create("clice");
-    await withTask(call, lead);
-    await call(lead, "start_session", {
+    const { worker, lead, call, manager, objectives } = await setupTaskWorkerProject({
       title: "w",
-      cwd: "wt",
       task: "t",
-      objective_id: "core/modules",
-      task_id: "t1",
     });
-    const [worker] = workers();
     lead.removeAgent([...lead.agents.keys()][0]);
 
     await expect(call(worker, "finish_task", { summary: "done" })).resolves.toMatch(
@@ -1507,23 +1452,18 @@ describe("project messages that must not be lost or looped", () => {
     expect(session(b.lead).sent.at(-1)).toContain("otherwise no reply is needed");
   });
 
-  it("space out worker starts so a lead cannot burst sessions", async () => {
-    useFakeTimers();
-    try {
-      const { create, call, workers, session } = setup();
-      const { lead } = create("a");
-      for (let i = 0; i < 3; i++) {
-        await call(lead, "start_session", { title: `w${i}`, cwd: "wt", task: "t" });
-      }
-      const sent = () => workers().map((w) => session(w).sent.length);
-      expect(sent()).toEqual([1, 0, 0]);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(sent()).toEqual([1, 1, 0]);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(sent()).toEqual([1, 1, 1]);
-    } finally {
-      vi.useRealTimers();
+  recoveryTest("space out worker starts so a lead cannot burst sessions", async () => {
+    const { create, call, workers, session } = setup();
+    const { lead } = create("a");
+    for (let i = 0; i < 3; i++) {
+      await call(lead, "start_session", { title: `w${i}`, cwd: "wt", task: "t" });
     }
+    const sent = () => workers().map((w) => session(w).sent.length);
+    expect(sent()).toEqual([1, 0, 0]);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(sent()).toEqual([1, 1, 0]);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(sent()).toEqual([1, 1, 1]);
   });
 });
 
@@ -1570,8 +1510,7 @@ describe("project edge cases", () => {
   it("save renamed and unlinked workspaces right away", async () => {
     const { create, call, manager, workers, saved } = setup();
     const { lead, project } = create("a");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const [worker] = workers();
+    const worker = await startWorker({ call, workers }, lead, { title: "w", task: "t" });
     manager.rename(project.id, "b");
     expect(saved).toEqual([lead.id]);
     manager.delete(project.id);
@@ -1581,8 +1520,7 @@ describe("project edge cases", () => {
   it("show a worker's cut-off turn in the project status", async () => {
     const { create, call, workers, registry } = setup();
     const { lead } = create("a");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const worker = workers()[0];
+    const worker = await startWorker({ call, workers }, lead, { title: "w", task: "t" });
     // A restart mid-turn marks the reply interrupted.
     const restored = Workspace.fromState(worker.getState(), registry);
     const reply = restored.messages.find((m) => m.kind === "agent")!;
@@ -1593,10 +1531,10 @@ describe("project edge cases", () => {
 
 describe("project messages across a restart", () => {
   it("keep a queued report's sender and prompt", async () => {
-    const { create, call, session, workers, registry, base } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const [worker] = workers();
+    const { worker, lead, call, session, registry, base } = await setupWorkerProject({
+      title: "w",
+      task: "t",
+    });
     session(lead).isRunning = true;
     await call(worker, "finish_task", { summary: "done" });
 
@@ -1617,10 +1555,7 @@ describe("project messages across a restart", () => {
 
 describe("message_session and read_session", () => {
   it("queue behind a busy worker and say so", async () => {
-    const { create, call, session, workers, endTurn } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first task" });
-    const [worker] = workers();
+    const { worker, lead, call, session, endTurn } = await setupWorkerProject(firstTask);
     expect(
       await call(lead, "message_session", { session_id: worker.id, message: "tests too" }),
     ).toBe('Sent to "w" (queued: it is busy).');
@@ -1632,13 +1567,10 @@ describe("message_session and read_session", () => {
     ]);
   });
 
-  it("drops a queued Lead follow-up when the user stops a non-steering worker", async () => {
-    useFakeTimers();
-    try {
-      const { create, call, session, workers } = setup();
-      const { lead } = create("clice");
-      await call(lead, "start_session", { title: "w", cwd: "wt", task: "first task" });
-      const [worker] = workers();
+  recoveryTest(
+    "drops a queued Lead follow-up when the user stops a non-steering worker",
+    async () => {
+      const { worker, lead, call, session } = await setupWorkerProject(firstTask);
       const s = session(worker);
       vi.spyOn(s, "abort").mockImplementation(() => {
         s.isRunning = false;
@@ -1652,20 +1584,15 @@ describe("message_session and read_session", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(worker.getMessages().some((m) => m.content === "tests too")).toBe(false);
       expect(s.sent).toEqual(["[From the project lead]\n\nfirst task"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+    },
+  );
 
   it.each([false, true])(
     "persists a user interrupt and drops the Lead follow-up (steered: %s)",
     async (steering) => {
-      useFakeTimers();
+      useRecoveryClock();
       try {
-        const { create, call, session, workers, registry, base } = setup();
-        const { lead } = create("clice");
-        await call(lead, "start_session", { title: "w", cwd: "wt", task: "first task" });
-        const [worker] = workers();
+        const { worker, lead, call, session, registry, base } = await setupWorkerProject(firstTask);
         const [entry] = worker.agents.values();
         const s = session(worker);
         if (steering) Object.assign(s, { steer: () => Promise.resolve(true) });
@@ -1699,10 +1626,7 @@ describe("message_session and read_session", () => {
   );
 
   it("go into a Codex worker's running turn, and its stop takes back what the model had not read", async () => {
-    const { create, call, session, workers } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first task" });
-    const [worker] = workers();
+    const { worker, lead, call, session } = await setupWorkerProject(firstTask);
     const s = session(worker);
     // As CodexSession does: steered ids it has not seen read go back at the
     // turn's end.
@@ -1742,10 +1666,10 @@ describe("message_session and read_session", () => {
   });
 
   it("label senders, count tool calls and cut long replies", async () => {
-    const { create, call, session, workers, endTurn } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "t" });
-    const [worker] = workers();
+    const { worker, lead, call, session, endTurn } = await setupWorkerProject({
+      title: "w",
+      task: "t",
+    });
     session(worker).emit("event", {
       kind: "tool_use",
       content: "**Bash**",
@@ -1772,20 +1696,13 @@ describe("message_session and read_session", () => {
     expect(last1.split("\n").filter((l) => l.startsWith("--- "))).toHaveLength(1);
   });
 
-  it("shows linked tasks and lead-dispatchability in project_status across worker states", async () => {
-    useFakeTimers();
-    try {
-      const { create, call, workers, endTurn, session, manager } = setup();
-      const { lead } = create("clice");
-      await withTask(call, lead);
-      await call(lead, "start_session", {
+  recoveryTest(
+    "shows linked tasks and lead-dispatchability in project_status across worker states",
+    async () => {
+      const { worker, lead, call, endTurn, session, manager } = await setupTaskWorkerProject({
         title: "modules",
-        cwd: "wt",
         task: "implement modules",
-        objective_id: "core/modules",
-        task_id: "t1",
       });
-      const [worker] = workers();
       const lineOf = async (id: string) =>
         (await call(lead, "project_status")).split("\n").find((l) => l.startsWith(`- ${id} `))!;
 
@@ -1819,18 +1736,24 @@ describe("message_session and read_session", () => {
       const ownLine = await lineOf(worker.id);
       expect(ownLine).toContain("(the user's own: does not report to you)");
       expect(ownLine).toContain("not lead-dispatchable (user's own)");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+    },
+  );
 
-  it("enforces ownership and dispatchability server-side on message_session and stop_session", async () => {
-    useFakeTimers();
-    try {
-      const { create, call, workers, endTurn, session, restart, host, base, manager } = setup();
-      const { lead } = create("clice");
-      await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-      let [worker] = workers();
+  recoveryTest(
+    "enforces ownership and dispatchability server-side on message_session and stop_session",
+    async () => {
+      const {
+        worker: startedWorker,
+        lead,
+        call,
+        endTurn,
+        session,
+        restart,
+        host,
+        base,
+        manager,
+      } = await setupWorkerProject(firstPass);
+      let worker = startedWorker;
 
       // Waiting for user (ended opening task without finish_task): refused.
       session(worker).emit("event", { kind: "text_delta", content: "Which option?" });
@@ -1914,15 +1837,10 @@ describe("message_session and read_session", () => {
       await expect(
         call(lead, "message_session", { session_id: worker.id, message: "keep going" }),
       ).rejects.toThrow("stopped by the user");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+    },
+  );
   it("marks an archived worker without loaded history or a persisted blocker as unknown", async () => {
-    const { create, call, workers, endTurn, host, store } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    const [worker] = workers();
+    const { worker, lead, call, endTurn, host, store } = await setupWorkerProject(firstPass);
     endTurn(worker);
     expect(host.archiveWorkspace(worker)).toBe(true);
     store(worker, worker.getMessages());
@@ -1937,10 +1855,8 @@ describe("message_session and read_session", () => {
   });
 
   it("does not hand back a new user turn when draining an older offline finish report", async () => {
-    const { create, call, workers, endTurn, host, manager, session } = setup();
-    const { lead, project } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    const [worker] = workers();
+    const { worker, lead, project, call, endTurn, host, manager, session } =
+      await setupWorkerProject(firstPass);
     host.isLeadOnline = () => false;
     expect(await call(worker, "finish_task", { summary: "first pass done" })).toBe(
       "Report saved for the offline lead.",
@@ -1961,10 +1877,18 @@ describe("message_session and read_session", () => {
   });
 
   it("preserves a user stop after an offline finish on the same turn, including unloaded status", async () => {
-    const { create, call, workers, host, manager, session, store, restart } = setup();
-    const { lead, project } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    let [worker] = workers();
+    const {
+      worker: startedWorker,
+      lead,
+      project,
+      call,
+      host,
+      manager,
+      session,
+      store,
+      restart,
+    } = await setupWorkerProject(firstPass);
+    let worker = startedWorker;
     host.isLeadOnline = () => false;
     await call(worker, "finish_task", { summary: "first pass done" });
     vi.spyOn(session(worker), "abort").mockImplementation(() => {
@@ -1987,20 +1911,12 @@ describe("message_session and read_session", () => {
   });
 
   it("keeps the user stop after handing back a user turn and restarting with history", async () => {
-    const { create, call, workers, session, endTurn, restart } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    const [worker] = workers();
+    const { worker, lead, call, session, endTurn, restart } = await setupWorkerProject(firstPass);
     session(worker).emit("event", { kind: "text_delta", content: "Which option?" });
     endTurn(worker);
     await worker.sendMessage("Use option A.");
     const s = session(worker);
-    s.emit("event", {
-      kind: "tool_use",
-      toolName: "mcp__panel__finish_task",
-      toolUseId: "ft-user",
-      content: "**finish_task**",
-    });
+    emitFinishTask(s, "ft-user");
     await call(worker, "finish_task", { summary: "done" });
     worker.abortAll();
     const assertStopped = (w: Workspace) =>
@@ -2014,19 +1930,11 @@ describe("message_session and read_session", () => {
   });
 
   it("counts a slash prompt sent to the backend, but not a local command, as a takeover", async () => {
-    const { create, call, workers, session, endTurn } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    const [worker] = workers();
+    const { worker, lead, call, session, endTurn } = await setupWorkerProject(firstPass);
     endTurn(worker);
     await worker.sendMessage("Wrap up the first pass.");
     const s = session(worker);
-    s.emit("event", {
-      kind: "tool_use",
-      toolName: "mcp__panel__finish_task",
-      toolUseId: "ft-first",
-      content: "**finish_task**",
-    });
+    emitFinishTask(s, "ft-first");
     await call(worker, "finish_task", { summary: "done" });
     endTurn(worker);
     await worker.sendMessage("/usage");
@@ -2041,22 +1949,14 @@ describe("message_session and read_session", () => {
   });
 
   it("protects a queued user turn even if another agent reports after it was queued", async () => {
-    const { create, call, workers, host, session } = setup();
-    const { lead } = create("clice");
-    await call(lead, "start_session", { title: "w", cwd: "wt", task: "first pass" });
-    const [worker] = workers();
+    const { worker, lead, call, host, session } = await setupWorkerProject(firstPass);
     host.addAgent(worker, "Allen", "gpt-6-astra", "b", "c");
     const [, allen] = worker.agents.values();
     await worker.sendMessage("Stop after the first pass.");
     expect(worker.getMessages().at(-1)?.status).toBe("queued");
     await worker.sendMessage("@Allen recap the work");
     const second = allen.session as FakeSession;
-    second.emit("event", {
-      kind: "tool_use",
-      toolName: "mcp__panel__finish_task",
-      toolUseId: "ft-allen",
-      content: "**finish_task**",
-    });
+    emitFinishTask(second, "ft-allen");
     await second
       .panelTools!.tools.find((t) => t.name === "finish_task")!
       .handler({ summary: "done" });
@@ -2075,8 +1975,7 @@ describe("rate-limit retries", () => {
   const limited = async () => {
     const h = setup();
     const { lead } = h.create("a");
-    await h.call(lead, "start_session", { title: "w", cwd: "wt", task: "build it" });
-    const w = h.workers()[0];
+    const w = await startWorker(h, lead, { title: "w", task: "build it" });
     const [agentId] = w.agents.keys();
     const s = h.session(w);
     // As a limit goes: the server pauses on the session's signal, then the
@@ -2092,8 +1991,7 @@ describe("rate-limit retries", () => {
   const cutWakeUp = async () => {
     const h = setup();
     const { lead } = h.create("a");
-    await h.call(lead, "start_session", { title: "w", cwd: "wt", task: "build it" });
-    const w = h.workers()[0];
+    const w = await startWorker(h, lead, { title: "w", task: "build it" });
     const [agentId] = w.agents.keys();
     const s = h.session(w);
     h.endTurn(w);
@@ -2192,9 +2090,9 @@ describe("rate-limit retries", () => {
     expect(w.retryLast(agentId)).toBe(false);
   });
 
-  it("go ahead of what comes in meanwhile: the lead's message waits, the user's is the cue to retry now", async () => {
-    useFakeTimers();
-    try {
+  recoveryTest(
+    "go ahead of what comes in meanwhile: the lead's message waits, the user's is the cue to retry now",
+    async () => {
       const { lead, w, agentId, s, call, endTurn } = await limited();
       // Past the reset, the retry not yet fired (a restart's ladder).
       w.pauseAgent(agentId, Date.now() - 1, true);
@@ -2215,44 +2113,44 @@ describe("rate-limit retries", () => {
       endTurn(w);
       await vi.advanceTimersByTimeAsync(0);
       expect(s.sent.slice(4)).toEqual(["U"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+    },
+  );
 
-  it("keep their prompt and their time through a turn the CLI starts that the limit refuses too", async () => {
-    const { w, agentId, s, endTurn } = await limited();
-    wakeUp(s);
-    s.emit("event", { kind: "error", content: "Usage limit reached" });
-    endTurn(w);
-    await tick();
-    expect(s.sent).toHaveLength(1);
-    expect(w.retryLast(agentId)).toBe(true);
-    expect(s.sent.slice(1)).toEqual(["[From the project lead]\n\nbuild it"]);
-  });
-
-  it("wait on through a turn the CLI starts that ends without an answer of the model's", async () => {
-    const { w, agentId, s, endTurn } = await limited();
-    // An overloaded API: a notice, a retry banner and nothing from the model.
-    wakeUp(s);
-    s.emit("event", { kind: "retry", content: "API retry 1/10 in 5s" });
-    endTurn(w);
-    await tick();
-    expect(s.sent).toHaveLength(1);
-    expect(w.retryLast(agentId)).toBe(true);
-    expect(s.sent.slice(1)).toEqual(["[From the project lead]\n\nbuild it"]);
-  });
-
-  it("go right after a turn the CLI starts that the limit lets through, as a carry-on", async () => {
-    const { w, agentId, s, endTurn } = await limited();
-    wakeUp(s);
-    s.emit("event", { kind: "text_delta", content: "the build passed" });
-    endTurn(w);
-    await tick();
-    // That turn saw "build it": sending it again would do it twice.
-    expect(s.sent.slice(1)).toEqual([CARRY_ON]);
-    expect(w.retryLast(agentId)).toBe(false);
-  });
+  for (const { name, event, sawPrompt } of [
+    {
+      name: "keep their prompt and their time through a turn the CLI starts that the limit refuses too",
+      event: { kind: "error", content: "Usage limit reached" },
+      sawPrompt: false,
+    },
+    {
+      name: "wait on through a turn the CLI starts that ends without an answer of the model's",
+      // An overloaded API: a notice, a retry banner and nothing from the model.
+      event: { kind: "retry", content: "API retry 1/10 in 5s" },
+      sawPrompt: false,
+    },
+    {
+      name: "go right after a turn the CLI starts that the limit lets through, as a carry-on",
+      event: { kind: "text_delta", content: "the build passed" },
+      sawPrompt: true,
+    },
+  ]) {
+    it(name, async () => {
+      const { w, agentId, s, endTurn } = await limited();
+      wakeUp(s);
+      s.emit("event", event);
+      endTurn(w);
+      await tick();
+      if (!sawPrompt) {
+        expect(s.sent).toHaveLength(1);
+        expect(w.retryLast(agentId)).toBe(true);
+      }
+      // If the turn saw "build it", sending it again would do it twice.
+      expect(s.sent.slice(1)).toEqual([
+        sawPrompt ? CARRY_ON : "[From the project lead]\n\nbuild it",
+      ]);
+      if (sawPrompt) expect(w.retryLast(agentId)).toBe(false);
+    });
+  }
 
   it("outlast a turn the CLI started that runs when they fall due", async () => {
     const { w, agentId, s } = await limited();
@@ -2276,22 +2174,17 @@ describe("rate-limit retries", () => {
     expect(s.sent.slice(1)).toEqual([CARRY_ON]);
   });
 
-  it("are not used up by the user writing while a turn still runs", async () => {
-    useFakeTimers();
-    try {
-      const { w, agentId, s, endTurn } = await limited();
-      s.isRunning = true;
-      await w.sendMessage("U");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(s.sent).toHaveLength(1);
-      expect(w.retryLast(agentId)).toBe(true);
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(s.sent.slice(1)).toEqual(["[From the project lead]\n\nbuild it", "U"]);
-    } finally {
-      vi.useRealTimers();
-    }
+  recoveryTest("are not used up by the user writing while a turn still runs", async () => {
+    const { w, agentId, s, endTurn } = await limited();
+    s.isRunning = true;
+    await w.sendMessage("U");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.sent).toHaveLength(1);
+    expect(w.retryLast(agentId)).toBe(true);
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.sent.slice(1)).toEqual(["[From the project lead]\n\nbuild it", "U"]);
   });
 });
 
@@ -2305,9 +2198,9 @@ describe("worker tasks held back for spacing", () => {
     return { ...env, lead, reply, w1 };
   };
 
-  it("wait as a saved queued message and go out after the gap, or after a restart", async () => {
-    useFakeTimers();
-    try {
+  recoveryTest(
+    "wait as a saved queued message and go out after the gap, or after a restart",
+    async () => {
       const { reply, w1, session, registry } = await twoStarts();
       expect(reply).toContain("Its task goes out in 15 s");
       const task = w1.messages.find((m) => m.kind === "user")!;
@@ -2319,65 +2212,48 @@ describe("worker tasks held back for spacing", () => {
       expect(session(w1).sent).toEqual([]);
       await vi.advanceTimersByTimeAsync(START_SPACING_MS);
       expect(session(w1).sent).toEqual(["[From the project lead]\n\nsecond"]);
-    } finally {
-      vi.useRealTimers();
-    }
+    },
+  );
+
+  recoveryTest("leave nothing to retry once sent, so a restart sends nothing again", async () => {
+    const { w1, session, endTurn, registry } = await twoStarts();
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    endTurn(w1);
+    const saved = w1.getState().agents[0];
+    expect([saved.pausedUntil, saved.lastEnvelope]).toEqual([undefined, undefined]);
+    const restored = Workspace.fromState(w1.getState(), registry);
+    expect([...restored.agents.values()][0].retryPending).toBe(false);
+    expect(session(w1).sent).toHaveLength(1);
   });
 
-  it("leave nothing to retry once sent, so a restart sends nothing again", async () => {
-    useFakeTimers();
-    try {
-      const { w1, session, endTurn, registry } = await twoStarts();
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      endTurn(w1);
-      const saved = w1.getState().agents[0];
-      expect([saved.pausedUntil, saved.lastEnvelope]).toEqual([undefined, undefined]);
-      const restored = Workspace.fromState(w1.getState(), registry);
-      expect([...restored.agents.values()][0].retryPending).toBe(false);
-      expect(session(w1).sent).toHaveLength(1);
-    } finally {
-      vi.useRealTimers();
-    }
+  recoveryTest("space the lead's messages that wake idle workers", async () => {
+    const { w1, lead, call, session, endTurn, workers } = await twoStarts();
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    const w0 = workers().find((w) => w.name === "w0")!;
+    await call(w0, "finish_task", { summary: "first done" });
+    await call(w1, "finish_task", { summary: "second done" });
+    endTurn(w0);
+    endTurn(w1);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(await call(lead, "message_session", { session_id: w0.id, message: "go on" })).toBe(
+      'Sent to "w0".',
+    );
+    expect(await call(lead, "message_session", { session_id: w1.id, message: "go on" })).toBe(
+      'Sent to "w1"; it goes out in 15 s: starts are spaced out.',
+    );
+    expect(session(w1).sent).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(session(w1).sent).toEqual([
+      "[From the project lead]\n\nsecond",
+      "[From the project lead]\n\ngo on",
+    ]);
   });
 
-  it("space the lead's messages that wake idle workers", async () => {
-    useFakeTimers();
-    try {
-      const { w1, lead, call, session, endTurn, workers } = await twoStarts();
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      const w0 = workers().find((w) => w.name === "w0")!;
-      await call(w0, "finish_task", { summary: "first done" });
-      await call(w1, "finish_task", { summary: "second done" });
-      endTurn(w0);
-      endTurn(w1);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(await call(lead, "message_session", { session_id: w0.id, message: "go on" })).toBe(
-        'Sent to "w0".',
-      );
-      expect(await call(lead, "message_session", { session_id: w1.id, message: "go on" })).toBe(
-        'Sent to "w1"; it goes out in 15 s: starts are spaced out.',
-      );
-      expect(session(w1).sent).toHaveLength(1);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(session(w1).sent).toEqual([
-        "[From the project lead]\n\nsecond",
-        "[From the project lead]\n\ngo on",
-      ]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("go out even when their timer fires a millisecond early", async () => {
-    useFakeTimers();
-    try {
-      const { w1, session } = await twoStarts();
-      vi.setSystemTime(Date.now() - 1);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(session(w1).sent).toEqual(["[From the project lead]\n\nsecond"]);
-    } finally {
-      vi.useRealTimers();
-    }
+  recoveryTest("go out even when their timer fires a millisecond early", async () => {
+    const { w1, session } = await twoStarts();
+    vi.setSystemTime(Date.now() - 1);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(session(w1).sent).toEqual(["[From the project lead]\n\nsecond"]);
   });
 
   it("pass a queued lead message on to the agent that takes over from a removed one", async () => {
@@ -2410,9 +2286,9 @@ describe("worker tasks held back for spacing", () => {
     });
   });
 
-  it("are not held back by a restart's checks on the workers that owe their lead a word", async () => {
-    useFakeTimers();
-    try {
+  recoveryTest(
+    "are not held back by a restart's checks on the workers that owe their lead a word",
+    async () => {
       const { create, call, manager, workers } = setup();
       const { lead } = create("a");
       for (let i = 0; i < 8; i++) {
@@ -2424,68 +2300,53 @@ describe("worker tasks held back for spacing", () => {
       expect(await call(lead, "start_session", { title: "x", cwd: "wt", task: "x" })).not.toContain(
         "goes out in",
       );
-    } finally {
-      vi.useRealTimers();
-    }
+    },
+  );
+
+  recoveryTest("stay ahead of a follow-up sent in the meantime", async () => {
+    const { w1, lead, call, session, endTurn } = await twoStarts();
+    expect(await call(lead, "message_session", { session_id: w1.id, message: "also X" })).toBe(
+      'Sent to "w1" (queued: it is busy).',
+    );
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    endTurn(w1);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(session(w1).sent).toEqual([
+      "[From the project lead]\n\nsecond",
+      "[From the project lead]\n\nalso X",
+    ]);
   });
 
-  it("stay ahead of a follow-up sent in the meantime", async () => {
-    useFakeTimers();
-    try {
-      const { w1, lead, call, session, endTurn } = await twoStarts();
-      expect(await call(lead, "message_session", { session_id: w1.id, message: "also X" })).toBe(
-        'Sent to "w1" (queued: it is busy).',
-      );
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      endTurn(w1);
-      await vi.advanceTimersByTimeAsync(10);
-      expect(session(w1).sent).toEqual([
-        "[From the project lead]\n\nsecond",
-        "[From the project lead]\n\nalso X",
-      ]);
-    } finally {
-      vi.useRealTimers();
-    }
+  recoveryTest("are dropped by stop_session", async () => {
+    const { w1, lead, call, session, frames } = await twoStarts();
+    await call(lead, "stop_session", { session_id: w1.id });
+    expect(w1.messages.some((m) => m.status === "queued")).toBe(false);
+    expect(frames).toContainEqual(
+      expect.objectContaining({ type: "message_removed", workspaceId: w1.id, queued: false }),
+    );
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(session(w1).sent).toEqual([]);
   });
 
-  it("are dropped by stop_session", async () => {
-    useFakeTimers();
-    try {
-      const { w1, lead, call, session, frames } = await twoStarts();
-      await call(lead, "stop_session", { session_id: w1.id });
-      expect(w1.messages.some((m) => m.status === "queued")).toBe(false);
-      expect(frames).toContainEqual(
-        expect.objectContaining({ type: "message_removed", workspaceId: w1.id, queued: false }),
-      );
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(session(w1).sent).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("are dropped with their project", async () => {
-    useFakeTimers();
-    try {
-      const { w1, session, manager, lead } = await twoStarts();
-      manager.delete(lead.projectLink!.projectId);
-      expect(w1.projectLink).toBeUndefined();
-      expect(w1.messages.some((m) => m.status === "queued")).toBe(false);
-      await vi.advanceTimersByTimeAsync(START_SPACING_MS);
-      expect(session(w1).sent).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+  recoveryTest("are dropped with their project", async () => {
+    const { w1, session, manager, lead } = await twoStarts();
+    manager.delete(lead.projectLink!.projectId);
+    expect(w1.projectLink).toBeUndefined();
+    expect(w1.messages.some((m) => m.status === "queued")).toBe(false);
+    await vi.advanceTimersByTimeAsync(START_SPACING_MS);
+    expect(session(w1).sent).toEqual([]);
   });
 });
 
 describe("a worker that goes idle without reporting", () => {
+  beforeEach(useRecoveryClock);
+  afterEach(() => vi.useRealTimers());
+
   // A lead with one worker running the task it was given.
   const started = async () => {
     const h = setup();
     const { lead, project } = h.create("a");
-    await h.call(lead, "start_session", { title: "w", cwd: "wt", task: "do it" });
-    const w = h.workers()[0];
+    const w = await startWorker(h, lead, { title: "w", task: "do it" });
     const say = (text: string, to = w) =>
       h.session(to).emit("event", { kind: "text_delta", content: text });
     const told = () =>
@@ -2502,7 +2363,11 @@ describe("a worker that goes idle without reporting", () => {
       await vi.advanceTimersByTimeAsync(0);
     };
     const state = (s: string) => h.session(w).emit("runState", s);
-    return { ...h, lead, project, w, say, told, settle, ask, askNext, state };
+    const shown = () =>
+      h.frames
+        .filter((f) => f.type === "workspace_updated" && f.id === w.id)
+        .map((f) => f.awaitsUser === true);
+    return { ...h, lead, project, w, say, told, settle, ask, askNext, state, shown };
   };
   const CARRY_ON =
     "[From the panel] A server restart cut your turn off. Carry on where you left off.";
@@ -2512,316 +2377,255 @@ describe("a worker that goes idle without reporting", () => {
       .join("\n\n");
 
   it("takes a refused finish_task for no report: the worker still waits for the user", async () => {
-    useFakeTimers();
-    try {
-      const { w, session } = await started();
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "f1",
-        content: "**finish_task**",
-      });
-      session(w).emit("event", {
-        kind: "tool_result",
-        toolUseId: "f1",
-        content: "The context is 1200 characters, over the 1000 the board takes.",
-        isError: true,
-      });
-      session(w).emit("event", { kind: "text_delta", content: "Shall I shorten it?" });
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "result", content: "" });
-      expect(awaitsUser(w)).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, session } = await started();
+    emitFinishTask(session(w), "f1");
+    session(w).emit("event", {
+      kind: "tool_result",
+      toolUseId: "f1",
+      content: "The context is 1200 characters, over the 1000 the board takes.",
+      isError: true,
+    });
+    session(w).emit("event", { kind: "text_delta", content: "Shall I shorten it?" });
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "result", content: "" });
+    expect(awaitsUser(w)).toBe(true);
   });
 
   it("leaves a task that ends in a question to the user, across a restart too", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, restart, manager } = await started();
-      say("Which branch should this go on?");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([]);
-      expect(w.lastDelivered()[0].answered).toBe(true);
-      const back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(back.lastDelivered()[0].answered).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, restart, manager } = await started();
+    say("Which branch should this go on?");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([]);
+    expect(w.lastDelivered()[0].answered).toBe(true);
+    const back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(back.lastDelivered()[0].answered).toBe(true);
   });
 
   it("tells the lead once, with the last reply, when its later message is answered without a report", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, askNext } = await started();
-      await askNext("which branch is it on?");
-      say("feature/x");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
-      expect(told()).toEqual([]);
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "which branch is it on?", "feature/x")]);
-      // A wake-up turn after it (a background task) is no new work from the lead.
-      say("late output");
-      endTurn(w);
-      await settle();
-      expect(told()).toHaveLength(1);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, askNext } = await started();
+    await askNext("which branch is it on?");
+    say("feature/x");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
+    expect(told()).toEqual([]);
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "which branch is it on?", "feature/x")]);
+    // A wake-up turn after it (a background task) is no new work from the lead.
+    say("late output");
+    endTurn(w);
+    await settle();
+    expect(told()).toHaveLength(1);
   });
 
   it("counts the wait from the last thing the worker did", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, endTurn, ask } = await started();
-      await ask("also this");
-      say("first");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
-      say("second");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
-      expect(told()).toEqual([]);
-      await vi.advanceTimersByTimeAsync(100);
-      expect(told()).toEqual([note("its turn ended", "also this", "second")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, endTurn, ask } = await started();
+    await ask("also this");
+    say("first");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
+    say("second");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(SETTLE_MS - 100);
+    expect(told()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(told()).toEqual([note("its turn ended", "also this", "second")]);
   });
 
   it("does not tell in the gap between a background task's end and the turn it starts", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, askNext, state } = await started();
-      await askNext("run the build");
-      // Timings from the claude/bash-bg recording.
-      say("started");
-      state("waiting");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(4008);
-      state("idle");
-      await vi.advanceTimersByTimeAsync(1861);
-      state("working");
-      await settle();
-      expect(told()).toEqual([]);
-      say("the output says done");
-      endTurn(w);
-      state("idle");
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "run the build", "the output says done")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, askNext, state } = await started();
+    await askNext("run the build");
+    // Timings from the claude/bash-bg recording.
+    say("started");
+    state("waiting");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(4008);
+    state("idle");
+    await vi.advanceTimersByTimeAsync(1861);
+    state("working");
+    await settle();
+    expect(told()).toEqual([]);
+    say("the output says done");
+    endTurn(w);
+    state("idle");
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "run the build", "the output says done")]);
   });
 
   it("says nothing more once it finished, but a progress report is not one", async () => {
-    useFakeTimers();
-    try {
-      const { w, call, say, told, settle, endTurn, ask } = await started();
-      say("Done.");
-      await call(w, "finish_task", { summary: "merged" });
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual(["Finished:\n\nmerged"]);
+    const { w, call, say, told, settle, endTurn, ask } = await started();
+    say("Done.");
+    await call(w, "finish_task", { summary: "merged" });
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual(["Finished:\n\nmerged"]);
 
-      // A follow-up queued behind the turn that reported is owed its own.
-      await ask("the API docs");
-      await ask("and the README");
-      await call(w, "finish_task", { summary: "API docs written" });
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(0);
-      await call(w, "report_progress", { text: "README half done" });
-      say("Stopping here for now.");
-      endTurn(w);
-      await settle();
-      expect(told().slice(1)).toEqual([
-        "Finished:\n\nAPI docs written",
-        "Progress:\n\nREADME half done",
-        note("its turn ended", "and the README", "Stopping here for now."),
-      ]);
-    } finally {
-      vi.useRealTimers();
-    }
+    // A follow-up queued behind the turn that reported is owed its own.
+    await ask("the API docs");
+    await ask("and the README");
+    await call(w, "finish_task", { summary: "API docs written" });
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(0);
+    await call(w, "report_progress", { text: "README half done" });
+    say("Stopping here for now.");
+    endTurn(w);
+    await settle();
+    expect(told().slice(1)).toEqual([
+      "Finished:\n\nAPI docs written",
+      "Progress:\n\nREADME half done",
+      note("its turn ended", "and the README", "Stopping here for now."),
+    ]);
   });
 
   it("tells how a failed turn ended, and leaves one the user stopped to them", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, session, ask } = await started();
-      say("Working on it");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
-      await settle();
-      expect(told()).toEqual([
-        'Worker turn failed on your message "do it".\n\nError: API Error: 529 overloaded\n\nIts last reply:\n\nWorking on it',
-      ]);
+    const { w, say, told, settle, session, ask } = await started();
+    say("Working on it");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
+    await settle();
+    expect(told()).toEqual([
+      'Worker turn failed on your message "do it".\n\nError: API Error: 529 overloaded\n\nIts last reply:\n\nWorking on it',
+    ]);
 
-      await ask("try again");
-      say("Retrying");
-      session(w).isRunning = false;
-      w.abortAll();
-      await settle();
-      expect(w.lastDelivered()[0]).toMatchObject({ stopped: "user", answered: true });
-      expect(told()).toHaveLength(1);
+    await ask("try again");
+    say("Retrying");
+    session(w).isRunning = false;
+    w.abortAll();
+    await settle();
+    expect(w.lastDelivered()[0]).toMatchObject({ stopped: "user", answered: true });
+    expect(told()).toHaveLength(1);
 
-      // Stopped while it waited on a background task, its turn long over.
-      const bg = await started();
-      bg.say("Started it in the background.");
-      bg.state("waiting");
-      bg.endTurn(bg.w);
-      bg.w.abortAll();
-      bg.state("idle");
-      await bg.settle();
-      expect(bg.w.lastDelivered()[0]).toMatchObject({ stopped: "user", answered: true });
-      expect(bg.told()).toEqual([]);
+    // Stopped while it waited on a background task, its turn long over.
+    const bg = await started();
+    bg.say("Started it in the background.");
+    bg.state("waiting");
+    bg.endTurn(bg.w);
+    bg.w.abortAll();
+    bg.state("idle");
+    await bg.settle();
+    expect(bg.w.lastDelivered()[0]).toMatchObject({ stopped: "user", answered: true });
+    expect(bg.told()).toEqual([]);
 
-      // Context cleared under a background task: a stop too.
-      const cleared = await started();
-      cleared.say("Profiling in the background.");
-      cleared.state("waiting");
-      cleared.endTurn(cleared.w);
-      cleared.w.clearContext([...cleared.w.agents.keys()][0]);
-      cleared.state("idle");
-      await cleared.settle();
-      expect(cleared.told()).toEqual([]);
-      expect(cleared.w.lastDelivered()[0].answered).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // Context cleared under a background task: a stop too.
+    const cleared = await started();
+    cleared.say("Profiling in the background.");
+    cleared.state("waiting");
+    cleared.endTurn(cleared.w);
+    cleared.w.clearContext([...cleared.w.agents.keys()][0]);
+    cleared.state("idle");
+    await cleared.settle();
+    expect(cleared.told()).toEqual([]);
+    expect(cleared.w.lastDelivered()[0].answered).toBe(true);
   });
 
   it("does not treat a stray process diagnostic after a successful wake-up as a failed turn", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, session, endTurn, state } = await started();
-      say("Build started.");
-      state("waiting");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "result", content: "", interrupted: true });
-      state("working");
-      say("Build passed.");
-      endTurn(w);
-      state("idle");
-      // The CLI dies afterwards with an error of its own.
-      session(w).emit("event", { kind: "error", content: "[Claude error] exited" });
-      await settle();
-      expect(told()).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, session, endTurn, state } = await started();
+    say("Build started.");
+    state("waiting");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "result", content: "", interrupted: true });
+    state("working");
+    say("Build passed.");
+    endTurn(w);
+    state("idle");
+    // The CLI dies afterwards with an error of its own.
+    session(w).emit("event", { kind: "error", content: "[Claude error] exited" });
+    await settle();
+    expect(told()).toEqual([]);
   });
 
   it("leaves the lead's own stop alone, and a worker the user took over to the user", async () => {
-    useFakeTimers();
-    try {
-      const { lead, w, call, say, told, settle, session, endTurn, ask } = await started();
-      session(w).isRunning = false;
-      await call(lead, "stop_session", { session_id: w.id });
-      await settle();
-      expect(told()).toEqual([]);
+    const { lead, w, call, say, told, settle, session, endTurn, ask } = await started();
+    session(w).isRunning = false;
+    await call(lead, "stop_session", { session_id: w.id });
+    await settle();
+    expect(told()).toEqual([]);
 
-      // The user's turns after the lead's message make it theirs.
-      await ask("which commit?");
-      say("abc123");
-      await w.sendMessage("now rebase it");
-      endTurn(w);
-      await vi.advanceTimersByTimeAsync(0);
-      say("Rebased.");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([]);
-      expect(w.lastDelivered()[0].answered).toBe(true);
+    // The user's turns after the lead's message make it theirs.
+    await ask("which commit?");
+    say("abc123");
+    await w.sendMessage("now rebase it");
+    endTurn(w);
+    await vi.advanceTimersByTimeAsync(0);
+    say("Rebased.");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([]);
+    expect(w.lastDelivered()[0].answered).toBe(true);
 
-      // A failed turn too: the user is there to see it.
-      const failed = await started();
-      failed.session(failed.w).isRunning = false;
-      failed.session(failed.w).emit("event", {
-        kind: "error",
-        content: "API Error: 529 overloaded",
-      });
-      await failed.w.sendMessage("what happened?");
-      failed.endTurn(failed.w);
-      await failed.settle();
-      expect(failed.told()).toEqual([]);
-      expect(failed.w.lastDelivered()[0]).toMatchObject({ since: true, answered: true });
+    // A failed turn too: the user is there to see it.
+    const failed = await started();
+    failed.session(failed.w).isRunning = false;
+    failed.session(failed.w).emit("event", {
+      kind: "error",
+      content: "API Error: 529 overloaded",
+    });
+    await failed.w.sendMessage("what happened?");
+    failed.endTurn(failed.w);
+    await failed.settle();
+    expect(failed.told()).toEqual([]);
+    expect(failed.w.lastDelivered()[0]).toMatchObject({ since: true, answered: true });
 
-      // A command the panel answers itself runs no turn.
-      const slash = await started();
-      await slash.askNext("which branch?");
-      slash.say("main");
-      slash.endTurn(slash.w);
-      await slash.w.sendMessage("/usage");
-      await slash.settle();
-      expect(slash.told()).toEqual([note("its turn ended", "which branch?", "main")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    // A command the panel answers itself runs no turn.
+    const slash = await started();
+    await slash.askNext("which branch?");
+    slash.say("main");
+    slash.endTurn(slash.w);
+    await slash.w.sendMessage("/usage");
+    await slash.settle();
+    expect(slash.told()).toEqual([note("its turn ended", "which branch?", "main")]);
   });
 
   it("waits while anything is still to run: a queued message, a pause, a background task, a wake-up", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, ask, state } = await started();
-      await ask("also this");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([]);
+    const { w, say, told, settle, endTurn, ask, state } = await started();
+    await ask("also this");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([]);
 
-      const [agentId] = w.agents.keys();
-      w.pauseAgent(agentId, Date.now() + 60_000);
-      say("Also done.");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([]);
-      w.pauseAgent(agentId, 0);
+    const [agentId] = w.agents.keys();
+    w.pauseAgent(agentId, Date.now() + 60_000);
+    say("Also done.");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([]);
+    w.pauseAgent(agentId, 0);
 
-      state("waiting");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([]);
+    state("waiting");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([]);
 
-      state("sleeping");
-      await settle();
-      expect(told()).toEqual([]);
-      state("idle");
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "also this", "Also done.")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    state("sleeping");
+    await settle();
+    expect(told()).toEqual([]);
+    state("idle");
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "also this", "Also done.")]);
   });
 
   it("keeps two agents of a worker apart, and a stop of one from the other", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, askNext } = await started();
-      await askNext("is staging up?");
-      const b = w.addAgent("B", "gpt-6-astra", "b", "c", { backend: "codex" });
-      const other = w.agents.get(b.id)!.session as FakeSession;
-      await w.sendMessage("look at the logs", b.id);
-      say("Need the staging URL.");
-      endTurn(w);
-      other.emit("event", { kind: "text_delta", content: "tailing them" });
-      other.emit("runState", "waiting");
-      other.isRunning = false;
-      other.emit("event", { kind: "result", content: "" });
-      w.abortAll();
-      other.emit("runState", "idle");
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "is staging up?", "Need the staging URL.")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, askNext } = await started();
+    await askNext("is staging up?");
+    const b = w.addAgent("B", "gpt-6-astra", "b", "c", { backend: "codex" });
+    const other = w.agents.get(b.id)!.session as FakeSession;
+    await w.sendMessage("look at the logs", b.id);
+    say("Need the staging URL.");
+    endTurn(w);
+    other.emit("event", { kind: "text_delta", content: "tailing them" });
+    other.emit("runState", "waiting");
+    other.isRunning = false;
+    other.emit("event", { kind: "result", content: "" });
+    w.abortAll();
+    other.emit("runState", "idle");
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "is staging up?", "Need the staging URL.")]);
   });
 
   it("never throws out of its timer, and stops with the manager", async () => {
-    useFakeTimers();
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const { lead, w, told, settle, endTurn, ask, askNext, manager, host } = await started();
@@ -2840,594 +2644,463 @@ describe("a worker that goes idle without reporting", () => {
       expect(told()).toEqual([]);
     } finally {
       errors.mockRestore();
-      vi.useRealTimers();
     }
   });
 
   it("comes from the panel, about the worker", async () => {
-    useFakeTimers();
-    try {
-      const { lead, w, endTurn, askNext, settle } = await started();
-      await askNext("which branch?");
-      endTurn(w);
-      await settle();
-      expect(lead.getMessages().find((m) => m.from?.workspaceId === w.id)!.from).toEqual({
-        workspaceId: w.id,
-        name: "w",
-        role: "panel",
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+    const { lead, w, endTurn, askNext, settle } = await started();
+    await askNext("which branch?");
+    endTurn(w);
+    await settle();
+    expect(lead.getMessages().find((m) => m.from?.workspaceId === w.id)!.from).toEqual({
+      workspaceId: w.id,
+      name: "w",
+      role: "panel",
+    });
   });
 
   it("carries on a turn a restart cut off, a shutdown or a crash, without the lead", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, restart, manager, session, endTurn } = await started();
-      say("Halfway through");
-      w.abortAll("restart");
-      let back = restart(w);
-      expect(awaitsUser(back)).toBe(false);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(session(back).sent).toEqual([CARRY_ON]);
-      expect(back.getMessages().filter((m) => m.from?.role === "panel")).toMatchObject([
-        { from: { workspaceId: w.id, name: "w", role: "panel" } },
-      ]);
-      // What comes of it stands for the task: a question waits for the user.
-      say("Which branch should this go on?", back);
-      endTurn(back);
-      await settle();
-      expect(told()).toEqual([]);
-      expect(awaitsUser(back)).toBe(true);
-      // Nothing is cut off any more: a later restart carries nothing on.
-      back = restart(back);
-      manager.recheckWorkers();
-      await settle();
-      expect(session(back).sent).toEqual([]);
-      expect(awaitsUser(back)).toBe(true);
+    const { w, say, told, settle, restart, manager, session, endTurn } = await started();
+    say("Halfway through");
+    w.abortAll("restart");
+    let back = restart(w);
+    expect(awaitsUser(back)).toBe(false);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(session(back).sent).toEqual([CARRY_ON]);
+    expect(back.getMessages().filter((m) => m.from?.role === "panel")).toMatchObject([
+      { from: { workspaceId: w.id, name: "w", role: "panel" } },
+    ]);
+    // What comes of it stands for the task: a question waits for the user.
+    say("Which branch should this go on?", back);
+    endTurn(back);
+    await settle();
+    expect(told()).toEqual([]);
+    expect(awaitsUser(back)).toBe(true);
+    // Nothing is cut off any more: a later restart carries nothing on.
+    back = restart(back);
+    manager.recheckWorkers();
+    await settle();
+    expect(session(back).sent).toEqual([]);
+    expect(awaitsUser(back)).toBe(true);
 
-      // The lead's later question, cut off by a crash mid-turn, goes on too,
-      // and its answer reaches the lead as the answer to the question.
-      const follow = await started();
-      await follow.askNext("which commit?");
-      follow.say("Looking");
-      const resumed = follow.restart(follow.w);
-      follow.manager.recheckWorkers();
-      await follow.settle();
-      expect(follow.session(resumed).sent).toEqual([CARRY_ON]);
-      follow.say("abc123", resumed);
-      follow.endTurn(resumed);
-      await follow.settle();
-      expect(follow.told()).toEqual([note("its turn ended", "which commit?", "abc123")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    // The lead's later question, cut off by a crash mid-turn, goes on too,
+    // and its answer reaches the lead as the answer to the question.
+    const follow = await started();
+    await follow.askNext("which commit?");
+    follow.say("Looking");
+    const resumed = follow.restart(follow.w);
+    follow.manager.recheckWorkers();
+    await follow.settle();
+    expect(follow.session(resumed).sent).toEqual([CARRY_ON]);
+    follow.say("abc123", resumed);
+    follow.endTurn(resumed);
+    await follow.settle();
+    expect(follow.told()).toEqual([note("its turn ended", "which commit?", "abc123")]);
   });
 
   it("carries on the lead's message past a command the user had the panel answer", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, restart, manager, askNext, session, endTurn } = await started();
-      await askNext("which commit?");
-      say("Looking");
-      await w.sendMessage("/usage");
-      const back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(session(back).sent).toEqual([CARRY_ON]);
-      say("abc123", back);
-      endTurn(back);
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "which commit?", "abc123")]);
-      expect(awaitsUser(back)).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, restart, manager, askNext, session, endTurn } = await started();
+    await askNext("which commit?");
+    say("Looking");
+    await w.sendMessage("/usage");
+    const back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(session(back).sent).toEqual([CARRY_ON]);
+    say("abc123", back);
+    endTurn(back);
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "which commit?", "abc123")]);
+    expect(awaitsUser(back)).toBe(false);
   });
 
   it("carries on once: cut off again, the lead is told", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, restart, manager, session } = await started();
-      say("Halfway through");
-      w.abortAll("restart");
-      let back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(session(back).sent).toEqual([CARRY_ON]);
-      say("Three quarters", back);
-      back.abortAll("restart");
-      back = restart(back);
-      manager.recheckWorkers();
-      await settle();
-      expect(session(back).sent).toEqual([]);
-      expect(told()).toEqual([
-        note("a server restart cut it off again after it carried on", "do it", "Three quarters"),
-      ]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, restart, manager, session } = await started();
+    say("Halfway through");
+    w.abortAll("restart");
+    let back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(session(back).sent).toEqual([CARRY_ON]);
+    say("Three quarters", back);
+    back.abortAll("restart");
+    back = restart(back);
+    manager.recheckWorkers();
+    await settle();
+    expect(session(back).sent).toEqual([]);
+    expect(told()).toEqual([
+      note("a server restart cut it off again after it carried on", "do it", "Three quarters"),
+    ]);
   });
 
   it("drops a carry-on waiting for its start slot when the user writes first", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, restart, manager, session, endTurn } = await started();
-      say("Halfway through");
-      w.abortAll("restart");
-      const back = restart(w);
-      manager.recheckWorkers();
-      await vi.advanceTimersByTimeAsync(SETTLE_MS - 1000);
-      // Other starts hold the next slots.
-      manager.takeStartSlot(1000);
-      manager.takeStartSlot(1000);
-      await vi.advanceTimersByTimeAsync(1000);
-      expect(session(back).sent).toEqual([]);
-      await back.sendMessage("forget that, do this instead");
-      endTurn(back);
-      await vi.advanceTimersByTimeAsync(3 * START_SPACING_MS);
-      expect(session(back).sent).toEqual(["forget that, do this instead"]);
-      expect(told()).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, restart, manager, session, endTurn } = await started();
+    say("Halfway through");
+    w.abortAll("restart");
+    const back = restart(w);
+    manager.recheckWorkers();
+    await vi.advanceTimersByTimeAsync(SETTLE_MS - 1000);
+    // Other starts hold the next slots.
+    manager.takeStartSlot(1000);
+    manager.takeStartSlot(1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(session(back).sent).toEqual([]);
+    await back.sendMessage("forget that, do this instead");
+    endTurn(back);
+    await vi.advanceTimersByTimeAsync(3 * START_SPACING_MS);
+    expect(session(back).sent).toEqual(["forget that, do this instead"]);
+    expect(told()).toEqual([]);
   });
 
   it("leaves a turn a restart cut off to the user who wrote to it since", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, restart, manager, session, endTurn } = await started();
-      say("Halfway through");
-      w.abortAll("restart");
-      const back = restart(w);
-      await back.sendMessage("never mind, stop there");
-      endTurn(back);
-      manager.recheckWorkers();
-      await settle();
-      expect(session(back).sent).toEqual(["never mind, stop there"]);
-      expect(told()).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, restart, manager, session, endTurn } = await started();
+    say("Halfway through");
+    w.abortAll("restart");
+    const back = restart(w);
+    await back.sendMessage("never mind, stop there");
+    endTurn(back);
+    manager.recheckWorkers();
+    await settle();
+    expect(session(back).sent).toEqual(["never mind, stop there"]);
+    expect(told()).toEqual([]);
   });
 
   it("keeps across a restart what it owes and what it already reported", async () => {
-    useFakeTimers();
-    try {
-      const { w, call, say, told, settle, endTurn, restart, manager, ask } = await started();
-      say("Done.");
-      await call(w, "finish_task", { summary: "merged" });
-      endTurn(w);
-      let back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual(["Finished:\n\nmerged"]);
+    const { w, call, say, told, settle, endTurn, restart, manager, ask } = await started();
+    say("Done.");
+    await call(w, "finish_task", { summary: "merged" });
+    endTurn(w);
+    let back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual(["Finished:\n\nmerged"]);
 
-      // A notice still waiting at the restart.
-      await ask("which commit?");
-      say("abc123", back);
-      endTurn(back);
-      back = restart(back);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()[1]).toBe(note("its turn ended", "which commit?", "abc123"));
-    } finally {
-      vi.useRealTimers();
-    }
+    // A notice still waiting at the restart.
+    await ask("which commit?");
+    say("abc123", back);
+    endTurn(back);
+    back = restart(back);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()[1]).toBe(note("its turn ended", "which commit?", "abc123"));
   });
 
   it("journals each terminal failure while the lead is offline, even after finish_task", async () => {
-    useFakeTimers();
-    try {
-      const {
-        w,
-        lead,
-        project,
-        host,
-        call,
-        ask,
-        told,
-        settle,
-        session,
-        restart,
-        manager,
-        base,
-        registry,
-        workspaces,
-      } = await started();
-      const fail = (worker: Workspace, content: string) => {
-        session(worker).isRunning = false;
-        session(worker).emit("event", { kind: "error", content });
-      };
-      const journal = () =>
-        new ReportJournalStore().load(new ProjectStore(base).projectDir(project.id));
-      await ask("check the release");
-      host.isLeadOnline = () => false;
-      await call(w, "finish_task", { summary: "The patch is ready" });
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "bash",
-        toolUseId: "check",
-        content: "**bash**",
-      });
-      session(w).emit("event", {
-        kind: "tool_result",
-        toolUseId: "check",
-        content: "exit status 2",
-        isError: true,
-      });
-      fail(w, "Provider unavailable");
-      await vi.advanceTimersByTimeAsync(0);
-      fail(w, "Connection lost");
-      // A duplicate-looking idle error is not another turn.
-      fail(w, "Connection lost");
-      const pending = w.getState();
-      const back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(journal().map((r) => r.kind)).toEqual(["final", "failure", "failure"]);
-      expect(journal()[1]).toMatchObject({
-        boardState: "not_applicable",
-        leadDelivery: { state: "pending" },
-      });
-      expect(journal()[1].payload.text).toContain(
-        "Last tool: bash (reported an error) — exit status 2",
-      );
-      // Simulate the journal commit surviving while the worker's cleanup did not.
-      const stale = Workspace.fromState(pending, registry);
-      workspaces.set(w.id, stale);
-      await back.dispose();
-      manager.recheckWorkers();
-      await settle();
-      expect(journal().map((r) => r.kind)).toEqual(["final", "failure", "failure"]);
-      host.isLeadOnline = () => true;
-      await manager.drainInbox(project.id);
-      expect(told()).toHaveLength(3);
-      expect(told()[1]).toContain("Error: Provider unavailable");
-      expect(told()[2]).toContain('Worker turn failed on your message "check the release".');
-      expect(told()[2]).toContain("Error: Connection lost");
-      expect(told()[2]).not.toContain("Last tool:");
-      expect(lead.getMessages().filter((m) => m.from?.role === "panel")).toHaveLength(2);
-    } finally {
-      vi.useRealTimers();
-    }
+    const {
+      w,
+      lead,
+      project,
+      host,
+      call,
+      ask,
+      told,
+      settle,
+      session,
+      restart,
+      manager,
+      base,
+      registry,
+      workspaces,
+    } = await started();
+    const fail = (worker: Workspace, content: string) => {
+      session(worker).isRunning = false;
+      session(worker).emit("event", { kind: "error", content });
+    };
+    const journal = () =>
+      new ReportJournalStore().load(new ProjectStore(base).projectDir(project.id));
+    await ask("check the release");
+    host.isLeadOnline = () => false;
+    await call(w, "finish_task", { summary: "The patch is ready" });
+    session(w).emit("event", {
+      kind: "tool_use",
+      toolName: "bash",
+      toolUseId: "check",
+      content: "**bash**",
+    });
+    session(w).emit("event", {
+      kind: "tool_result",
+      toolUseId: "check",
+      content: "exit status 2",
+      isError: true,
+    });
+    fail(w, "Provider unavailable");
+    await vi.advanceTimersByTimeAsync(0);
+    fail(w, "Connection lost");
+    // A duplicate-looking idle error is not another turn.
+    fail(w, "Connection lost");
+    const pending = w.getState();
+    const back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(journal().map((r) => r.kind)).toEqual(["final", "failure", "failure"]);
+    expect(journal()[1]).toMatchObject({
+      boardState: "not_applicable",
+      leadDelivery: { state: "pending" },
+    });
+    expect(journal()[1].payload.text).toContain(
+      "Last tool: bash (reported an error) — exit status 2",
+    );
+    // Simulate the journal commit surviving while the worker's cleanup did not.
+    const stale = Workspace.fromState(pending, registry);
+    workspaces.set(w.id, stale);
+    await back.dispose();
+    manager.recheckWorkers();
+    await settle();
+    expect(journal().map((r) => r.kind)).toEqual(["final", "failure", "failure"]);
+    host.isLeadOnline = () => true;
+    await manager.drainInbox(project.id);
+    expect(told()).toHaveLength(3);
+    expect(told()[1]).toContain("Error: Provider unavailable");
+    expect(told()[2]).toContain('Worker turn failed on your message "check the release".');
+    expect(told()[2]).toContain("Error: Connection lost");
+    expect(told()[2]).not.toContain("Last tool:");
+    expect(lead.getMessages().filter((m) => m.from?.role === "panel")).toHaveLength(2);
   });
 
   it("journals distinct failed wake-up turns on the same input without retrying the worker", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, state, told, settle, session, manager } = await started();
-      const sent = [...session(w).sent];
-      say("first attempt");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "Connection lost" });
-      await settle();
-      state("working");
-      say("wake-up output");
-      session(w).emit("event", { kind: "error", content: "Connection lost" });
-      state("idle");
-      await settle();
-      expect(told()).toHaveLength(2);
-      expect(told()[0]).toContain("first attempt");
-      expect(told()[1]).toContain("wake-up output");
-      manager.workerIdle(w);
-      await settle();
-      expect(told()).toHaveLength(2);
-      expect(session(w).sent).toEqual(sent);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, state, told, settle, session, manager } = await started();
+    const sent = [...session(w).sent];
+    say("first attempt");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "Connection lost" });
+    await settle();
+    state("working");
+    say("wake-up output");
+    session(w).emit("event", { kind: "error", content: "Connection lost" });
+    state("idle");
+    await settle();
+    expect(told()).toHaveLength(2);
+    expect(told()[0]).toContain("first attempt");
+    expect(told()[1]).toContain("wake-up output");
+    manager.workerIdle(w);
+    await settle();
+    expect(told()).toHaveLength(2);
+    expect(session(w).sent).toEqual(sent);
   });
 
   it.each(["stop", "archive", "disable reporting"])(
     "does not journal a terminal failure if the worker is subject to %s before settling",
     async (action) => {
-      useFakeTimers();
-      try {
-        const { w, lead, call, told, settle, session, manager } = await started();
-        session(w).isRunning = false;
-        session(w).emit("event", { kind: "error", content: "Network disconnected" });
-        if (action === "stop") w.abortAll();
-        else if (action === "archive") await call(lead, "archive_session", { session_id: w.id });
-        else manager.setReporting(w.id, false);
-        await settle();
-        expect(told()).toEqual([]);
-        expect(w.pendingTurnFailures()).toEqual([]);
-      } finally {
-        vi.useRealTimers();
-      }
+      const { w, lead, call, told, settle, session, manager } = await started();
+      session(w).isRunning = false;
+      session(w).emit("event", { kind: "error", content: "Network disconnected" });
+      if (action === "stop") w.abortAll();
+      else if (action === "archive") await call(lead, "archive_session", { session_id: w.id });
+      else manager.setReporting(w.id, false);
+      await settle();
+      expect(told()).toEqual([]);
+      expect(w.pendingTurnFailures()).toEqual([]);
     },
   );
 
   it("waits for a rate-limit retry still to run, however late it is", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, session, endTurn, askNext } = await started();
-      await askNext("is it merged?");
-      const [agentId] = w.agents.keys();
-      say("Working");
-      w.pauseAgent(agentId, Date.now() + 1000, true);
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "rate limited" });
-      await settle();
-      expect(told()).toEqual([]);
-      w.retryLast(agentId);
-      say("Done now");
-      endTurn(w);
-      await settle();
-      expect(told()).toEqual([note("its turn ended", "is it merged?", "Done now")]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, session, endTurn, askNext } = await started();
+    await askNext("is it merged?");
+    const [agentId] = w.agents.keys();
+    say("Working");
+    w.pauseAgent(agentId, Date.now() + 1000, true);
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "rate limited" });
+    await settle();
+    expect(told()).toEqual([]);
+    w.retryLast(agentId);
+    say("Done now");
+    endTurn(w);
+    await settle();
+    expect(told()).toEqual([note("its turn ended", "is it merged?", "Done now")]);
   });
 
   it("owes nothing once archived", async () => {
-    useFakeTimers();
-    try {
-      const { lead, w, told, settle, endTurn, call, manager } = await started();
-      endTurn(w);
-      await call(lead, "archive_session", { session_id: w.id });
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(w.getState().agents[0].delivered?.answered).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { lead, w, told, settle, endTurn, call, manager } = await started();
+    endTurn(w);
+    await call(lead, "archive_session", { session_id: w.id });
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(w.getState().agents[0].delivered?.answered).toBe(true);
   });
 
   it("carries on a task whose background work a crash cut off, and shows no wait till then", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, state, restart, manager, session } = await started();
-      say("Started the build in the background.");
-      state("waiting");
-      endTurn(w);
-      const back = restart(w);
-      expect(awaitsUser(back)).toBe(false);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(session(back).sent).toEqual([CARRY_ON]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, state, restart, manager, session } = await started();
+    say("Started the build in the background.");
+    state("waiting");
+    endTurn(w);
+    const back = restart(w);
+    expect(awaitsUser(back)).toBe(false);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(session(back).sent).toEqual([CARRY_ON]);
   });
 
   it("tells the lead what a session the user started answers it", async () => {
-    useFakeTimers();
-    try {
-      const { lead, call, host, project, session, endTurn, settle, w } = await started();
-      const own = host.createWorkspace("mine", w.cwd, { projectId: project.id, role: "worker" });
-      host.addAgent(own, "A", "gpt-6-astra", "a", "c");
-      await own.sendMessage("what does this do?");
-      endTurn(own);
-      await settle();
-      await call(lead, "message_session", { session_id: own.id, message: "which branch?" });
-      await vi.advanceTimersByTimeAsync(0);
-      session(own).emit("event", { kind: "text_delta", content: "main" });
-      endTurn(own);
-      await settle();
-      expect(
-        lead
-          .getMessages()
-          .filter((m) => m.from?.workspaceId === own.id)
-          .map((m) => m.content),
-      ).toEqual([note("its turn ended", "which branch?", "main")]);
-      expect(awaitsUser(own)).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { lead, call, host, project, session, endTurn, settle, w } = await started();
+    const own = host.createWorkspace("mine", w.cwd, { projectId: project.id, role: "worker" });
+    host.addAgent(own, "A", "gpt-6-astra", "a", "c");
+    await own.sendMessage("what does this do?");
+    endTurn(own);
+    await settle();
+    await call(lead, "message_session", { session_id: own.id, message: "which branch?" });
+    await vi.advanceTimersByTimeAsync(0);
+    session(own).emit("event", { kind: "text_delta", content: "main" });
+    endTurn(own);
+    await settle();
+    expect(
+      lead
+        .getMessages()
+        .filter((m) => m.from?.workspaceId === own.id)
+        .map((m) => m.content),
+    ).toEqual([note("its turn ended", "which branch?", "main")]);
+    expect(awaitsUser(own)).toBe(false);
   });
 
   it("tells a fresh lead nothing of what the lead of a deleted project said", async () => {
-    useFakeTimers();
-    try {
-      const { w, endTurn, settle, manager, project, workspaces } = await started();
-      manager.delete(project.id);
-      endTurn(w);
-      manager.restored(w);
-      manager.recheckWorkers();
-      await settle();
-      const fresh = workspaces.get(manager.get(w.projectLink!.projectId)!.leadWorkspaceId!)!;
-      expect(fresh.getMessages().filter((m) => m.from)).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, endTurn, settle, manager, project, workspaces } = await started();
+    manager.delete(project.id);
+    endTurn(w);
+    manager.restored(w);
+    manager.recheckWorkers();
+    await settle();
+    const fresh = workspaces.get(manager.get(w.projectLink!.projectId)!.leadWorkspaceId!)!;
+    expect(fresh.getMessages().filter((m) => m.from)).toEqual([]);
   });
 
-  it("shows it waiting for the user when its task or the user's turn ends on them", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, endTurn, restart, frames } = await started();
-      const shown = () =>
-        frames
-          .filter((f) => f.type === "workspace_updated" && f.id === w.id)
-          .map((f) => f.awaitsUser === true);
-      say("Which branch should this go on?");
-      endTurn(w);
-      // At once, and once.
-      expect(shown()).toEqual([true]);
-      await settle();
-      expect(shown()).toEqual([true]);
-      expect(awaitsUser(restart(w))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+  it("shows it waiting for the user when its task ends on them", async () => {
+    const { w, say, settle, endTurn, restart, shown } = await started();
+    say("Which branch should this go on?");
+    endTurn(w);
+    // At once, and once.
+    expect(shown()).toEqual([true]);
+    await settle();
+    expect(shown()).toEqual([true]);
+    expect(awaitsUser(restart(w))).toBe(true);
+  });
 
-    useFakeTimers();
-    try {
-      const { w, lead, say, settle, endTurn, session, call, askNext, frames, manager, project } =
-        await started();
-      const shown = () =>
-        frames
-          .filter((f) => f.type === "workspace_updated" && f.id === w.id)
-          .map((f) => f.awaitsUser === true);
-      say("Which branch?");
-      endTurn(w);
-      // The user answers, and it reports the task finished. A client that
-      // connects meanwhile leaves the others holding what it gets.
-      await w.sendMessage("main");
-      expect(awaitsUser(w)).toBe(false);
-      manager.showAllAwaiting();
-      expect(shown()).toEqual([true, false]);
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "t1",
-        content: "**finish_task**",
-      });
-      await call(w, "finish_task", { summary: "merged" });
-      // A command the panel answers itself is no turn, during one or after.
-      await w.sendMessage("/usage");
-      endTurn(w);
-      await settle();
-      await w.sendMessage("/usage");
-      manager.showAllAwaiting();
-      expect(awaitsUser(w)).toBe(false);
-      expect(shown()).toEqual([true, false]);
+  it("shows it waiting for the user across user turns, archive and restore", async () => {
+    const { w, lead, say, settle, endTurn, session, call, askNext, shown, manager, project } =
+      await started();
+    say("Which branch?");
+    endTurn(w);
+    // The user answers, and it reports the task finished. A client that
+    // connects meanwhile leaves the others holding what it gets.
+    await w.sendMessage("main");
+    expect(awaitsUser(w)).toBe(false);
+    manager.showAllAwaiting();
+    expect(shown()).toEqual([true, false]);
+    emitFinishTask(session(w), "t1");
+    await call(w, "finish_task", { summary: "merged" });
+    // A command the panel answers itself is no turn, during one or after.
+    await w.sendMessage("/usage");
+    endTurn(w);
+    await settle();
+    await w.sendMessage("/usage");
+    manager.showAllAwaiting();
+    expect(awaitsUser(w)).toBe(false);
+    expect(shown()).toEqual([true, false]);
 
-      // A question of the user's after that is answered to them; not inside
-      // an archived project.
-      await w.sendMessage("which commit?");
-      say("abc123");
-      endTurn(w);
-      await settle();
-      expect(shown()).toEqual([true, false, true]);
-      // Archived with its project it waits for nobody, until it is opened.
-      endTurn(lead);
-      manager.setArchived(project.id, true);
-      manager.setArchived(project.id, false);
-      expect(w.isArchived).toBe(true);
-      expect(shown()).toEqual([true, false, true, false]);
-      w.archivedAt = null;
-      manager.showAwaiting(w);
-      expect(shown()).toEqual([true, false, true, false, true]);
+    // A question of the user's after that is answered to them; not inside
+    // an archived project.
+    await w.sendMessage("which commit?");
+    say("abc123");
+    endTurn(w);
+    await settle();
+    expect(shown()).toEqual([true, false, true]);
+    // Archived with its project it waits for nobody, until it is opened.
+    endTurn(lead);
+    manager.setArchived(project.id, true);
+    manager.setArchived(project.id, false);
+    expect(w.isArchived).toBe(true);
+    expect(shown()).toEqual([true, false, true, false]);
+    w.archivedAt = null;
+    manager.showAwaiting(w);
+    expect(shown()).toEqual([true, false, true, false, true]);
 
-      // What it answers the lead later is the lead's.
-      await w.sendMessage("thanks");
-      await call(w, "finish_task", { summary: "all set" });
-      await askNext("is it pushed?");
-      say("yes");
-      endTurn(w);
-      await settle();
-      expect(shown()).toEqual([true, false, true, false, true, false]);
+    // What it answers the lead later is the lead's.
+    await w.sendMessage("thanks");
+    await call(w, "finish_task", { summary: "all set" });
+    await askNext("is it pushed?");
+    say("yes");
+    endTurn(w);
+    await settle();
+    expect(shown()).toEqual([true, false, true, false, true, false]);
 
-      // A failed turn, or one the user stopped, asks nothing.
-      await w.sendMessage("push the tag");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
-      await settle();
-      expect(awaitsUser(w)).toBe(false);
-      await w.sendMessage("try again");
-      say("Pushing");
-      session(w).isRunning = false;
-      w.abortAll();
-      await settle();
-      expect(awaitsUser(w)).toBe(false);
-      expect(shown()).toEqual([true, false, true, false, true, false]);
-    } finally {
-      vi.useRealTimers();
-    }
+    // A failed turn, or one the user stopped, asks nothing.
+    await w.sendMessage("push the tag");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
+    await settle();
+    expect(awaitsUser(w)).toBe(false);
+    await w.sendMessage("try again");
+    say("Pushing");
+    session(w).isRunning = false;
+    w.abortAll();
+    await settle();
+    expect(awaitsUser(w)).toBe(false);
+    expect(shown()).toEqual([true, false, true, false, true, false]);
   });
 
   it("shows it waiting only once nothing more is to run, through wake-ups and notices", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, endTurn, state, call, session, frames } = await started();
-      const shown = () =>
-        frames
-          .filter((f) => f.type === "workspace_updated" && f.id === w.id)
-          .map((f) => f.awaitsUser === true);
-      // A background task still runs, then a pause holds it: not yet.
-      say("Which branch? The build runs meanwhile.");
-      state("waiting");
-      endTurn(w);
-      expect(awaitsUser(w)).toBe(false);
-      const [agentId] = w.agents.keys();
-      w.pauseAgent(agentId, Date.now() + 1000);
-      state("idle");
-      expect(shown()).toEqual([]);
-      await settle();
-      expect(shown()).toEqual([true]);
-      // A notice of the panel's after it changes nothing.
-      w.postSystemMessage("Context compacted.");
-      expect(awaitsUser(w)).toBe(true);
-      // Reported finished, a wake-up's turn after it asks nothing.
-      await w.sendMessage("main");
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "t1",
-        content: "**finish_task**",
-      });
-      await call(w, "finish_task", { summary: "merged" });
-      endTurn(w);
-      session(w).isRunning = true;
-      say("late output");
-      endTurn(w);
-      await settle();
-      expect(awaitsUser(w)).toBe(false);
-      expect(shown()).toEqual([true, false]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, settle, endTurn, state, call, session, shown } = await started();
+    // A background task still runs, then a pause holds it: not yet.
+    say("Which branch? The build runs meanwhile.");
+    state("waiting");
+    endTurn(w);
+    expect(awaitsUser(w)).toBe(false);
+    const [agentId] = w.agents.keys();
+    w.pauseAgent(agentId, Date.now() + 1000);
+    state("idle");
+    expect(shown()).toEqual([]);
+    await settle();
+    expect(shown()).toEqual([true]);
+    // A notice of the panel's after it changes nothing.
+    w.postSystemMessage("Context compacted.");
+    expect(awaitsUser(w)).toBe(true);
+    // Reported finished, a wake-up's turn after it asks nothing.
+    await w.sendMessage("main");
+    emitFinishTask(session(w), "t1");
+    await call(w, "finish_task", { summary: "merged" });
+    endTurn(w);
+    session(w).isRunning = true;
+    say("late output");
+    endTurn(w);
+    await settle();
+    expect(awaitsUser(w)).toBe(false);
+    expect(shown()).toEqual([true, false]);
   });
 
   it("shows a task the lead retried after it failed waiting for the user", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, session, endTurn, ask } = await started();
-      say("Working on it");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
-      await settle();
-      expect(told()).toHaveLength(1);
-      await ask("try again");
-      say("Which branch should this go on?");
-      endTurn(w);
-      await settle();
-      expect(told()).toHaveLength(1);
-      expect(awaitsUser(w)).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, session, endTurn, ask } = await started();
+    say("Working on it");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
+    await settle();
+    expect(told()).toHaveLength(1);
+    await ask("try again");
+    say("Which branch should this go on?");
+    endTurn(w);
+    await settle();
+    expect(told()).toHaveLength(1);
+    expect(awaitsUser(w)).toBe(true);
   });
 
   it("reads no command the panel answered as the user's turn after a restart", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, session, call, endTurn, restart } = await started();
-      say("Which branch?");
-      endTurn(w);
-      await w.sendMessage("main");
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "t1",
-        content: "**finish_task**",
-      });
-      await call(w, "finish_task", { summary: "merged" });
-      endTurn(w);
-      await w.sendMessage("/usage");
-      await settle();
-      expect(awaitsUser(restart(w))).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, settle, session, call, endTurn, restart } = await started();
+    say("Which branch?");
+    endTurn(w);
+    await w.sendMessage("main");
+    emitFinishTask(session(w), "t1");
+    await call(w, "finish_task", { summary: "merged" });
+    endTurn(w);
+    await w.sendMessage("/usage");
+    await settle();
+    expect(awaitsUser(restart(w))).toBe(false);
   });
 
   const emitRefusedFinish = (s: FakeSession, toolUseId: string) => {
-    s.emit("event", {
-      kind: "tool_use",
-      toolName: "mcp__panel__finish_task",
-      toolUseId,
-      content: "**finish_task**",
-    });
+    emitFinishTask(s, toolUseId);
     s.emit("event", {
       kind: "tool_result",
       toolUseId,
@@ -3437,250 +3110,204 @@ describe("a worker that goes idle without reporting", () => {
   };
 
   it("clears awaitsUser in a multi-agent worker once finish_task succeeds, and re-arms on later user turns or dialogs", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, session, call, endTurn, restart, host, frames, manager } =
-        await started();
-      const shown = () =>
-        frames
-          .filter((f) => f.type === "workspace_updated" && f.id === w.id)
-          .map((f) => f.awaitsUser === true);
+    const { w, say, settle, session, call, endTurn, restart, host, shown, manager } =
+      await started();
 
-      host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
-      const [primaryEntry, allenEntry] = [...w.agents.values()];
-      const allen = allenEntry.session as FakeSession;
-      const endAllen = () => {
-        allen.isRunning = false;
-        allen.emit("event", { kind: "result", content: "" });
-      };
+    host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
+    const [primaryEntry, allenEntry] = [...w.agents.values()];
+    const allen = allenEntry.session as FakeSession;
+    const endAllen = () => {
+      allen.isRunning = false;
+      allen.emit("event", { kind: "result", content: "" });
+    };
 
-      // Primary asks a question, then user consults a second agent who replies
-      // without finish_task, then user tells the primary to finish.
-      say("Here is my plan. Thoughts?");
-      endTurn(w);
-      expect(awaitsUser(w)).toBe(true);
-      expect(shown()).toEqual([true]);
+    // Primary asks a question, then user consults a second agent who replies
+    // without finish_task, then user tells the primary to finish.
+    say("Here is my plan. Thoughts?");
+    endTurn(w);
+    expect(awaitsUser(w)).toBe(true);
+    expect(shown()).toEqual([true]);
 
-      await w.sendMessage("@Allen review this");
-      allen.emit("event", { kind: "text_delta", content: "Looks solid." });
-      endAllen();
-      expect(awaitsUser(w)).toBe(true);
+    await w.sendMessage("@Allen review this");
+    allen.emit("event", { kind: "text_delta", content: "Looks solid." });
+    endAllen();
+    expect(awaitsUser(w)).toBe(true);
 
-      await w.sendMessage("LGTM, go ahead");
-      session(w).emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "ft1",
-        content: "**finish_task**",
-      });
-      await call(w, "finish_task", { summary: "done" });
-      endTurn(w);
-      await settle();
-      expect(awaitsUser(w)).toBe(false);
-      expect(shown()).toEqual([true, false]);
+    await w.sendMessage("LGTM, go ahead");
+    emitFinishTask(session(w), "ft1");
+    await call(w, "finish_task", { summary: "done" });
+    endTurn(w);
+    await settle();
+    expect(awaitsUser(w)).toBe(false);
+    expect(shown()).toEqual([true, false]);
 
-      // Pending UI dialog still forces awaitsUser even after finish_task,
-      // and showAwaiting broadcasts both the rise and clear.
-      const dialog = {
-        workspaceId: w.id,
-        agentId: primaryEntry.info.id,
-        processGeneration: 1,
-        requestId: "confirm-1",
-      };
-      const beforeDialog = w.unseen;
-      session(w).emit("ui_dialog_request", dialog);
-      manager.showAwaiting(w);
-      expect(awaitsUser(w)).toBe(true);
-      expect(manager.awaitsUser(w)).toBe(true);
-      expect(w.unseen).toBe(beforeDialog + 1);
-      manager.showAwaiting(w);
-      expect(w.unseen).toBe(beforeDialog + 1);
-      expect(w.getState().attention).toMatchObject({ unread: beforeDialog + 1, awaitsUser: true });
-      session(w).emit("ui_dialog_resolved", dialog);
-      manager.showAwaiting(w);
-      expect(awaitsUser(w)).toBe(false);
-      expect(manager.awaitsUser(w)).toBe(false);
-      expect(shown()).toEqual([true, false, true, false]);
+    // Pending UI dialog still forces awaitsUser even after finish_task,
+    // and showAwaiting broadcasts both the rise and clear.
+    const dialog = {
+      workspaceId: w.id,
+      agentId: primaryEntry.info.id,
+      processGeneration: 1,
+      requestId: "confirm-1",
+    };
+    const beforeDialog = w.unseen;
+    session(w).emit("ui_dialog_request", dialog);
+    manager.showAwaiting(w);
+    expect(awaitsUser(w)).toBe(true);
+    expect(manager.awaitsUser(w)).toBe(true);
+    expect(w.unseen).toBe(beforeDialog + 1);
+    manager.showAwaiting(w);
+    expect(w.unseen).toBe(beforeDialog + 1);
+    expect(w.getState().attention).toMatchObject({ unread: beforeDialog + 1, awaitsUser: true });
+    session(w).emit("ui_dialog_resolved", dialog);
+    manager.showAwaiting(w);
+    expect(awaitsUser(w)).toBe(false);
+    expect(manager.awaitsUser(w)).toBe(false);
+    expect(shown()).toEqual([true, false, true, false]);
 
-      // A targeted local slash command (@Allen /usage) after finish_task is not
-      // mistaken for a new user turn after restart.
-      await w.sendMessage("@Allen /usage");
-      const afterFinish = restart(w);
-      expect(awaitsUser(afterFinish)).toBe(false);
+    // A targeted local slash command (@Allen /usage) after finish_task is not
+    // mistaken for a new user turn after restart.
+    await w.sendMessage("@Allen /usage");
+    const afterFinish = restart(w);
+    expect(awaitsUser(afterFinish)).toBe(false);
 
-      // A new user message AFTER a successful finish_task re-arms awaitsUser
-      // (both live and after restart), even when handled by the second agent.
-      const [, allenAfter] = [...afterFinish.agents.values()];
-      const allenRestarted = allenAfter.session as FakeSession;
-      await afterFinish.sendMessage("@Allen one more check?");
-      allenRestarted.emit("event", { kind: "text_delta", content: "Looks good, merge it?" });
-      allenRestarted.isRunning = false;
-      allenRestarted.emit("event", { kind: "result", content: "" });
-      expect(awaitsUser(afterFinish)).toBe(true);
-      const afterFollowUp = restart(afterFinish);
-      expect(awaitsUser(afterFollowUp)).toBe(true);
+    // A new user message AFTER a successful finish_task re-arms awaitsUser
+    // (both live and after restart), even when handled by the second agent.
+    const [, allenAfter] = [...afterFinish.agents.values()];
+    const allenRestarted = allenAfter.session as FakeSession;
+    await afterFinish.sendMessage("@Allen one more check?");
+    allenRestarted.emit("event", { kind: "text_delta", content: "Looks good, merge it?" });
+    allenRestarted.isRunning = false;
+    allenRestarted.emit("event", { kind: "result", content: "" });
+    expect(awaitsUser(afterFinish)).toBe(true);
+    const afterFollowUp = restart(afterFinish);
+    expect(awaitsUser(afterFollowUp)).toBe(true);
 
-      // A refused finish_task on a follow-up after an earlier successful
-      // finish_task does not clear awaitsUser either.
-      const primaryAfter = [...afterFollowUp.agents.values()][0].session as FakeSession;
-      await afterFollowUp.sendMessage("report the follow-up too");
-      emitRefusedFinish(primaryAfter, "ft-post-err");
-      primaryAfter.emit("event", { kind: "text_delta", content: "Context too long." });
-      primaryAfter.isRunning = false;
-      primaryAfter.emit("event", { kind: "result", content: "" });
-      expect(awaitsUser(afterFollowUp)).toBe(true);
-      expect(awaitsUser(restart(afterFollowUp))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // A refused finish_task on a follow-up after an earlier successful
+    // finish_task does not clear awaitsUser either.
+    const primaryAfter = [...afterFollowUp.agents.values()][0].session as FakeSession;
+    await afterFollowUp.sendMessage("report the follow-up too");
+    emitRefusedFinish(primaryAfter, "ft-post-err");
+    primaryAfter.emit("event", { kind: "text_delta", content: "Context too long." });
+    primaryAfter.isRunning = false;
+    primaryAfter.emit("event", { kind: "result", content: "" });
+    expect(awaitsUser(afterFollowUp)).toBe(true);
+    expect(awaitsUser(restart(afterFollowUp))).toBe(true);
   });
 
   it("does not let a refused finish_task supersede an earlier agent turn", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, session, endTurn, restart, host } = await started();
-      host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
-      const allen = [...w.agents.values()][1].session as FakeSession;
+    const { w, say, settle, session, endTurn, restart, host } = await started();
+    host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
+    const allen = [...w.agents.values()][1].session as FakeSession;
 
-      say("Plan?");
-      endTurn(w);
-      await w.sendMessage("@Allen thoughts?");
-      allen.emit("event", { kind: "text_delta", content: "LGTM" });
-      allen.isRunning = false;
-      allen.emit("event", { kind: "result", content: "" });
-      expect(awaitsUser(w)).toBe(true);
+    say("Plan?");
+    endTurn(w);
+    await w.sendMessage("@Allen thoughts?");
+    allen.emit("event", { kind: "text_delta", content: "LGTM" });
+    allen.isRunning = false;
+    allen.emit("event", { kind: "result", content: "" });
+    expect(awaitsUser(w)).toBe(true);
 
-      // Refused finish_task on a failed turn must not clear Allen's earlier turn.
-      await w.sendMessage("go ahead");
-      emitRefusedFinish(session(w), "ft-err");
-      session(w).isRunning = false;
-      session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
-      await settle();
-      expect(awaitsUser(w)).toBe(true);
+    // Refused finish_task on a failed turn must not clear Allen's earlier turn.
+    await w.sendMessage("go ahead");
+    emitRefusedFinish(session(w), "ft-err");
+    session(w).isRunning = false;
+    session(w).emit("event", { kind: "error", content: "API Error: 529 overloaded" });
+    await settle();
+    expect(awaitsUser(w)).toBe(true);
 
-      // Refused finish_task on a completed turn still keeps awaitsUser true,
-      // both live and after restart.
-      await w.sendMessage("try again");
-      emitRefusedFinish(session(w), "ft-err-2");
-      say("Shall I shorten it?");
-      endTurn(w);
-      await settle();
-      expect(awaitsUser(w)).toBe(true);
-      expect(awaitsUser(restart(w))).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // Refused finish_task on a completed turn still keeps awaitsUser true,
+    // both live and after restart.
+    await w.sendMessage("try again");
+    emitRefusedFinish(session(w), "ft-err-2");
+    say("Shall I shorten it?");
+    endTurn(w);
+    await settle();
+    expect(awaitsUser(w)).toBe(true);
+    expect(awaitsUser(restart(w))).toBe(true);
   });
 
   it("clears awaitsUser across a restart when a second agent finishes while primary keeps its delivered task turn", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, settle, call, endTurn, restart, host } = await started();
-      host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
-      const allen = [...w.agents.values()][1].session as FakeSession;
+    const { w, say, settle, call, endTurn, restart, host } = await started();
+    host.addAgent(w, "Allen", "gpt-6-astra", "b", "c");
+    const allen = [...w.agents.values()][1].session as FakeSession;
 
-      // Primary stops on the task (a.input === a.delivered, restored after restart).
-      say("Which approach?");
-      endTurn(w);
-      expect(awaitsUser(w)).toBe(true);
+    // Primary stops on the task (a.input === a.delivered, restored after restart).
+    say("Which approach?");
+    endTurn(w);
+    expect(awaitsUser(w)).toBe(true);
 
-      // Second agent finishes the task without primary getting another turn.
-      await w.sendMessage("@Allen wrap it up");
-      allen.emit("event", {
-        kind: "tool_use",
-        toolName: "mcp__panel__finish_task",
-        toolUseId: "ft-allen",
-        content: "**finish_task**",
-      });
-      await call(w, "finish_task", { summary: "done by Allen" });
-      allen.isRunning = false;
-      allen.emit("event", { kind: "result", content: "" });
-      await settle();
-      expect(awaitsUser(w)).toBe(false);
-      expect(awaitsUser(restart(w))).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    // Second agent finishes the task without primary getting another turn.
+    await w.sendMessage("@Allen wrap it up");
+    emitFinishTask(allen, "ft-allen");
+    await call(w, "finish_task", { summary: "done by Allen" });
+    allen.isRunning = false;
+    allen.emit("event", { kind: "result", content: "" });
+    await settle();
+    expect(awaitsUser(w)).toBe(false);
+    expect(awaitsUser(restart(w))).toBe(false);
   });
 
   it("leaves to the user across a restart what they took over", async () => {
-    useFakeTimers();
-    try {
-      const { w, say, told, settle, endTurn, askNext, restart, manager } = await started();
-      await askNext("which commit?");
-      say("abc123");
-      endTurn(w);
-      await w.sendMessage("thanks");
-      endTurn(w);
-      const back = restart(w);
-      manager.recheckWorkers();
-      await settle();
-      expect(told()).toEqual([]);
-      expect(back.lastDelivered()[0]).toMatchObject({ since: true, answered: true });
-    } finally {
-      vi.useRealTimers();
-    }
+    const { w, say, told, settle, endTurn, askNext, restart, manager } = await started();
+    await askNext("which commit?");
+    say("abc123");
+    endTurn(w);
+    await w.sendMessage("thanks");
+    endTurn(w);
+    const back = restart(w);
+    manager.recheckWorkers();
+    await settle();
+    expect(told()).toEqual([]);
+    expect(back.lastDelivered()[0]).toMatchObject({ since: true, answered: true });
   });
 
   it("never shows the lead, a session the user started or an archived one waiting", async () => {
-    useFakeTimers();
-    try {
-      const { lead, w, say, endTurn, call, host, session, project } = await started();
-      say("Which branch?");
-      endTurn(w);
-      expect(awaitsUser(w)).toBe(true);
-      await call(lead, "archive_session", { session_id: w.id });
-      expect(awaitsUser(w)).toBe(false);
+    const { lead, w, say, endTurn, call, host, session, project } = await started();
+    say("Which branch?");
+    endTurn(w);
+    expect(awaitsUser(w)).toBe(true);
+    await call(lead, "archive_session", { session_id: w.id });
+    expect(awaitsUser(w)).toBe(false);
 
-      const own = host.createWorkspace("mine", w.cwd, { projectId: project.id, role: "worker" });
-      host.addAgent(own, "A", "gpt-6-astra", "a", "c");
-      await own.sendMessage("what does this do?");
-      session(own).emit("event", { kind: "text_delta", content: "It parses." });
-      endTurn(own);
-      expect(awaitsUser(own)).toBe(false);
+    const own = host.createWorkspace("mine", w.cwd, { projectId: project.id, role: "worker" });
+    host.addAgent(own, "A", "gpt-6-astra", "a", "c");
+    await own.sendMessage("what does this do?");
+    session(own).emit("event", { kind: "text_delta", content: "It parses." });
+    endTurn(own);
+    expect(awaitsUser(own)).toBe(false);
 
-      await lead.sendMessage("hi");
-      session(lead).emit("event", { kind: "text_delta", content: "Hello." });
-      endTurn(lead);
-      expect(awaitsUser(lead)).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    await lead.sendMessage("hi");
+    session(lead).emit("event", { kind: "text_delta", content: "Hello." });
+    endTurn(lead);
+    expect(awaitsUser(lead)).toBe(false);
   });
 
   it("is archived with all its sessions once none is busy, and comes back with its lead", async () => {
-    useFakeTimers();
-    try {
-      const { w, lead, told, settle, endTurn, askNext, manager, project } = await started();
-      await askNext("which branch?");
-      expect(() => manager.setArchived(project.id, true)).toThrow(
-        'Still busy: "w"; stop them first',
-      );
-      expect(manager.get(project.id)!.archivedAt ?? null).toBeNull();
-      endTurn(w);
-      await settle();
-      expect(told()).toHaveLength(1);
-      expect(() => manager.setArchived(project.id, true)).toThrow('Still busy: "a · lead"');
-      endTurn(lead);
-      manager.setArchived(project.id, true);
-      expect([lead.isArchived, w.isArchived]).toEqual([true, true]);
-      manager.setArchived(project.id, false);
-      expect([lead.isArchived, w.isArchived]).toEqual([false, true]);
+    const { w, lead, told, settle, endTurn, askNext, manager, project } = await started();
+    await askNext("which branch?");
+    expect(() => manager.setArchived(project.id, true)).toThrow('Still busy: "w"; stop them first');
+    expect(manager.get(project.id)!.archivedAt ?? null).toBeNull();
+    endTurn(w);
+    await settle();
+    expect(told()).toHaveLength(1);
+    expect(() => manager.setArchived(project.id, true)).toThrow('Still busy: "a · lead"');
+    endTurn(lead);
+    manager.setArchived(project.id, true);
+    expect([lead.isArchived, w.isArchived]).toEqual([true, true]);
+    manager.setArchived(project.id, false);
+    expect([lead.isArchived, w.isArchived]).toEqual([false, true]);
 
-      // A session of an archived project opened again brings it back.
-      manager.setArchived(project.id, true);
-      w.archivedAt = null;
-      manager.restored(w);
-      expect(manager.get(project.id)!.archivedAt).toBeNull();
-      expect(lead.isArchived).toBe(false);
+    // A session of an archived project opened again brings it back.
+    manager.setArchived(project.id, true);
+    w.archivedAt = null;
+    manager.restored(w);
+    expect(manager.get(project.id)!.archivedAt).toBeNull();
+    expect(lead.isArchived).toBe(false);
 
-      // One archived before its sessions went with it is settled at startup.
-      manager.setArchived(project.id, true);
-      lead.archivedAt = null;
-      manager.archiveShelved();
-      expect(lead.isArchived).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // One archived before its sessions went with it is settled at startup.
+    manager.setArchived(project.id, true);
+    lead.archivedAt = null;
+    manager.archiveShelved();
+    expect(lead.isArchived).toBe(true);
   });
 });

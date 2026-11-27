@@ -10,6 +10,7 @@ import { PiSession } from "../../src/session/pi";
 import type { BoundarySteer, Host, HostSessionHandle } from "../../src/session/host";
 import { HostRegistry } from "../../src/session/host";
 import type {
+  DispatchAttempt,
   PromptEnvelope,
   SendHooks,
   SendReceipt,
@@ -37,16 +38,25 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+const emptyUsage = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  cache_creation_tokens: 0,
+  turns: 0,
+  duration_ms: 0,
+} satisfies UsageStats;
+
+function firstWrite(
+  input: { inputId: string; reportId?: string },
+  startedAt = Date.now(),
+): DispatchAttempt {
+  return { ...input, generation: 0, beforeLeafId: null, beforeEntryCount: 0, startedAt };
+}
+
 class StubSession extends EventEmitter implements HostSessionHandle {
   sessionId: string | null = "sess-1";
-  usage: UsageStats = {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_read_tokens: 0,
-    cache_creation_tokens: 0,
-    turns: 0,
-    duration_ms: 0,
-  };
+  usage: UsageStats = { ...emptyUsage };
   isRunning = false;
   effectiveEffort?: string;
   resetCalled = 0;
@@ -55,13 +65,7 @@ class StubSession extends EventEmitter implements HostSessionHandle {
     _input,
     hooks,
   ) => {
-    hooks?.onBeforeWrite?.({
-      inputId: "in",
-      generation: 0,
-      beforeLeafId: null,
-      beforeEntryCount: 0,
-      startedAt: Date.now(),
-    });
+    hooks?.onBeforeWrite?.(firstWrite({ inputId: "in" }));
     return Promise.resolve({ disposition: "started" });
   };
   interruptImpl: () => Promise<boolean> = () => Promise.resolve(true);
@@ -124,6 +128,27 @@ function makeWorkspace(overrides: Partial<WorkspaceCallbacks> = {}) {
   return { ws, agent, session, newMsgs, removed, dir, registry, agentMsgs };
 }
 
+function firstUserMessage(ws: Workspace) {
+  return ws.messages.find((message) => message.kind === "user");
+}
+
+function queueWorkerReport(
+  ws: Workspace,
+  agentId: string,
+  inputId: string,
+  reportId: string,
+  text: string,
+  workspaceId = "w-1",
+) {
+  return ws.ensureReportQueued(
+    inputId,
+    agentId,
+    { inputId, text, reportId },
+    { workspaceId, name: "Worker", role: "worker" },
+    text,
+  );
+}
+
 describe("Pi workspace lifecycle regressions", () => {
   it("rolls back in-memory queued message when synchronous save throws", () => {
     let fail = true;
@@ -133,27 +158,14 @@ describe("Pi workspace lifecycle regressions", () => {
       },
     });
     const beforeCount = newMsgs.length;
-    expect(() =>
-      ws.ensureReportQueued(
-        "rep-msg-1",
-        agent.id,
-        { inputId: "rep-msg-1", text: "report body", reportId: "rep-1" },
-        { workspaceId: "w-1", name: "Worker", role: "worker" },
-        "report body",
-      ),
-    ).toThrow("disk full");
+    const queueReport = () => queueWorkerReport(ws, agent.id, "rep-msg-1", "rep-1", "report body");
+    expect(queueReport).toThrow("disk full");
     expect(ws.findMessage("rep-msg-1")).toBeUndefined();
     expect(ws.takeChanged().has("rep-msg-1")).toBe(false);
     expect(newMsgs).toHaveLength(beforeCount);
 
     fail = false;
-    ws.ensureReportQueued(
-      "rep-msg-1",
-      agent.id,
-      { inputId: "rep-msg-1", text: "report body", reportId: "rep-1" },
-      { workspaceId: "w-1", name: "Worker", role: "worker" },
-      "report body",
-    );
+    queueReport();
     expect(ws.findMessage("rep-msg-1")?.status).toBe("queued");
   });
 
@@ -168,17 +180,22 @@ describe("Pi workspace lifecycle regressions", () => {
     session.sendImpl = (input, hooks) => {
       const envelope = input as PromptEnvelope;
       beforeWrite = () =>
-        hooks?.onBeforeWrite?.({
-          inputId: envelope.inputId,
-          reportId: envelope.reportId,
-          generation: 0,
-          beforeLeafId: null,
-          beforeEntryCount: 0,
-          startedAt: Date.now(),
-        });
+        hooks?.onBeforeWrite?.(
+          firstWrite({ inputId: envelope.inputId, reportId: envelope.reportId }),
+        );
       return promise;
     };
     return { promise, resolve, reject, write: () => beforeWrite!() };
+  }
+
+  async function acceptFirstTurn(ws: Workspace, session: StubSession, text: string) {
+    const first = deferSend(session);
+    const sending = ws.sendMessage(text);
+    first.write();
+    session.isRunning = true;
+    session.emit("user_message_accepted", { inputId: firstUserMessage(ws)!.id });
+    first.resolve({ disposition: "started" });
+    await sending;
   }
 
   it.each([349, 350])("projects the startup row across the write after %ims", async (delay) => {
@@ -188,7 +205,7 @@ describe("Pi workspace lifecycle regressions", () => {
       const { ws, session } = makeWorkspace({ onMessageDone });
       const turn = deferSend(session);
       const sending = ws.sendMessage("start the agent");
-      const input = ws.messages.find((m) => m.kind === "user")!;
+      const input = firstUserMessage(ws)!;
       vi.advanceTimersByTime(delay);
       expect(onMessageDone.mock.calls.map((args) => args[2])).toEqual(
         delay === 350 ? ["starting"] : [],
@@ -223,7 +240,7 @@ describe("Pi workspace lifecycle regressions", () => {
       const { ws, session } = makeWorkspace();
       session.isRunning = true;
       await ws.sendMessage("queue behind this turn");
-      const input = ws.messages.find((m) => m.kind === "user")!;
+      const input = firstUserMessage(ws)!;
       expect(input.status).toBe("queued");
       const steer = session.boundarySteer?.();
       expect(steer?.claim()).toBe(true);
@@ -243,18 +260,17 @@ describe("Pi workspace lifecycle regressions", () => {
     "opens one cold-start reply at %s",
     async (opensAt) => {
       const order: string[] = [];
-      const { ws, agent, session, registry } = makeWorkspace({
+      const { ws, agent, session, registry, agentMsgs } = makeWorkspace({
         onSaveNow: () => order.push("save"),
         onNewMessage: (_id, msg) => {
           if (msg.kind === "agent") order.push("reply");
         },
         onMessageDone: (_ws, _id, status) => order.push(status),
       });
-      const agentMsgs = () => ws.messages.filter((msg) => msg.kind === "agent");
       const turn = deferSend(session);
       const unseen = ws.unseen;
       const sending = ws.sendMessage("cold start");
-      const input = ws.messages.find((m) => m.kind === "user")!;
+      const input = firstUserMessage(ws)!;
       expect(input.status).toBe("starting");
       expect(input.dispatchAttempt).toBeUndefined();
       // Pi learns its default effort while the process starts; this is not an override.
@@ -326,7 +342,7 @@ describe("Pi workspace lifecycle regressions", () => {
       } else {
         expect(agentMsgs()).toHaveLength(0);
       }
-      const input = ws.messages.find((m) => m.kind === "user")!;
+      const input = firstUserMessage(ws)!;
       expect(input.status).toBe(
         kind === "handled" ? "done" : kind === "rejected" ? "error" : "queued",
       );
@@ -344,9 +360,7 @@ describe("Pi workspace lifecycle regressions", () => {
       if (written) turn.write();
       turn.reject(new Error("transport closed"));
       await sending;
-      expect(ws.messages.find((m) => m.kind === "user")?.status).toBe(
-        written ? "outcome_unknown" : "error",
-      );
+      expect(firstUserMessage(ws)?.status).toBe(written ? "outcome_unknown" : "error");
       expect(agentMsgs()).toHaveLength(written ? 0 : 1);
     },
   );
@@ -357,7 +371,7 @@ describe("Pi workspace lifecycle regressions", () => {
       const { ws, agent, session, agentMsgs } = makeWorkspace();
       const turn = deferSend(session);
       const sending = ws.sendMessage("deferred");
-      const input = ws.messages.find((m) => m.kind === "user")!;
+      const input = firstUserMessage(ws)!;
       session.isRunning = true;
       if (action === "abort") turn.write();
       if (action === "interrupt") await ws.interruptAll();
@@ -374,15 +388,7 @@ describe("Pi workspace lifecycle regressions", () => {
 
   it("stops a retry before writing even though it has no new user message", async () => {
     const { ws, agent, session, agentMsgs } = makeWorkspace();
-    const first = deferSend(session);
-    const sending = ws.sendMessage("retry me");
-    first.write();
-    session.isRunning = true;
-    session.emit("user_message_accepted", {
-      inputId: ws.messages.find((m) => m.kind === "user")!.id,
-    });
-    first.resolve({ disposition: "started" });
-    await sending;
+    await acceptFirstTurn(ws, session, "retry me");
     session.isRunning = false;
     session.emit("event", { kind: "result", content: "" });
     ws.pauseAgent(agent.id, Date.now(), true);
@@ -420,22 +426,8 @@ describe("Pi workspace lifecycle regressions", () => {
       onReportDeliveryState: delivery,
       onMessageDone,
     });
-    const first = deferSend(session);
-    const sending = ws.sendMessage("first");
-    first.write();
-    session.isRunning = true;
-    session.emit("user_message_accepted", {
-      inputId: ws.messages.find((m) => m.kind === "user")!.id,
-    });
-    first.resolve({ disposition: "started" });
-    await sending;
-    const report = ws.ensureReportQueued(
-      "report",
-      agent.id,
-      { inputId: "report", text: "report", reportId: "r1" },
-      { workspaceId: "worker", name: "Worker", role: "worker" },
-      "report",
-    );
+    await acceptFirstTurn(ws, session, "first");
+    const report = queueWorkerReport(ws, agent.id, "report", "r1", "report", "worker");
     expect(report.status).toBe("queued");
     expect(ws.cancelQueued(report.id)).toBe(true);
     expect(ws.findMessage(report.id)).toBeUndefined();
@@ -466,32 +458,26 @@ describe("Pi workspace lifecycle regressions", () => {
   it("does not abort a newly started next turn when an older interrupt times out", async () => {
     const { ws, agent, session } = makeWorkspace();
     session.isRunning = true;
-    session.interruptImpl = () => {
-      // Simulate the old turn retiring and a new turn beginning before interrupt resolves false.
-      ws.deliver("next prompt", { workspaceId: "w", name: "W", role: "worker" }, "next prompt");
+    const startTurn = (name: "old" | "new") => {
       const entry = ws.agents.get(agent.id)!;
-      entry.input = { id: "new-turn-id", replies: [] };
+      entry.input = { id: `${name}-turn-id`, replies: [] };
       entry.currentMsg = {
-        id: "new-reply-id",
+        id: `${name}-reply-id`,
         kind: "agent",
         agentId: agent.id,
         content: "",
         timestamp: Date.now(),
         status: "streaming",
       };
+    };
+    session.interruptImpl = () => {
+      // Simulate the old turn retiring and a new turn beginning before interrupt resolves false.
+      ws.deliver("next prompt", { workspaceId: "w", name: "W", role: "worker" }, "next prompt");
+      startTurn("new");
       session.isRunning = true;
       return Promise.resolve(false);
     };
-    const entry = ws.agents.get(agent.id)!;
-    entry.input = { id: "old-turn-id", replies: [] };
-    entry.currentMsg = {
-      id: "old-reply-id",
-      kind: "agent",
-      agentId: agent.id,
-      content: "",
-      timestamp: Date.now(),
-      status: "streaming",
-    };
+    startTurn("old");
     await ws.interruptAgent(agent.id);
     expect(session.abortCalled).toBe(0);
   });
@@ -594,14 +580,7 @@ describe("Pi workspace lifecycle regressions", () => {
       sessionFile,
       normalizedCwd: dir,
       config: { cwd: dir, backend: "pi" },
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        turns: 0,
-        duration_ms: 0,
-      },
+      usage: { ...emptyUsage },
       activeAsyncRuns: [
         {
           runId: "run-1",
@@ -653,13 +632,7 @@ describe("Pi workspace lifecycle regressions", () => {
       onSaveNow: () => order.push("save"),
       onReportDeliveryState: (reportId, state) => order.push(`journal:${reportId}:${state}`),
     });
-    ws.ensureReportQueued(
-      "rep-cancel",
-      agent.id,
-      { inputId: "rep-cancel", text: "body", reportId: "rep-99" },
-      { workspaceId: "w-1", name: "Worker", role: "worker" },
-      "body",
-    );
+    queueWorkerReport(ws, agent.id, "rep-cancel", "rep-99", "body");
     order.length = 0;
     expect(ws.cancelQueued("rep-cancel")).toBe(true);
     expect(order).toEqual(["save", "journal:rep-99:error"]);
@@ -723,13 +696,7 @@ describe("Pi workspace lifecycle regressions", () => {
       timestamp: 1,
       status: "queued",
       queuedEnvelope: { inputId: "m1", text: "secret prompt" },
-      dispatchAttempt: {
-        inputId: "m1",
-        generation: 0,
-        beforeLeafId: null,
-        beforeEntryCount: 0,
-        startedAt: 1,
-      },
+      dispatchAttempt: firstWrite({ inputId: "m1" }, 1),
     });
     expect("queuedEnvelope" in wire).toBe(false);
     expect("dispatchAttempt" in wire).toBe(false);
@@ -749,13 +716,7 @@ describe("Pi workspace lifecycle regressions", () => {
     let calls = 0;
     session.sendImpl = (_input, hooks) => {
       calls++;
-      hooks?.onBeforeWrite?.({
-        inputId: "in",
-        generation: 0,
-        beforeLeafId: null,
-        beforeEntryCount: 0,
-        startedAt: Date.now(),
-      });
+      hooks?.onBeforeWrite?.(firstWrite({ inputId: "in" }));
       if (calls === 1) {
         return Promise.resolve({
           disposition: "rejected",

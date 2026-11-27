@@ -1,35 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, within, act, cleanup } from "@testing-library/react";
-import { AgentsPanel, type AgentsPanelActions } from "../src/panels/AgentsPanel";
+import { fireEvent, within, act, cleanup } from "@testing-library/react";
 import { workCount } from "../src/panels/SessionTasks";
-import { App } from "../src/App";
 import type { AgentInfo, Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { agentsActions as actions, renderAgents } from "./helpers/agentsPanel";
+import { agent as makeAgent, workspace } from "./helpers/fixtures";
+import { bootProjectApp, stubAppSocket } from "./helpers/projectApp";
 
 const NOW = 1_800_000_000_000;
-const agent = (id: string, over: Partial<AgentInfo> = {}): AgentInfo => ({
-  id,
-  name: id,
-  model: "claude-opus-5-5",
-  avatar: "A",
-  color: "#fff",
-  isDefault: true,
-  ...over,
-});
-const ws = (id: string, agents: AgentInfo[], over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/w/${id}`,
-  git: null,
-  pr: null,
-  agents,
-  messages: [],
-  createdAt: NOW - 1000,
-  lastMessageAt: NOW - 1000,
-  ...over,
-});
+const agent = (id: string, over: Partial<AgentInfo> = {}) =>
+  makeAgent(id, { name: id, color: "#fff", ...over });
+const ws = (id: string, agents: AgentInfo[]) =>
+  workspace(id, {
+    cwd: `/w/${id}`,
+    git: null,
+    pr: null,
+    agents,
+    createdAt: NOW - 1000,
+    lastMessageAt: NOW - 1000,
+  });
 
 const busy = ws("indexer", [
   agent("kisara", {
@@ -47,33 +35,8 @@ const busy = ws("indexer", [
 ]);
 const quiet = ws("docs", [agent("bob")]);
 
-const actions = (): AgentsPanelActions => ({
-  onOpen: vi.fn(),
-  onStop: vi.fn(),
-  onArchive: vi.fn(),
-  onRestore: vi.fn(),
-  onSetReporting: vi.fn(),
-  onAddAgent: vi.fn(),
-  onClearContext: vi.fn(),
-  onRemoveAgent: vi.fn(),
-  onSetModel: vi.fn(),
-  onSetEffort: vi.fn(),
-  onStopTask: vi.fn(),
-  onCancelWake: vi.fn(),
-  onStopAll: vi.fn(),
-});
 const panel = (sessions: Workspace[], a = actions(), overview = false) =>
-  render(
-    <AgentsPanel
-      sessions={sessions}
-      project={undefined}
-      activeWsId={sessions[0].id}
-      connected
-      models={[]}
-      actions={a}
-      overview={overview}
-    />,
-  ).container;
+  renderAgents(sessions, { actions: a, overview }).container;
 
 describe("a session's background work, in its card", () => {
   beforeEach(() => {
@@ -186,36 +149,10 @@ describe("a session's background work, in its card", () => {
 });
 
 describe("Stop in the app", () => {
-  beforeEach(() => {
-    const store = new Map<string, string>();
-    vi.stubGlobal("localStorage", {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => void store.set(k, String(v)),
-      removeItem: (k: string) => void store.delete(k),
-      clear: () => store.clear(),
-    });
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Element.prototype.scrollIntoView = vi.fn();
-  });
+  beforeEach(stubAppSocket);
   afterEach(() => vi.unstubAllGlobals());
 
-  const boot = (workspaces: Workspace[]) => {
-    localStorage.setItem("activeWsId", workspaces[0].id);
-    render(<App />);
-    const sock = FakeSocket.instances.at(-1)!;
-    act(() => sock.open());
-    act(() =>
-      sock.receive({
-        type: "init",
-        workspaces,
-        config: { presets: [], models: [], commands: [], hosts: {} },
-        hosts: [],
-        projects: [],
-      }),
-    );
-    return sock;
-  };
+  const boot = (workspaces: Workspace[]) => bootProjectApp(workspaces, [], workspaces[0].id).sock;
 
   it("stops only the turn of a working agent", () => {
     const sock = boot([ws("w", [agent("a"), agent("b", { isDefault: false, state: "working" })])]);

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
 import { expect, it } from "vitest";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
+import { ensureWebviewBuilt } from "../../../scripts/browser-harness";
 import { seedDemo } from "../../../scripts/seed-demo";
 import { Server } from "../../src/server/server";
 import type { TelemetryStore } from "../../src/storage/telemetry";

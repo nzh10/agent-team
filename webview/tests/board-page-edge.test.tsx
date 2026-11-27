@@ -1,24 +1,11 @@
 // The board page at clice's scale and at its edges: selection, Escape,
 // focus, broken files, counts, the archive.
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { render, fireEvent, within } from "@testing-library/react";
+import { fireEvent, within } from "@testing-library/react";
 import { BoardPage, type SessionInfo } from "../src/project/BoardPage";
 import type { Objective, ObjectiveStatus, Project } from "../src/state/useServer";
-
-const o = (id: string, over: Partial<Objective> = {}): Objective => ({
-  id,
-  area: id.split("/")[0],
-  title: id,
-  goal: `goal of ${id}`,
-  status: "active",
-  priority: "normal",
-  dependsOn: [],
-  tasks: [],
-  decisions: [],
-  sessions: [],
-  updatedAt: 1_800_000_000_000,
-  ...over,
-});
+import { boardProject as project, boardProps, renderBoard } from "./helpers/board";
+import { objective as o } from "./helpers/fixtures";
 
 // A clice-sized board: 60 objectives over 8 areas, long Chinese titles,
 // foundation items with wide fan-out, chains four deep, a third isolated.
@@ -54,30 +41,11 @@ function bigBoard(): Objective[] {
   return out;
 }
 
-const project = (objectives: Project["objectives"]): Project => ({
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: 0,
-  objectives,
-});
-
 const sessions = new Map<string, SessionInfo>();
 
 afterEach(() => vi.unstubAllGlobals());
 
-function page(p: Project) {
-  const props = {
-    onClose: vi.fn(),
-    onOpenSession: vi.fn(),
-    onAskLead: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-  };
-  const utils = render(<BoardPage project={p} sessions={sessions} {...props} />);
-  return { ...utils, ...props };
-}
+const page = (p: Project) => renderBoard(p, { sessions });
 
 const graph = (c: HTMLElement) =>
   fireEvent.click(within(c).getByRole("button", { name: "Dependencies" }));
@@ -124,14 +92,7 @@ describe("selection", () => {
   it("forgets an objective that disappears", () => {
     const { container, rerender, onClose } = page(project(objs));
     fireEvent.click(card(container, "cli/refactor"));
-    const props = {
-      sessions,
-      onClose,
-      onOpenSession: vi.fn(),
-      onAskLead: vi.fn(),
-      onRename: vi.fn(),
-      onDelete: vi.fn(),
-    };
+    const props = boardProps({ sessions, onClose });
     rerender(<BoardPage project={project(objs.slice(0, 2))} {...props} />);
     expect(container.querySelector(".bp-detail")).toBeNull();
     rerender(<BoardPage project={project(objs)} {...props} />);
@@ -364,8 +325,7 @@ describe("the archive", () => {
     rerender(
       <BoardPage
         project={project([objs[2]])}
-        sessions={sessions}
-        {...{ onClose, onOpenSession, onAskLead, onRename: vi.fn(), onDelete: vi.fn() }}
+        {...boardProps({ sessions, onClose, onOpenSession, onAskLead })}
       />,
     );
     expect(queryByRole("button", { name: /^Archive/ })).toBeNull();

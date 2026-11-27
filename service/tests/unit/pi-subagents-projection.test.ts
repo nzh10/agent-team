@@ -16,13 +16,18 @@ import {
   saveWorkspace,
 } from "../../src/workspace/state";
 import type { Message, Workspace, WorkspaceState } from "../../src/workspace/workspace";
+import {
+  sessionMessage,
+  textBlocks,
+  transcriptMessage,
+  writeJsonl,
+  writeStatusJson,
+} from "./helpers/subagent-artifacts";
 
 const childA = "call:0";
 const childB = "call:1";
 const argsMarker = "priority-gate-a-extra-argument";
 const outputMarker = "priority-gate-a-inner-output";
-const writeJsonl = (file: string, records: unknown[]) =>
-  fs.writeFileSync(file, records.map((x) => JSON.stringify(x)).join("\n") + "\n");
 
 function scenario(base: string, nested = false) {
   fs.writeFileSync(path.join(base, "config.toml"), "");
@@ -34,42 +39,28 @@ function scenario(base: string, nested = false) {
   writeJsonl(nativeA, [
     { type: "session", version: 3, id: "child-a-session" },
     { type: "thinking_level_change", id: "effort", parentId: null, thinkingLevel: "high" },
-    {
-      type: "message",
-      id: "call",
-      parentId: "effort",
-      message: {
-        role: "assistant",
-        provider: "test",
-        model: "native-a",
-        content: [
-          {
-            type: "toolCall",
-            id: "inner",
-            name: "read",
-            arguments: { path: "README.md", filter: argsMarker },
-          },
-        ],
-      },
-    },
-    {
-      type: "message",
-      id: "result",
-      parentId: "call",
-      message: {
-        role: "toolResult",
-        toolCallId: "inner",
-        toolName: "read",
-        content: [{ type: "text", text: outputMarker }],
-      },
-    },
+    sessionMessage("call", "effort", {
+      role: "assistant",
+      provider: "test",
+      model: "native-a",
+      content: [
+        {
+          type: "toolCall",
+          id: "inner",
+          name: "read",
+          arguments: { path: "README.md", filter: argsMarker },
+        },
+      ],
+    }),
+    sessionMessage("result", "call", {
+      role: "toolResult",
+      toolCallId: "inner",
+      toolName: "read",
+      content: textBlocks(outputMarker),
+    }),
   ]);
   writeJsonl(transcriptB, [
-    {
-      recordType: "message",
-      role: "assistant",
-      message: { content: [{ type: "text", text: "unrelated-sibling-b" }] },
-    },
+    transcriptMessage("assistant", { content: textBlocks("unrelated-sibling-b") }),
   ]);
   const activeRun: ActiveAsyncRunRecord = {
     runId: "async-run",
@@ -145,26 +136,23 @@ function scenario(base: string, nested = false) {
   saveIndex(base, [workspaceId]);
   closeHistory(base);
   const finishWithoutNotify = () =>
-    fs.writeFileSync(
-      path.join(base, "status.json"),
-      JSON.stringify({
-        sessionId,
-        runId: activeRun.runId,
-        state: "completed",
-        steps: [
-          { childId: "", workflowKey: "a", status: "completed", sessionFile: nativeA },
-          {
-            childId: "b",
-            status: "completed",
-            transcriptPath: transcriptB,
-            model: "test/status-b",
-            thinking: "off",
-            scheduleOrigin: "private",
-            currentTool: "private-tool",
-          },
-        ],
-      }),
-    );
+    writeStatusJson(base, {
+      sessionId,
+      runId: activeRun.runId,
+      state: "completed",
+      steps: [
+        { childId: "", workflowKey: "a", status: "completed", sessionFile: nativeA },
+        {
+          childId: "b",
+          status: "completed",
+          transcriptPath: transcriptB,
+          model: "test/status-b",
+          thinking: "off",
+          scheduleOrigin: "private",
+          currentTool: "private-tool",
+        },
+      ],
+    });
   return { workspaceId, agentId, finishWithoutNotify };
 }
 

@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, within, act } from "@testing-library/react";
-import { AgentsPanel, type AgentsPanelActions } from "../src/panels/AgentsPanel";
+import { fireEvent, within, act } from "@testing-library/react";
 import {
   scopeSessions,
   scopeSummary,
@@ -8,7 +7,6 @@ import {
   sessionWork,
   stateSummary,
 } from "../src/panels/scope";
-import { App } from "../src/App";
 import { CODEX_SETUP_VALUE } from "../src/workspace/models";
 import type {
   AgentInfo,
@@ -18,32 +16,23 @@ import type {
   Project,
   Workspace,
 } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { agentsActions, renderAgents } from "./helpers/agentsPanel";
+import { agent as makeAgent, workspace } from "./helpers/fixtures";
+import { bootProjectApp, stubAppSocket } from "./helpers/projectApp";
 
 const NOW = Date.now();
-const agent = (id: string, over: Partial<AgentInfo> = {}): AgentInfo => ({
-  id,
-  name: id,
-  model: "claude-opus-5-5[1m]",
-  avatar: "A",
-  color: "#fff",
-  isDefault: true,
-  ...over,
-});
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/home/me/work/${id}`,
-  git: null,
-  pr: null,
-  agents: [agent(`${id}-a`)],
-  messages: [],
-  createdAt: NOW - 50_000,
-  lastMessageAt: NOW - 50_000,
-  ...over,
-});
+const agent = (id: string, over: Partial<AgentInfo> = {}) =>
+  makeAgent(id, { name: id, model: "claude-opus-5-5[1m]", color: "#fff", ...over });
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, {
+    cwd: `/home/me/work/${id}`,
+    git: null,
+    pr: null,
+    agents: [agent(`${id}-a`)],
+    createdAt: NOW - 50_000,
+    lastMessageAt: NOW - 50_000,
+    ...over,
+  });
 const objective = (over: Partial<Objective>): Objective => ({
   id: "core/modules",
   area: "core",
@@ -121,34 +110,7 @@ describe("panel scope", () => {
 });
 
 describe("AgentsPanel", () => {
-  const actions = (): AgentsPanelActions => ({
-    onOpen: vi.fn(),
-    onStop: vi.fn(),
-    onArchive: vi.fn(),
-    onRestore: vi.fn(),
-    onSetReporting: vi.fn(),
-    onAddAgent: vi.fn(),
-    onClearContext: vi.fn(),
-    onRemoveAgent: vi.fn(),
-    onSetModel: vi.fn(),
-    onSetEffort: vi.fn(),
-    onStopTask: vi.fn(),
-    onCancelWake: vi.fn(),
-    onStopAll: vi.fn(),
-  });
-  const panel = (a = actions()) => {
-    const utils = render(
-      <AgentsPanel
-        sessions={[lead, w1, w2]}
-        project={project}
-        activeWsId="w1"
-        connected
-        models={[]}
-        actions={a}
-      />,
-    );
-    return { ...utils, a };
-  };
+  const panel = () => renderAgents([lead, w1, w2], { project, activeWsId: "w1" });
 
   it("shows each session with where it works, what it works on and its agents", () => {
     const { container } = panel();
@@ -169,18 +131,7 @@ describe("AgentsPanel", () => {
   });
 
   it("summarizes idle and working agents and stops a turn without unfolding", () => {
-    const a = actions();
-    const { container } = render(
-      <AgentsPanel
-        sessions={[lead, w1, w2]}
-        project={project}
-        activeWsId="lead"
-        connected
-        models={[]}
-        actions={a}
-        overview
-      />,
-    );
+    const { container, actions: a } = renderAgents([lead, w1, w2], { project, overview: true });
     const brief = (name: string) => container.querySelector(`[aria-label="${name}"] .ap-brief`)!;
     expect(brief("clice · lead").textContent).toContain("225k");
     expect(brief("modules").textContent).toContain("running tests");
@@ -196,17 +147,7 @@ describe("AgentsPanel", () => {
         }),
       ],
     });
-    const { container } = render(
-      <AgentsPanel
-        sessions={[estimated]}
-        project={undefined}
-        activeWsId="estimated"
-        connected
-        models={[]}
-        actions={actions()}
-        overview
-      />,
-    );
+    const { container } = renderAgents([estimated], { overview: true });
     const brief = container.querySelector(".ap-brief-meta")!;
     expect(brief.textContent).toBe("225k");
     expect(brief.textContent).not.toContain("~");
@@ -219,17 +160,9 @@ describe("AgentsPanel", () => {
   });
 
   it("hides context for fresh agents and unloaded archived snapshots", () => {
-    const { container } = render(
-      <AgentsPanel
-        sessions={[ws("fresh"), ws("archived", { archivedAt: 1 })]}
-        project={undefined}
-        activeWsId="fresh"
-        connected
-        models={[]}
-        actions={actions()}
-        overview
-      />,
-    );
+    const { container } = renderAgents([ws("fresh"), ws("archived", { archivedAt: 1 })], {
+      overview: true,
+    });
     expect(container.querySelectorAll(".ap-context")).toHaveLength(0);
     expect(container.textContent).not.toContain("ctx unknown");
     expect([...container.querySelectorAll(".ap-brief-meta")].map((el) => el.textContent)).toEqual([
@@ -256,16 +189,7 @@ describe("AgentsPanel", () => {
         }),
       ],
     };
-    const { container } = render(
-      <AgentsPanel
-        sessions={[w1]}
-        project={md}
-        activeWsId="w1"
-        connected
-        models={[]}
-        actions={actions()}
-      />,
-    );
+    const { container } = renderAgents([w1], { project: md });
     const task = container.querySelector(".ap-task")!;
     expect(task.textContent).toBe("评估：CMake / Bazel 先跑 check.py");
     expect([...task.querySelectorAll("code")].map((c) => c.textContent)).toEqual([
@@ -298,16 +222,10 @@ describe("AgentsPanel", () => {
       projectLink: { projectId: "p1", role: "worker" },
       awaitsUser: true,
     });
-    const { container } = render(
-      <AgentsPanel
-        sessions={[lead, { ...w1, awaitsUser: true }, quiet]}
-        project={project}
-        activeWsId="w1"
-        connected
-        models={[]}
-        actions={actions()}
-      />,
-    );
+    const { container } = renderAgents([lead, { ...w1, awaitsUser: true }, quiet], {
+      project,
+      activeWsId: "w1",
+    });
     const name = container.querySelector(`[aria-label="${long}"] .ap-session-name`)!;
     expect(name.querySelector(".clip")!.getAttribute("title")).toBe(long);
     expect(name.querySelector(".awaits-tag")!.textContent).toBe("your turn");
@@ -316,7 +234,7 @@ describe("AgentsPanel", () => {
   });
 
   it("switches whether a session reports to the lead, the lead having no switch", () => {
-    const { container, a } = panel();
+    const { container, actions: a } = panel();
     const card = (name: string) => container.querySelector(`[aria-label="${name}"]`)!;
     expect(card("clice · lead").querySelector(".report-switch")).toBeNull();
     const own = card("modules").querySelector<HTMLButtonElement>(
@@ -328,7 +246,7 @@ describe("AgentsPanel", () => {
   });
 
   it("keeps archived sessions folded away, restorable", () => {
-    const { container, a } = panel();
+    const { container, actions: a } = panel();
     const archived = container.querySelector(".ap-archived")!;
     expect(archived.querySelector("summary")!.textContent).toBe("Archived · 1");
     fireEvent.click(within(archived as HTMLElement).getByText("Restore"));
@@ -338,30 +256,7 @@ describe("AgentsPanel", () => {
 
 describe("a session's actions by its state", () => {
   const buttons = (state: AgentInfo["state"]) => {
-    const { container, unmount } = render(
-      <AgentsPanel
-        sessions={[ws("s", { agents: [agent("a", { state })] })]}
-        project={undefined}
-        activeWsId="s"
-        connected
-        models={[]}
-        actions={{
-          onOpen: vi.fn(),
-          onStop: vi.fn(),
-          onArchive: vi.fn(),
-          onRestore: vi.fn(),
-          onSetReporting: vi.fn(),
-          onAddAgent: vi.fn(),
-          onClearContext: vi.fn(),
-          onRemoveAgent: vi.fn(),
-          onSetModel: vi.fn(),
-          onSetEffort: vi.fn(),
-          onStopTask: vi.fn(),
-          onCancelWake: vi.fn(),
-          onStopAll: vi.fn(),
-        }}
-      />,
-    );
+    const { container, unmount } = renderAgents([ws("s", { agents: [agent("a", { state })] })]);
     // Under the agents: adding one first, the session's own action at the edge.
     expect(container.querySelector(".ap-session-head .panel-btn")).toBeNull();
     const names = [...container.querySelectorAll(".ap-session-foot .panel-btn")].map(
@@ -380,18 +275,7 @@ describe("a session's actions by its state", () => {
 });
 
 describe("the agents panel in the app", () => {
-  beforeEach(() => {
-    const store = new Map<string, string>();
-    vi.stubGlobal("localStorage", {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => void store.set(k, String(v)),
-      removeItem: (k: string) => void store.delete(k),
-      clear: () => store.clear(),
-    });
-    FakeSocket.instances = [];
-    vi.stubGlobal("WebSocket", FakeSocket);
-    Element.prototype.scrollIntoView = vi.fn();
-  });
+  beforeEach(stubAppSocket);
   afterEach(() => vi.unstubAllGlobals());
 
   const opus = { id: "claude-opus-5-5", label: "Opus", backend: "pi" };
@@ -400,28 +284,16 @@ describe("the agents panel in the app", () => {
     workspaces = [lead, w1, w2],
     models: object[] = [opus],
     codexAuth?: CodexAuthState,
-  ) => {
-    localStorage.setItem("activeWsId", active);
-    render(<App />);
-    const sock = FakeSocket.instances.at(-1)!;
-    act(() => sock.open());
-    act(() =>
-      sock.receive({
-        type: "init",
-        workspaces,
-        config: {
-          presets: [{ name: "Isla", avatar: "I", color: "#ccc" }],
-          models,
-          commands: [],
-          hosts: {},
-          ...(codexAuth ? { codexAuth } : {}),
-        },
-        hosts: [],
-        projects: [project],
-      }),
-    );
-    return sock;
-  };
+  ) =>
+    bootProjectApp(workspaces, [project], active, {
+      config: {
+        presets: [{ name: "Isla", avatar: "I", color: "#ccc" }],
+        models,
+        commands: [],
+        hosts: {},
+        ...(codexAuth ? { codexAuth } : {}),
+      },
+    }).sock;
 
   it("opens from the header chip, which sums up the open session's agents", () => {
     boot("w1");
@@ -795,30 +667,7 @@ describe("the agents panel in the app", () => {
 describe("an agent's state line", () => {
   const task = { id: "t1", type: "local_bash", description: "build", since: 1 };
   const lines = (session: Workspace, connected = true) => {
-    const { container, unmount } = render(
-      <AgentsPanel
-        sessions={[session]}
-        project={undefined}
-        activeWsId={session.id}
-        connected={connected}
-        models={[]}
-        actions={{
-          onOpen: vi.fn(),
-          onStop: vi.fn(),
-          onArchive: vi.fn(),
-          onRestore: vi.fn(),
-          onSetReporting: vi.fn(),
-          onAddAgent: vi.fn(),
-          onClearContext: vi.fn(),
-          onRemoveAgent: vi.fn(),
-          onSetModel: vi.fn(),
-          onSetEffort: vi.fn(),
-          onStopTask: vi.fn(),
-          onCancelWake: vi.fn(),
-          onStopAll: vi.fn(),
-        }}
-      />,
-    );
+    const { container, unmount } = renderAgents([session], { connected });
     const out = Object.fromEntries(
       [...container.querySelectorAll(".ap-agent")].map((row) => [
         row.querySelector(".ap-agent-name")!.textContent,
@@ -894,30 +743,11 @@ describe("switching an agent's model and effort", () => {
   const render1 = (a: AgentInfo, connected = true, available: ModelOption[] = models) => {
     const onSetModel = vi.fn();
     const onSetEffort = vi.fn();
-    const utils = render(
-      <AgentsPanel
-        sessions={[ws("s", { agents: [a] })]}
-        project={undefined}
-        activeWsId="s"
-        connected={connected}
-        models={available}
-        actions={{
-          onOpen: vi.fn(),
-          onStop: vi.fn(),
-          onArchive: vi.fn(),
-          onRestore: vi.fn(),
-          onSetReporting: vi.fn(),
-          onAddAgent: vi.fn(),
-          onClearContext: vi.fn(),
-          onRemoveAgent: vi.fn(),
-          onSetModel,
-          onSetEffort,
-          onStopTask: vi.fn(),
-          onCancelWake: vi.fn(),
-          onStopAll: vi.fn(),
-        }}
-      />,
-    );
+    const utils = renderAgents([ws("s", { agents: [a] })], {
+      connected,
+      models: available,
+      actions: agentsActions({ onSetModel, onSetEffort }),
+    });
     return { ...utils, onSetModel, onSetEffort };
   };
   const options = (el: Element | null) =>
@@ -1110,39 +940,13 @@ describe("switching an agent's model and effort", () => {
       accountType: null,
       checkedAt: 1,
     };
-    const baseActions: AgentsPanelActions = {
-      onOpen: vi.fn(),
-      onStop: vi.fn(),
-      onArchive: vi.fn(),
-      onRestore: vi.fn(),
-      onSetReporting: vi.fn(),
-      onAddAgent: vi.fn(),
-      onClearContext: vi.fn(),
-      onRemoveAgent: vi.fn(),
-      onSetModel,
-      onSetEffort: vi.fn(),
-      onStopTask: vi.fn(),
-      onCancelWake: vi.fn(),
-      onStopAll: vi.fn(),
-    };
+    const baseActions = agentsActions({ onSetModel });
 
     // Empty session with backend switching enabled hides native codex models, keeps Pi openai-codex/*,
     // shows italic Codex (not signed in) entry, and invokes onOpenCodexSetup instead of onSetModel.
-    const empty = render(
-      <AgentsPanel
-        sessions={[
-          ws("s", {
-            agents: [agent("a", { model: "claude-opus-5-5", canSwitchBackend: true })],
-          }),
-        ]}
-        project={undefined}
-        activeWsId="s"
-        connected
-        models={mixedModels}
-        codexAuth={unauth}
-        onOpenCodexSetup={onOpenCodexSetup}
-        actions={baseActions}
-      />,
+    const empty = renderAgents(
+      [ws("s", { agents: [agent("a", { model: "claude-opus-5-5", canSwitchBackend: true })] })],
+      { models: mixedModels, codexAuth: unauth, onOpenCodexSetup, actions: baseActions },
     );
     const select = empty.container.querySelector(".ap-model:not(.ap-effort)") as HTMLSelectElement;
     expect([...select.options].map((o) => o.value)).toEqual([
@@ -1157,24 +961,18 @@ describe("switching an agent's model and effort", () => {
     empty.unmount();
 
     // Even when only 1 Pi model exists, an empty session with unauthenticated Codex still exposes the setup entry.
-    const singlePi = render(
-      <AgentsPanel
-        sessions={[
-          ws("s2", {
-            agents: [agent("b", { model: "openai-codex/gpt-5.4", canSwitchBackend: true })],
-          }),
-        ]}
-        project={undefined}
-        activeWsId="s2"
-        connected
-        models={[
-          { id: "openai-codex/gpt-5.4", label: "GPT-5.4", backend: "pi" },
-          { id: "gpt-6-astra", label: "GPT-6 Astra", backend: "codex" },
-        ]}
-        codexAuth={unauth}
-        onOpenCodexSetup={onOpenCodexSetup}
-        actions={baseActions}
-      />,
+    const singlePi = renderAgents(
+      [
+        ws("s2", {
+          agents: [agent("b", { model: "openai-codex/gpt-5.4", canSwitchBackend: true })],
+        }),
+      ],
+      {
+        models: [mixedModels[1], mixedModels[2]],
+        codexAuth: unauth,
+        onOpenCodexSetup,
+        actions: baseActions,
+      },
     );
     const singleSelect = singlePi.container.querySelector(
       ".ap-model:not(.ap-effort)",

@@ -620,7 +620,6 @@ export class Server {
         return;
       case "open_workspace":
       case "load_messages": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (workspace && this.ensureLoaded(workspace)) {
           const before = (msg.before as number) ?? Infinity;
           const limit =
@@ -651,7 +650,6 @@ export class Server {
       }
 
       case "load_message_details": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (!workspace || !this.ensureLoaded(workspace)) return;
         const message = workspace.getMessages().find((m) => m.id === msg.messageId);
         if (!message) return;
@@ -705,8 +703,7 @@ export class Server {
       case "seal_project":
         this.projectAction(ws, async () => {
           const id = msg.projectId as string;
-          const sealing = this.projects.sealProject(id, msg.reason as string | undefined);
-          await sealing;
+          await this.projects.sealProject(id, msg.reason as string | undefined);
           this.removeProjectRuntimeCaches(id);
         });
         return;
@@ -861,12 +858,12 @@ export class Server {
       }
 
       case "abort":
-        this.abortAgent(msg.workspaceId as string, msg.agentId as string | undefined);
+        if (msg.agentId) workspace?.abortAgent(msg.agentId as string);
+        else workspace?.abortAll();
         return;
 
       // Stop the running turn only; background tasks and wake-ups go on.
       case "interrupt": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         const agentId = msg.agentId as string | undefined;
         if (!workspace) return;
         void this.track(
@@ -881,7 +878,6 @@ export class Server {
       }
 
       case "cancel_wakeup": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         const refused = workspace
           ? workspace.cancelWake(msg.agentId as string)
           : "No wake-up to cancel";
@@ -891,7 +887,6 @@ export class Server {
 
       // A client showed the session: its messages are read on every device.
       case "mark_seen": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (!workspace) return;
         if (workspace.unseen) {
           workspace.unseen = 0;
@@ -906,7 +901,6 @@ export class Server {
         return;
 
       case "unarchive_workspace": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (
           workspace &&
           this.unarchiveWorkspace(workspace) &&
@@ -948,7 +942,6 @@ export class Server {
         return;
 
       case "cancel_queued": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (!workspace || !this.ensureLoaded(workspace)) return;
         if (workspace.cancelQueued(msg.messageId as string)) {
           this.persistWorkspaceNow(workspace.id);
@@ -965,7 +958,6 @@ export class Server {
 
       case "debug_rate_limit": {
         if (process.env.AGENT_TEAM_DEBUG !== "1") return;
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         const entry = workspace?.agents.get(msg.agentId as string);
         entry?.session.simulateRateLimit?.({
           rateLimitType: msg.rateLimitType as string | undefined,
@@ -975,31 +967,26 @@ export class Server {
       }
 
       case "cancel_subagent": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (!workspace) {
           this.sendJson(ws, { type: "error", message: "Workspace not found" });
           return;
         }
-        try {
-          void this.track(
-            workspace.cancelSubagent(msg.agentId as string, msg.taskId as string),
-          ).catch((e) => {
-            this.sendJson(ws, {
-              type: "error",
-              message: `${e instanceof Error ? e.message : String(e)}`,
-            });
-          });
-        } catch (e) {
+        const failed = (e: unknown) =>
           this.sendJson(ws, {
             type: "error",
             message: `${e instanceof Error ? e.message : String(e)}`,
           });
+        try {
+          void this.track(
+            workspace.cancelSubagent(msg.agentId as string, msg.taskId as string),
+          ).catch(failed);
+        } catch (e) {
+          failed(e);
         }
         return;
       }
 
       case "clear_context": {
-        const workspace = this.workspaces.get(msg.workspaceId as string);
         if (workspace && workspace.clearContext(msg.agentId as string)) {
           this.persistWorkspaceNow(workspace.id);
           this.flushPendingLeadTools(workspace);
@@ -1329,16 +1316,6 @@ export class Server {
       this.broadcastUI({ type: "error", message: `${e instanceof Error ? e.message : String(e)}` });
     }
     this.persistWorkspace(workspaceId);
-  }
-
-  private abortAgent(workspaceId: string, agentId?: string): void {
-    const workspace = this.workspaces.get(workspaceId);
-    if (!workspace) return;
-    if (agentId) {
-      workspace.abortAgent(agentId);
-    } else {
-      workspace.abortAll();
-    }
   }
 
   private async restartServer(): Promise<void> {
@@ -1887,7 +1864,7 @@ export class Server {
       [
         ...this.catalogModels,
         ...[...this.workspaces.values()].flatMap((w) =>
-          w.projectLink && this.projects.get(w.projectLink.projectId)?.status === "sealed"
+          this.isProjectSealed(w)
             ? []
             : [...w.agents.values()].flatMap((entry) => entry.session.getAvailableModels?.() ?? []),
         ),

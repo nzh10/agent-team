@@ -2,29 +2,22 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import { page, cdp } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { AgentsPanel, type AgentsPanelActions } from "../../src/panels/AgentsPanel";
+import { AgentsPanel } from "../../src/panels/AgentsPanel";
 import { AgentTasks } from "../../src/panels/SessionTasks";
 import { CodeView } from "../../src/panels/FilesPanel";
 import { DiffView } from "../../src/panels/ChangesView";
 import { Sidebar, SystemStatusPanel, type SidebarProps } from "../../src/sidebar/Sidebar";
-import type { AgentInfo, Workspace } from "../../src/state/useServer";
+import type { Workspace } from "../../src/state/useServer";
+import { agentsActions } from "../helpers/agentsPanel";
+import { themedViewport } from "../helpers/browser";
+import { agent as makeAgent, project, workspace as makeWorkspace } from "../helpers/fixtures";
+import { sidebarProps } from "../helpers/sidebar";
 import { MdBlock } from "../../src/chat/markdown";
 import "../../src/styles.css";
 
 const long = "A long name that must not push other controls off the edge ".repeat(8).trim();
-const workspace = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  hostId: "local",
-  project: "repo",
-  cwd: "/repo",
-  agents: [],
-  messages: [],
-  createdAt: 1,
-  git: null,
-  pr: null,
-  ...over,
-});
+const workspace = (id: string, over: Partial<Workspace> = {}) =>
+  makeWorkspace(id, { git: null, pr: null, ...over });
 const no = () => {};
 const rect = (el: Element) => el.getBoundingClientRect();
 const get = <T extends HTMLElement = HTMLElement>(root: ParentNode, selector: string) => {
@@ -46,38 +39,24 @@ afterEach(async () => {
   touch = false;
 });
 
-const sidebar: SidebarProps = {
-  workspaces: [
-    workspace("lead", { projectLink: { projectId: "p", role: "lead" } }),
-    workspace("worker", {
-      name: long,
-      awaitsUser: true,
-      projectLink: { projectId: "p", role: "worker" },
-    }),
-  ],
-  projects: [
-    { id: "p", name: "repo", root: "/repo", leadWorkspaceId: "lead", createdAt: 1, objectives: [] },
-  ],
-  activeWsId: "lead",
-  connected: true,
-  groupOverrides: {},
-  searchQuery: "",
-  searchHits: null,
-  systemStatus: null,
-  onSelect: no,
-  onDelete: no,
-  onToggleGroup: no,
-  onSearchChange: no,
-  onJump: no,
-  onCreate: no,
-  onDeleteProject: no,
-  onCreateIn: no,
-  onReplayDemo: no,
-  onDebugSnapshot: no,
-  onPurgeArchived: no,
-  onArchiveProject: no,
-  onRestoreProject: no,
-};
+const sidebar = sidebarProps(
+  {
+    workspaces: [
+      workspace("lead", { projectLink: { projectId: "p", role: "lead" } }),
+      workspace("worker", {
+        name: long,
+        awaitsUser: true,
+        projectLink: { projectId: "p", role: "worker" },
+      }),
+    ],
+    projects: [project("p", { name: "repo" })],
+    activeWsId: "lead",
+    onDeleteProject: no,
+    onArchiveProject: no,
+    onRestoreProject: no,
+  },
+  () => no,
+);
 
 it("keeps session deletion confirmation in the viewport outside the mobile drawer", async () => {
   await page.viewport(390, 760);
@@ -93,15 +72,12 @@ it("keeps session deletion confirmation in the viewport outside the mobile drawe
   expect(rect(modal).right).toBeLessThanOrEqual(390);
 });
 
-const archivedProject = {
-  id: "archived",
+const archivedProject = project("archived", {
   name: "Archived",
   root: "/archive",
   leadWorkspaceId: "old",
-  createdAt: 1,
   archivedAt: 2,
-  objectives: [],
-};
+});
 const archivedRows = [
   workspace("old-worker", { archivedAt: 2, projectLink: { projectId: "p", role: "worker" } }),
   workspace("old", {
@@ -175,31 +151,14 @@ it("uses the sidebar type scale and hover affordance on archived project rows", 
 
 it("gives model and effort their own unclipped row in a narrow panel, independently of viewport width", async () => {
   await page.viewport(1100, 800);
-  const agent: AgentInfo = {
-    id: "a",
+  const agent = makeAgent("a", {
     name: long,
     model: "anthropic/claude-opus-5-5",
     effortLevels: ["low", "high"],
     fast: true,
-    avatar: "A",
     color: "#fff",
-    isDefault: true,
-  };
-  const actions: AgentsPanelActions = {
-    onOpen: no,
-    onStop: no,
-    onArchive: no,
-    onRestore: no,
-    onSetReporting: no,
-    onAddAgent: no,
-    onClearContext: no,
-    onRemoveAgent: no,
-    onSetModel: no,
-    onSetEffort: no,
-    onStopTask: no,
-    onCancelWake: no,
-    onStopAll: no,
-  };
+  });
+  const actions = agentsActions({}, () => no);
   const view = (width: number, current = agent, connected = true) => (
     <div style={{ width }}>
       <AgentsPanel
@@ -309,17 +268,13 @@ it("aligns status bars across rows even with differently sized values", async ()
 
 it("wraps task descriptions above their times and leaves room under the last action on a phone", async () => {
   await page.viewport(390, 800);
-  const agent: AgentInfo = {
-    id: "a",
+  const agent = makeAgent("a", {
     name: "A",
-    avatar: "A",
     color: "#fff",
-    model: "claude-opus-5-5",
-    isDefault: true,
     backgroundTasks: [
       { id: "task", type: "local_bash", description: long, since: Date.now() - 1000 },
     ],
-  };
+  });
   const actions = { onStopTask: no, onCancelWake: no, onStopAll: no };
   const session = workspace("s");
   const { container } = render(
@@ -363,8 +318,7 @@ it.each([
 ])(
   "shares syntax colors and preserves code scrolling in $theme at $width×$height",
   async ({ width, height, theme }) => {
-    await page.viewport(width, height);
-    document.documentElement.dataset.theme = theme;
+    await themedViewport(width, height, theme);
     const code = `const sentence = ${JSON.stringify(long)};`;
     const { container } = render(
       <>
@@ -423,14 +377,11 @@ it.each([
 // Headless Chromium may keep hover disabled after touch emulation is turned off.
 it("exposes touch actions only on the open session and gives the lists a larger type scale", async () => {
   await page.viewport(1000, 800);
-  const unrelated = {
-    id: "other",
+  const unrelated = project("other", {
     name: "Other",
     root: "/other",
     leadWorkspaceId: "other-lead",
-    createdAt: 1,
-    objectives: [],
-  };
+  });
   const props = {
     ...sidebar,
     projects: [...sidebar.projects!, unrelated, archivedProject],

@@ -40,6 +40,17 @@ function mockTransport(
   };
 }
 
+function probeWithTransport(transport: () => Transport, options: { timeoutMs?: number } = {}) {
+  return probeCodexAuth({}, { codexBinary: () => "/usr/local/bin/codex", transport, ...options });
+}
+
+function accountRead(result: { account: unknown; requiresOpenaiAuth: boolean }) {
+  return mockTransport((msg, emit) => {
+    if (msg.method === "initialize") emit({ id: msg.id, result: codexFields("initialize") });
+    if (msg.method === "account/read") emit({ id: msg.id, result });
+  });
+}
+
 describe("probeCodexAuth", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -50,21 +61,8 @@ describe("probeCodexAuth", () => {
       { type: "chatgpt", email: "user@example.com", planType: "plus" },
       { type: "apiKey" },
     ]) {
-      const fake = mockTransport((msg, emit) => {
-        if (msg.method === "initialize") {
-          emit({ id: msg.id, result: codexFields("initialize") });
-        } else if (msg.method === "account/read") {
-          emit({ id: msg.id, result: { account, requiresOpenaiAuth: true } });
-        }
-      });
-
-      const result = await probeCodexAuth(
-        {},
-        {
-          codexBinary: () => "/usr/local/bin/codex",
-          transport: fake.transport,
-        },
-      );
+      const fake = accountRead({ account, requiresOpenaiAuth: true });
+      const result = await probeWithTransport(fake.transport);
 
       expect(result).toMatchObject({
         cliAvailable: true,
@@ -81,20 +79,8 @@ describe("probeCodexAuth", () => {
   });
 
   it("treats requiresOpenaiAuth=false as authenticated even when account is null", async () => {
-    const fake = mockTransport((msg, emit) => {
-      if (msg.method === "initialize") emit({ id: msg.id, result: codexFields("initialize") });
-      if (msg.method === "account/read") {
-        emit({ id: msg.id, result: { account: null, requiresOpenaiAuth: false } });
-      }
-    });
-
-    const result = await probeCodexAuth(
-      {},
-      {
-        codexBinary: () => "/usr/local/bin/codex",
-        transport: fake.transport,
-      },
-    );
+    const fake = accountRead({ account: null, requiresOpenaiAuth: false });
+    const result = await probeWithTransport(fake.transport);
 
     expect(result).toMatchObject({
       cliAvailable: true,
@@ -105,20 +91,8 @@ describe("probeCodexAuth", () => {
   });
 
   it("reports unauthenticated when account is null and requiresOpenaiAuth is true", async () => {
-    const fake = mockTransport((msg, emit) => {
-      if (msg.method === "initialize") emit({ id: msg.id, result: codexFields("initialize") });
-      if (msg.method === "account/read") {
-        emit({ id: msg.id, result: { account: null, requiresOpenaiAuth: true } });
-      }
-    });
-
-    const result = await probeCodexAuth(
-      {},
-      {
-        codexBinary: () => "/usr/local/bin/codex",
-        transport: fake.transport,
-      },
-    );
+    const fake = accountRead({ account: null, requiresOpenaiAuth: true });
+    const result = await probeWithTransport(fake.transport);
 
     expect(result).toMatchObject({
       cliAvailable: true,
@@ -159,13 +133,7 @@ describe("probeCodexAuth", () => {
       }
     });
 
-    const resErr = await probeCodexAuth(
-      {},
-      {
-        codexBinary: () => "/usr/local/bin/codex",
-        transport: rpcErr.transport,
-      },
-    );
+    const resErr = await probeWithTransport(rpcErr.transport);
     expect(resErr).toMatchObject({
       cliAvailable: true,
       authenticated: false,
@@ -177,13 +145,7 @@ describe("probeCodexAuth", () => {
     const crashed = mockTransport((msg, _emit, triggerClose) => {
       if (msg.method === "initialize") queueMicrotask(() => triggerClose("EOF"));
     });
-    const resCrash = await probeCodexAuth(
-      {},
-      {
-        codexBinary: () => "/usr/local/bin/codex",
-        transport: crashed.transport,
-      },
-    );
+    const resCrash = await probeWithTransport(crashed.transport);
     expect(resCrash).toMatchObject({
       cliAvailable: true,
       authenticated: false,
@@ -198,14 +160,7 @@ describe("probeCodexAuth", () => {
       // Never replies to initialize / account/read.
     });
 
-    const promise = probeCodexAuth(
-      {},
-      {
-        timeoutMs: 250,
-        codexBinary: () => "/usr/local/bin/codex",
-        transport: hanging.transport,
-      },
-    );
+    const promise = probeWithTransport(hanging.transport, { timeoutMs: 250 });
     await vi.advanceTimersByTimeAsync(250);
     const result = await promise;
 

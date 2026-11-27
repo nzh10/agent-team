@@ -108,6 +108,38 @@ class FakeServer {
       .map((m) => (m.params ?? {}) as Record<string, unknown>);
   }
 
+  holdTurnStart(id: string): () => void {
+    let answer!: () => void;
+    this.handlers["turn/start"] = () =>
+      new Promise((resolve) => {
+        answer = () => resolve({ turn: { id, status: "inProgress", error: null } });
+      });
+    return () => answer();
+  }
+
+  userMessage(id: string, clientId: string | null): void {
+    this.item("started", { type: "userMessage", id, clientId, content: [] });
+  }
+
+  agentDelta(itemId: string, delta: string, turnId?: string): void {
+    this.notify("item/agentMessage/delta", {
+      threadId: "thr_1",
+      ...(turnId === undefined ? {} : { turnId }),
+      itemId,
+      delta,
+    });
+  }
+
+  commandStarted(id: string, command: string): void {
+    this.item("started", { type: "commandExecution", id, command, commandActions: [] });
+  }
+
+  reject(method: string, message: string): void {
+    this.handlers[method] = () => {
+      throw new Error(message);
+    };
+  }
+
   // The notifications of a turn's start, on thread thr_1.
   startTurn(id = `turn_${this.turns()}`): void {
     this.notify("turn/started", { ...withId("turn/started", "turn", id), threadId: "thr_1" });
@@ -152,6 +184,35 @@ afterEach(() => {
   CodexSession.hooks = null;
 });
 
+type CapturedEvent = {
+  event: StreamEvent;
+  runState: string;
+  steered: string;
+  unread: string[];
+};
+
+function capture<K extends keyof CapturedEvent>(session: CodexSession, name: K) {
+  const values: CapturedEvent[K][] = [];
+  session.on(name, (value: CapturedEvent[K]) => values.push(value));
+  return values;
+}
+
+function restoreSeedThread(sessionId: string) {
+  const session = CodexSession.fromState({
+    sessionId,
+    config: { cwd: "/tmp", backend: "codex", model: "gpt-6-astra" },
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      turns: 0,
+      duration_ms: 0,
+    },
+  });
+  return { session, events: capture(session, "event") };
+}
+
 function makeSession(config: Partial<ConstructorParameters<typeof CodexSession>[0]> = {}) {
   const session = new CodexSession({
     cwd: "/tmp",
@@ -159,12 +220,41 @@ function makeSession(config: Partial<ConstructorParameters<typeof CodexSession>[
     model: "gpt-6-astra",
     ...config,
   });
-  const events: StreamEvent[] = [];
-  const states: string[] = [];
-  session.on("event", (e: StreamEvent) => events.push(e));
-  session.on("runState", (s: string) => states.push(s));
-  return { session, events, states };
+  return { session, events: capture(session, "event"), states: capture(session, "runState") };
 }
+
+async function sendAndStart(
+  session: CodexSession,
+  input: Parameters<CodexSession["send"]>[0],
+  turnId?: string,
+) {
+  await session.send(input);
+  server.startTurn(turnId);
+}
+
+async function sendWorkspaceTurn(ws: Workspace, text: string) {
+  await ws.sendMessage(text);
+  server.startTurn();
+}
+
+const turnInputTexts = () =>
+  server.sent("turn/start").map((p) => (p.input as Array<{ text: string }>)[0].text);
+
+function capacityRetryDelays(...capacityRetryDelaysMs: number[]) {
+  CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs };
+}
+
+const overloaded = {
+  message: "Selected model is at capacity. Please try a different model.",
+  codexErrorInfo: "serverOverloaded",
+  additionalDetails: null,
+};
+
+const usageLimit = {
+  message: "You've hit your usage limit.",
+  codexErrorInfo: "usageLimitExceeded",
+  additionalDetails: null,
+};
 
 const echoTools = (handler: (args: Record<string, unknown>) => Promise<string>): PanelToolset => ({
   instructions: "You are a session of the project.",
@@ -204,8 +294,7 @@ describe("CodexSession automatic recovery continuation", () => {
   const next = (delta = "") => batch("retry-2", [userItem.clientId], delta);
 
   async function startFailedBatch(session: CodexSession) {
-    await session.send(batch());
-    server.startTurn();
+    await sendAndStart(session, batch());
     server.item("started", userItem, "thr_1", "turn_1");
     server.item("completed", userItem, "thr_1", "turn_1");
   }
@@ -285,9 +374,7 @@ describe("CodexSession automatic recovery continuation", () => {
     server.completeTurn("failed", networkFailure);
     await session.dispose();
     const restored = CodexSession.fromState(session.getState());
-    server.handlers["thread/resume"] = () => {
-      throw new Error("no rollout found for thread id thr_1");
-    };
+    server.reject("thread/resume", "no rollout found for thread id thr_1");
     const onBeforeWrite = vi.fn();
     await expect(restored.send(next(), { onBeforeWrite })).resolves.toMatchObject({
       disposition: "rejected",
@@ -328,12 +415,7 @@ describe("CodexSession automatic recovery continuation", () => {
     const { session } = makeSession();
     await startFailedBatch(session);
     if (scenario === "output") {
-      server.notify("item/agentMessage/delta", {
-        threadId: "thr_1",
-        turnId: "turn_1",
-        itemId: "out",
-        delta: "partial output",
-      });
+      server.agentDelta("out", "partial output", "turn_1");
     }
     if (scenario === "tool") {
       server.item("started", { type: "commandExecution", id: "tool" }, "thr_1", "turn_1");
@@ -411,10 +493,7 @@ describe("codex app-server session", () => {
       const { session } = makeSession();
       const onBeforeWrite = vi.fn();
       if (lost) server.hold.add("turn/start");
-      else
-        server.handlers["turn/start"] = () => {
-          throw new Error("Request rejected");
-        };
+      else server.reject("turn/start", "Request rejected");
       const sending = session.send("first", { onBeforeWrite });
       if (lost) {
         const failed = expect(sending).rejects.toThrow("Connection lost");
@@ -544,8 +623,7 @@ describe("codex app-server session", () => {
 
   it("sends model, effort and Fast with every turn, changing them without a restart", async () => {
     const { session } = makeSession({ model: "gpt-6-astra[1m]" });
-    await session.send("one");
-    server.startTurn();
+    await sendAndStart(session, "one");
     server.completeTurn();
     session.setEffort("high");
     session.setFastMode(true);
@@ -589,20 +667,7 @@ describe("codex app-server session", () => {
       throw new Error(`no rollout found for thread id ${String(p.threadId)}`);
     };
     server.handlers["thread/start"] = () => ({ thread: { id: "thr_new" } });
-    const session = CodexSession.fromState({
-      sessionId: "thr_gone",
-      config: { cwd: "/tmp", backend: "codex", model: "gpt-6-astra" },
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        turns: 0,
-        duration_ms: 0,
-      },
-    });
-    const events: StreamEvent[] = [];
-    session.on("event", (e: StreamEvent) => events.push(e));
+    const { session, events } = restoreSeedThread("thr_gone");
     await session.send("hi");
     expect(session.sessionId).toBe("thr_new");
     expect(events[0]).toMatchObject({ kind: "notice", level: "warning" });
@@ -611,23 +676,8 @@ describe("codex app-server session", () => {
   });
 
   it("keeps the thread when the resume fails for another reason", async () => {
-    server.handlers["thread/resume"] = () => {
-      throw new Error("permission denied");
-    };
-    const session = CodexSession.fromState({
-      sessionId: "thr_kept",
-      config: { cwd: "/tmp", backend: "codex" },
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        turns: 0,
-        duration_ms: 0,
-      },
-    });
-    const events: StreamEvent[] = [];
-    session.on("event", (e: StreamEvent) => events.push(e));
+    server.reject("thread/resume", "permission denied");
+    const { session, events } = restoreSeedThread("thr_kept");
     await session.send("hi");
     expect(session.sessionId).toBe("thr_kept");
     expect(events).toEqual([{ kind: "error", content: "[Codex error] permission denied" }]);
@@ -636,14 +686,8 @@ describe("codex app-server session", () => {
 
   it("ends a turn its app-server died in, and resumes in a new one next time", async () => {
     const { session, events } = makeSession();
-    await session.send("one");
-    server.startTurn();
-    server.item("started", {
-      type: "commandExecution",
-      id: "c1",
-      command: "sleep 9",
-      commandActions: [],
-    });
+    await sendAndStart(session, "one");
+    server.commandStarted("c1", "sleep 9");
     server.exit("codex app-server exited (9)");
     expect(session.isRunning).toBe(false);
     expect(events.map((e) => [e.kind, e.content])).toEqual([
@@ -657,11 +701,7 @@ describe("codex app-server session", () => {
   });
 
   it("interrupts a turn stopped before turn/start answered, once codex started it", async () => {
-    let answer!: () => void;
-    server.handlers["turn/start"] = () =>
-      new Promise(
-        (r) => (answer = () => r({ turn: { id: "turn_9", status: "inProgress", error: null } })),
-      );
+    const answer = server.holdTurnStart("turn_9");
     const { session } = makeSession();
     const sending = session.send("hi");
     await flush();
@@ -678,26 +718,22 @@ describe("codex app-server session", () => {
 
   it("steers only into a running turn, and tells which steered message the model read", async () => {
     const { session } = makeSession();
-    const steered: string[] = [];
-    session.on("steered", (id: string) => steered.push(id));
+    const steered = capture(session, "steered");
     expect(await session.steer("early", "m0")).toBe(false);
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     expect(await session.steer("a", "m1")).toBe(true);
     expect(await session.steer("b", "m2")).toBe(true);
     expect(server.sent("turn/steer")[0]).toMatchObject({
       expectedTurnId: "turn_1",
       clientUserMessageId: "m1",
     });
-    server.item("started", { type: "userMessage", id: "u0", clientId: null, content: [] });
+    server.userMessage("u0", null);
     expect(steered).toEqual([]);
     // Tagged with the panel's id, in any order; untagged, in order sent.
-    server.item("started", { type: "userMessage", id: "u2", clientId: "m2", content: [] });
-    server.item("started", { type: "userMessage", id: "u1", clientId: null, content: [] });
+    server.userMessage("u2", "m2");
+    server.userMessage("u1", null);
     expect(steered).toEqual(["m2", "m1"]);
-    server.handlers["turn/steer"] = () => {
-      throw new Error("no active turn to steer");
-    };
+    server.reject("turn/steer", "no active turn to steer");
     expect(await session.steer("late", "m3")).toBe(false);
   });
 
@@ -714,8 +750,7 @@ describe("codex app-server session", () => {
     "classifies transport on the Codex terminal error: %j",
     async ({ message, info, expected }) => {
       const { session, events } = makeSession();
-      await session.send("hi");
-      server.startTurn();
+      await sendAndStart(session, "hi");
       server.completeTurn("failed", { message, codexErrorInfo: info, additionalDetails: null });
       const terminal = events.at(-1);
       expect(terminal?.kind).toBe("error");
@@ -733,8 +768,7 @@ describe("codex app-server session", () => {
       quota.push(q);
       sparse.push(delta);
     });
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.notify("error", {
       threadId: "thr_1",
       turnId: "turn_1",
@@ -758,12 +792,7 @@ describe("codex app-server session", () => {
         planType: null,
       },
     });
-    const error = {
-      message: "You've hit your usage limit.",
-      codexErrorInfo: "usageLimitExceeded",
-      additionalDetails: null,
-    };
-    server.completeTurn("failed", error);
+    server.completeTurn("failed", usageLimit);
     expect(events.map((e) => e.kind)).toEqual(["retry", "error"]);
     expect(events[1].content).toMatch(/^Usage limit reached \(seven-day\)\. Resets at /);
     expect(limits).toEqual([{ rateLimitType: "seven_day", resetsAt: 900 }]);
@@ -788,21 +817,13 @@ describe("codex app-server session", () => {
     });
   });
 
-  const overloaded = {
-    message: "Selected model is at capacity. Please try a different model.",
-    codexErrorInfo: "serverOverloaded",
-    additionalDetails: null,
-  };
-
   it("carries on in a new turn when the model's capacity failed one, without resending the prompt", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [0, 0] };
+    capacityRetryDelays(0, 0);
     const { session, events, states } = makeSession();
-    const steered: string[] = [];
-    session.on("steered", (id: string) => steered.push(id));
-    await session.send("hi");
-    server.startTurn();
-    server.item("started", { type: "userMessage", id: "u1", clientId: null, content: [] });
-    server.notify("item/agentMessage/delta", { threadId: "thr_1", itemId: "m1", delta: "Half" });
+    const steered = capture(session, "steered");
+    await sendAndStart(session, "hi");
+    server.userMessage("u1", null);
+    server.agentDelta("m1", "Half");
     server.completeTurn("failed", overloaded);
     expect(events.map((e) => e.kind)).toEqual(["text_delta", "retry"]);
     expect(events[1].content).toBe(`${overloaded.message} Retrying in 0s (1/2).`);
@@ -815,8 +836,8 @@ describe("codex app-server session", () => {
       /^Continue from where you left off\. The previous turn was interrupted because the selected model was at capacity\./,
     );
     server.startTurn();
-    server.item("started", { type: "userMessage", id: "u2", clientId: null, content: [] });
-    server.notify("item/agentMessage/delta", { threadId: "thr_1", itemId: "m2", delta: "done" });
+    server.userMessage("u2", null);
+    server.agentDelta("m2", "done");
     server.completeTurn();
     expect(events.map((e) => e.kind)).toEqual(["text_delta", "retry", "text_delta", "result"]);
     expect(events[2].content).toBe("\n\ndone");
@@ -825,10 +846,9 @@ describe("codex app-server session", () => {
   });
 
   it("gives up on capacity after the last retry, and a Stop while it waits ends the turn", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [0] };
+    capacityRetryDelays(0);
     const { session, events } = makeSession();
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.completeTurn("failed", overloaded);
     await flush();
     server.startTurn();
@@ -838,9 +858,8 @@ describe("codex app-server session", () => {
     expect(session.isRunning).toBe(false);
 
     // A new turn starts counting again.
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [60_000] };
-    await session.send("again");
-    server.startTurn();
+    capacityRetryDelays(60_000);
+    await sendAndStart(session, "again");
     server.completeTurn("failed", overloaded);
     expect(events.at(-1)?.kind).toBe("retry");
     expect(await session.interrupt()).toBe(true);
@@ -852,13 +871,11 @@ describe("codex app-server session", () => {
   });
 
   it("gives a capacity retry's unread steers back to the queue, and takes none while it waits", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [0] };
+    capacityRetryDelays(0);
     const { session } = makeSession();
-    const unread: string[][] = [];
-    session.on("unread", (ids: string[]) => unread.push(ids));
-    await session.send("hi");
-    server.startTurn();
-    server.item("started", { type: "userMessage", id: "u1", clientId: null, content: [] });
+    const unread = capture(session, "unread");
+    await sendAndStart(session, "hi");
+    server.userMessage("u1", null);
     expect(await session.steer("also this", "m1")).toBe(true);
     server.completeTurn("failed", overloaded);
     expect(unread).toEqual([["m1"]]);
@@ -872,9 +889,8 @@ describe("codex app-server session", () => {
     const dir = mkdtempSync(join(tmpdir(), "codex-capacity-"));
     const { session } = makeSession({ dataDir: dir, workspaceId: "ws" });
     try {
-      CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [60_000] };
-      await session.send("hi");
-      server.startTurn();
+      capacityRetryDelays(60_000);
+      await sendAndStart(session, "hi");
       server.completeTurn("failed", overloaded);
       server.startTurn("turn_goal");
       server.item("started", { type: "agentMessage", id: "output" }, "thr_1", "turn_goal");
@@ -889,10 +905,9 @@ describe("codex app-server session", () => {
   });
 
   it("retries no compaction, and no turn when codex carried on by itself meanwhile", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [20] };
+    capacityRetryDelays(20);
     const { session, events } = makeSession();
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.completeTurn("failed", overloaded);
     server.startTurn("turn_goal");
     await vi.advanceTimersByTimeAsync(40);
@@ -900,8 +915,7 @@ describe("codex app-server session", () => {
     server.completeTurn("completed", null, "turn_goal");
     expect(events.map((e) => e.kind)).toEqual(["retry", "result"]);
 
-    await session.send("/compact");
-    server.startTurn("turn_c");
+    await sendAndStart(session, "/compact", "turn_c");
     server.completeTurn("failed", overloaded, "turn_c");
     expect(events.at(-1)).toEqual({
       kind: "error",
@@ -913,10 +927,9 @@ describe("codex app-server session", () => {
   });
 
   it("retries a turn codex started itself after a compaction", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [60_000] };
+    capacityRetryDelays(60_000);
     const { session, events } = makeSession();
-    await session.send("/compact");
-    server.startTurn("turn_c");
+    await sendAndStart(session, "/compact", "turn_c");
     server.completeTurn("completed", null, "turn_c");
     server.startTurn("turn_goal");
     server.completeTurn("failed", overloaded, "turn_goal");
@@ -926,8 +939,7 @@ describe("codex app-server session", () => {
 
   it("goes idle without a terminal event when the process is killed mid-turn", async () => {
     const { session, events, states } = makeSession();
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     session.abort();
     expect(session.isRunning).toBe(false);
     expect(states).toEqual(["working", "idle"]);
@@ -979,21 +991,18 @@ describe("codex app-server session", () => {
     });
     expect(await session.getContextUsage()).toMatchObject({ totalTokens: 4800, maxTokens: 258400 });
 
-    await session.send("/compact");
-    server.startTurn("failed-compact");
+    await sendAndStart(session, "/compact", "failed-compact");
     server.completeTurn("failed", overloaded, "failed-compact");
     expect(events.at(-1)).not.toHaveProperty("context");
     expect(await session.getContextUsage()).toMatchObject({ totalTokens: 4800, maxTokens: 258400 });
 
-    await session.send("next");
-    server.startTurn("next");
+    await sendAndStart(session, "next", "next");
     server.notify("thread/tokenUsage/updated", usage); // Late update from the old turn.
     server.completeTurn("completed", null, "next");
     expect(events.at(-1)?.context).toBeNull();
     expect(await session.getContextUsage()).toBeNull();
 
-    await session.send("invalid reasoning count");
-    server.startTurn("invalid");
+    await sendAndStart(session, "invalid reasoning count", "invalid");
     server.notify("thread/tokenUsage/updated", {
       ...usage,
       turnId: "invalid",
@@ -1008,8 +1017,7 @@ describe("codex app-server session", () => {
 
   it("takes a turn codex starts itself as a wake-up", async () => {
     const { session, events } = makeSession();
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.completeTurn();
     server.startTurn("turn_goal");
     expect(session.isRunning).toBe(true);
@@ -1023,10 +1031,9 @@ describe("codex app-server session", () => {
 
   it("keeps an agent message whose text came without deltas, and each warning once", async () => {
     const { session, events } = makeSession();
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.notify("warning", { threadId: "thr_1", message: "Model metadata not found." });
-    server.notify("item/agentMessage/delta", { threadId: "thr_1", itemId: "a1", delta: "Hel" });
+    server.agentDelta("a1", "Hel");
     server.item("completed", { type: "agentMessage", id: "a1", text: "Hello." });
     server.item("completed", { type: "agentMessage", id: "a2", text: "Second." });
     server.notify("warning", { threadId: "thr_1", message: "Model metadata not found." });
@@ -1048,8 +1055,7 @@ describe("codex session races", () => {
     await flush();
     session.abort();
     server.hold.clear();
-    await session.send("two");
-    server.startTurn();
+    await sendAndStart(session, "two");
     // The first process exits now: its turn/start fails.
     await flush();
     expect(session.isRunning).toBe(true);
@@ -1064,9 +1070,7 @@ describe("codex session races", () => {
     await session.send("hi");
     expect(await session.interrupt()).toBe(true);
     expect(server.sent("turn/interrupt")).toEqual([]);
-    server.handlers["turn/interrupt"] = () => {
-      throw new Error("no active turn");
-    };
+    server.reject("turn/interrupt", "no active turn");
     server.startTurn();
     await flush();
     expect(server.sent("turn/interrupt")).toHaveLength(1);
@@ -1077,8 +1081,7 @@ describe("codex session races", () => {
 
   it("keeps the next turn's Stop when the stopped turn's interrupt fails late", async () => {
     const { session } = makeSession();
-    await session.send("one");
-    server.startTurn();
+    await sendAndStart(session, "one");
     server.hold.add("turn/interrupt");
     void session.interrupt();
     await flush();
@@ -1095,11 +1098,7 @@ describe("codex session races", () => {
   });
 
   it("steers a message sent before turn/start answered once the turn is known", async () => {
-    let answer!: () => void;
-    server.handlers["turn/start"] = () =>
-      new Promise(
-        (r) => (answer = () => r({ turn: { id: "turn_1", status: "inProgress", error: null } })),
-      );
+    const answer = server.holdTurnStart("turn_1");
     const { session } = makeSession();
     void session.send("hi");
     await flush();
@@ -1115,25 +1114,21 @@ describe("codex session races", () => {
 
   it("does not take a userMessage tagged with an id it never sent for a steered one", async () => {
     const { session } = makeSession();
-    const steered: string[] = [];
-    session.on("steered", (id: string) => steered.push(id));
-    await session.send("hi");
-    server.startTurn();
-    server.item("started", { type: "userMessage", id: "u0", clientId: null, content: [] });
+    const steered = capture(session, "steered");
+    await sendAndStart(session, "hi");
+    server.userMessage("u0", null);
     await session.steer("more", "m1");
-    server.item("started", { type: "userMessage", id: "u1", clientId: "other", content: [] });
+    server.userMessage("u1", "other");
     expect(steered).toEqual([]);
-    server.item("started", { type: "userMessage", id: "u2", clientId: null, content: [] });
+    server.userMessage("u2", null);
     expect(steered).toEqual(["m1"]);
   });
 
   it("splits at a steered message read in the same tick as the steer's answer", async () => {
     const { session } = makeSession();
-    const steered: string[] = [];
-    session.on("steered", (id: string) => steered.push(id));
-    await session.send("hi");
-    server.startTurn();
-    server.item("started", { type: "userMessage", id: "u0", clientId: null, content: [] });
+    const steered = capture(session, "steered");
+    await sendAndStart(session, "hi");
+    server.userMessage("u0", null);
     server.after["turn/steer"] = [
       {
         method: "item/started",
@@ -1149,10 +1144,8 @@ describe("codex session races", () => {
 
   it("reports the steered messages a turn ended without reading, and never steers /compact", async () => {
     const { session } = makeSession();
-    const unread: string[][] = [];
-    session.on("unread", (ids: string[]) => unread.push(ids));
-    await session.send("hi");
-    server.startTurn();
+    const unread = capture(session, "unread");
+    await sendAndStart(session, "hi");
     expect(await session.steer("/compact", "m0")).toBe(false);
     expect(await session.steer("more", "m1")).toBe(true);
     server.completeTurn("interrupted");
@@ -1162,8 +1155,7 @@ describe("codex session races", () => {
   it("answers no tool call from a process it is replacing, and stops its subagents' cards", async () => {
     const { session, events } = makeSession();
     session.setPanelTools(echoTools(() => Promise.resolve("ran")));
-    await session.send("hi");
-    server.startTurn();
+    await sendAndStart(session, "hi");
     server.item("started", {
       type: "subAgentActivity",
       id: "s1",
@@ -1171,23 +1163,18 @@ describe("codex session races", () => {
       agentThreadId: "thr_sub",
       agentPath: "/root/helper",
     });
-    const call = server.request("item/tool/call", {
-      threadId: "thr_1",
-      turnId: "turn_1",
-      callId: "c",
-      namespace: "panel",
-      tool: "echo",
-      arguments: { text: "x" },
-    });
+    const echo = (callId: string) =>
+      server.request("item/tool/call", {
+        threadId: "thr_1",
+        turnId: "turn_1",
+        callId,
+        namespace: "panel",
+        tool: "echo",
+        arguments: { text: "x" },
+      });
+    const call = echo("c");
     session.abort();
-    const late = server.request("item/tool/call", {
-      threadId: "thr_1",
-      turnId: "turn_1",
-      callId: "c2",
-      namespace: "panel",
-      tool: "echo",
-      arguments: { text: "x" },
-    });
+    const late = echo("c2");
     expect(await call).toMatchObject({ success: true });
     expect(await late).toMatchObject({
       message: expect.stringContaining("shutting down") as string,
@@ -1201,22 +1188,41 @@ describe("codex session races", () => {
 
 describe("codex steering through the workspace", () => {
   const removed: string[] = [];
-  function makeWorkspace(onAgentIdle?: () => void) {
-    removed.length = 0;
+  function localRegistry() {
     const registry = new HostRegistry();
     registry.register(new LocalHost("local", "Local"));
-    const ws = new Workspace("ws", "t", "p", "local", "/tmp", registry, {
-      onNewMessage: () => {},
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
-      onMessageRemoved: (_ws, id) => removed.push(id),
-      onAgentIdle,
+    return registry;
+  }
+  const workspaceCallbacks: WorkspaceCallbacks = {
+    onNewMessage: () => {},
+    onStreamEvent: () => {},
+    onMessageDone: () => {},
+  };
+  function makeWorkspace(callbacks: Partial<WorkspaceCallbacks> = {}) {
+    const ws = new Workspace("ws", "t", "p", "local", "/tmp", localRegistry(), {
+      ...workspaceCallbacks,
+      ...callbacks,
     });
-    ws.addAgent("A", "gpt-6-astra", "🤖", "#888", { backend: "codex" });
+    const agent = ws.addAgent("A", "gpt-6-astra", "🤖", "#888", { backend: "codex" });
+    return { ws, agent };
+  }
+  function workspaceWithRemovalLog(callbacks: Partial<WorkspaceCallbacks> = {}) {
+    removed.length = 0;
+    return makeWorkspace({ onMessageRemoved: (_ws, id) => removed.push(id), ...callbacks }).ws;
+  }
+  async function startWorkspace() {
+    const ws = workspaceWithRemovalLog();
+    await sendWorkspaceTurn(ws, "first");
     return ws;
   }
-  const userMessage = (id: string, clientId: string | null) =>
-    server.item("started", { type: "userMessage", id, clientId, content: [] });
+  async function sendMessageRow(ws: Workspace, text: string) {
+    await ws.sendMessage(text);
+    return ws.messages.find((m) => m.content === text)!;
+  }
+  function readPromptAndSteer(clientId: string) {
+    server.userMessage("u1", null);
+    server.userMessage("u2", clientId);
+  }
   const summary = (ws: Workspace) =>
     ws.messages.filter((m) => m.kind !== "system").map((m) => `${m.kind} ${m.status} ${m.content}`);
 
@@ -1224,7 +1230,7 @@ describe("codex steering through the workspace", () => {
     "notifies idle after early turn completion or transport loss (lost=%s)",
     async (lost) => {
       const idle: boolean[] = [];
-      const ws = makeWorkspace(() => idle.push(ws.isIdle));
+      const ws = workspaceWithRemovalLog({ onAgentIdle: () => idle.push(ws.isIdle) });
       if (lost) server.hold.add("turn/start");
       else
         server.after["turn/start"] = [
@@ -1253,8 +1259,6 @@ describe("codex steering through the workspace", () => {
   );
 
   it("queues paired panel context and user text as one Codex turn and two transcript rows", async () => {
-    const registry = new HostRegistry();
-    registry.register(new LocalHost("local", "Local"));
     const prepareManualInput = vi
       .fn<NonNullable<WorkspaceCallbacks["prepareManualInput"]>>()
       .mockReturnValueOnce(undefined)
@@ -1270,17 +1274,13 @@ describe("codex steering through the workspace", () => {
       });
     const onReportDeliveryState = vi.fn<NonNullable<WorkspaceCallbacks["onReportDeliveryState"]>>();
     const live: ReturnType<typeof toWireMessage>[] = [];
-    const ws = new Workspace("ws", "t", "p", "local", "/tmp", registry, {
+    const { ws, agent } = makeWorkspace({
       onNewMessage: (_ws, msg) => live.push(toWireMessage(msg)),
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
       prepareManualInput,
       onReportDeliveryState,
     });
-    const agent = ws.addAgent("A", "gpt-6-astra", "🤖", "#888", { backend: "codex" });
-    await ws.sendMessage("First");
-    server.startTurn();
-    userMessage("first-user", null);
+    await sendWorkspaceTurn(ws, "First");
+    server.userMessage("first-user", null);
     const inbox = ws.ensureReportQueued(
       "inbox-msg",
       agent.id,
@@ -1315,7 +1315,7 @@ describe("codex steering through the workspace", () => {
     ]);
     await vi.waitFor(() => expect(ws.findMessage(rows[1].id)?.status).toBe("done"));
     server.startTurn();
-    userMessage("paired-user", null);
+    server.userMessage("paired-user", null);
     server.completeTurn();
     expect(onReportDeliveryState.mock.calls.map(([id, state]) => [id, state])).toEqual([
       ["outage-batch", "enqueued"],
@@ -1326,30 +1326,18 @@ describe("codex steering through the workspace", () => {
   });
 
   it("steers a message into the running turn and answers it in a reply of its own", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.notify("item/agentMessage/delta", {
-      threadId: "thr_1",
-      itemId: "a1",
-      delta: "Working.",
-    });
-    await ws.sendMessage("also this");
-    const steered = ws.messages.find((m) => m.content === "also this")!;
+    const ws = await startWorkspace();
+    server.agentDelta("a1", "Working.");
+    const steered = await sendMessageRow(ws, "also this");
     // Handed over, not read yet: still queued, and no longer cancellable.
     expect(steered.status).toBe("queued");
     expect(ws.cancelQueued(steered.id)).toBe(false);
     expect(server.sent("turn/steer")).toEqual([
       expect.objectContaining({ clientUserMessageId: steered.id, expectedTurnId: "turn_1" }),
     ]);
-    server.item("started", { type: "userMessage", id: "u1", clientId: null, content: [] });
-    server.item("started", { type: "userMessage", id: "u2", clientId: steered.id, content: [] });
+    readPromptAndSteer(steered.id);
     expect(steered.status).toBe("done");
-    server.notify("item/agentMessage/delta", {
-      threadId: "thr_1",
-      itemId: "a2",
-      delta: "Done both.",
-    });
+    server.agentDelta("a2", "Done both.");
     server.completeTurn();
     await flush();
     expect(summary(ws)).toEqual([
@@ -1361,25 +1349,14 @@ describe("codex steering through the workspace", () => {
   });
 
   it("queues a message, cancellable, while a capacity retry waits", async () => {
-    CodexSession.hooks = { ...CodexSession.hooks, capacityRetryDelaysMs: [60_000] };
+    capacityRetryDelays(60_000);
     const shown: Array<{ content: string; steering?: boolean }> = [];
-    const registry = new HostRegistry();
-    registry.register(new LocalHost("local", "Local"));
-    const ws = new Workspace("ws", "t", "p", "local", "/tmp", registry, {
+    const { ws } = makeWorkspace({
       onNewMessage: (_ws, m) => shown.push({ content: m.content, steering: m.steering }),
-      onStreamEvent: () => {},
-      onMessageDone: () => {},
     });
-    ws.addAgent("A", "gpt-6-astra", "🤖", "#888", { backend: "codex" });
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.completeTurn("failed", {
-      message: "Selected model is at capacity. Please try a different model.",
-      codexErrorInfo: "serverOverloaded",
-      additionalDetails: null,
-    });
-    await ws.sendMessage("also this");
-    const waiting = ws.messages.find((m) => m.content === "also this")!;
+    await sendWorkspaceTurn(ws, "first");
+    server.completeTurn("failed", overloaded);
+    const waiting = await sendMessageRow(ws, "also this");
     expect(shown.find((m) => m.content === "also this")?.steering).toBeUndefined();
     expect(server.sent("turn/steer")).toEqual([]);
     expect(ws.cancelQueued(waiting.id)).toBe(true);
@@ -1387,27 +1364,18 @@ describe("codex steering through the workspace", () => {
   });
 
   it("queues a message the turn would not take, and runs it when the turn ends", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.handlers["turn/steer"] = () => {
-      throw new Error("activeTurnNotSteerable");
-    };
-    await ws.sendMessage("second");
-    const second = ws.messages.find((m) => m.content === "second")!;
+    const ws = await startWorkspace();
+    server.reject("turn/steer", "activeTurnNotSteerable");
+    const second = await sendMessageRow(ws, "second");
     expect(second.status).toBe("queued");
     server.completeTurn();
     await flush();
     expect(second.status).toBe("done");
-    expect(
-      server.sent("turn/start").map((p) => (p.input as Array<{ text: string }>)[0].text),
-    ).toEqual(["first", "second"]);
+    expect(turnInputTexts()).toEqual(["first", "second"]);
   });
 
   it("tells another session its message went into the running turn", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
+    const ws = await startWorkspace();
     const from = { workspaceId: "lead", name: "lead", role: "lead" as const };
     expect(ws.deliver("note", from, "[From the project lead] note")).toBe("steered");
     await flush();
@@ -1417,28 +1385,18 @@ describe("codex steering through the workspace", () => {
   });
 
   it("stops a turn by interrupt and runs the steered message it never read after it", async () => {
-    const ws = makeWorkspace();
+    const ws = await startWorkspace();
     const [id] = ws.agents.keys();
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.item("started", {
-      type: "commandExecution",
-      id: "c1",
-      command: "sleep 30",
-      commandActions: [],
-    });
+    server.commandStarted("c1", "sleep 30");
     // Steered, but the command still runs: the model has not read it.
-    await ws.sendMessage("second");
-    const second = ws.messages.find((m) => m.content === "second")!;
+    const second = await sendMessageRow(ws, "second");
     await ws.interruptAgent(id);
     expect(server.sent("turn/interrupt")).toEqual([{ threadId: "thr_1", turnId: "turn_1" }]);
     // codex drops it with the turn (codex/steer-interrupt): the panel runs it.
     server.completeTurn("interrupted");
     await flush();
     expect(second.status).toBe("done");
-    expect(
-      server.sent("turn/start").map((p) => (p.input as Array<{ text: string }>)[0].text),
-    ).toEqual(["first", "second"]);
+    expect(turnInputTexts()).toEqual(["first", "second"]);
     const [reply] = ws.messages.filter((m) => m.kind === "agent");
     expect(reply.content).toBe("*\\[interrupted\\]*");
     expect(reply.events!.find((e) => e.kind === "tool_use")).toMatchObject({
@@ -1449,15 +1407,11 @@ describe("codex steering through the workspace", () => {
   });
 
   it("drops the empty reply when the steered message is read with the prompt", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
-    await ws.sendMessage("second");
-    const second = ws.messages.find((m) => m.content === "second")!;
+    const ws = await startWorkspace();
+    const second = await sendMessageRow(ws, "second");
     const [empty] = ws.messages.filter((m) => m.kind === "agent");
-    userMessage("u1", null);
-    userMessage("u2", second.id);
-    server.notify("item/agentMessage/delta", { threadId: "thr_1", itemId: "a1", delta: "Both." });
+    readPromptAndSteer(second.id);
+    server.agentDelta("a1", "Both.");
     server.completeTurn();
     await flush();
     expect(removed).toEqual([empty.id]);
@@ -1465,48 +1419,28 @@ describe("codex steering through the workspace", () => {
   });
 
   it("carries on rather than resending a prompt when a limit refuses the turn after a steer", async () => {
-    const ws = makeWorkspace();
+    const ws = await startWorkspace();
     const [id] = ws.agents.keys();
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.notify("item/agentMessage/delta", { threadId: "thr_1", itemId: "a1", delta: "On it." });
-    await ws.sendMessage("second");
-    const second = ws.messages.find((m) => m.content === "second")!;
-    userMessage("u1", null);
-    userMessage("u2", second.id);
+    server.agentDelta("a1", "On it.");
+    const second = await sendMessageRow(ws, "second");
+    readPromptAndSteer(second.id);
     // The request that read it is the one the limit refuses.
     ws.pauseAgent(id, Date.now() + 60_000, true);
-    server.completeTurn("failed", {
-      message: "You've hit your usage limit.",
-      codexErrorInfo: "usageLimitExceeded",
-      additionalDetails: null,
-    });
+    server.completeTurn("failed", usageLimit);
     await flush();
     expect(ws.retryLast(id)).toBe(true);
     await flush();
-    const inputs = server
-      .sent("turn/start")
-      .map((p) => (p.input as Array<{ text: string }>)[0].text);
-    expect(inputs).toEqual([
+    expect(turnInputTexts()).toEqual([
       "first",
       "[From the panel] A usage limit cut your turn off. Carry on where you left off.",
     ]);
   });
 
   it("closes a call the earlier reply made when its result comes after a steered message", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
-    server.item("started", {
-      type: "commandExecution",
-      id: "c1",
-      command: "make",
-      commandActions: [],
-    });
-    await ws.sendMessage("second");
-    const second = ws.messages.find((m) => m.content === "second")!;
-    userMessage("u1", null);
-    userMessage("u2", second.id);
+    const ws = await startWorkspace();
+    server.commandStarted("c1", "make");
+    const second = await sendMessageRow(ws, "second");
+    readPromptAndSteer(second.id);
     server.item("completed", {
       type: "commandExecution",
       id: "c1",
@@ -1528,10 +1462,8 @@ describe("codex steering through the workspace", () => {
   });
 
   it("does not steer past a waiting message or a rate-limit hold", async () => {
-    const ws = makeWorkspace();
+    const ws = await startWorkspace();
     const [id] = ws.agents.keys();
-    await ws.sendMessage("first");
-    server.startTurn();
     ws.pauseAgent(id, Date.now() + 60_000);
     await ws.sendMessage("held");
     ws.pauseAgent(id, 0);
@@ -1544,22 +1476,12 @@ describe("codex steering through the workspace", () => {
   });
 
   it("gives a message caught mid-steer by a restart back to the queue", async () => {
-    const ws = makeWorkspace();
-    await ws.sendMessage("first");
-    server.startTurn();
+    const ws = await startWorkspace();
     server.hold.add("turn/steer");
     void ws.sendMessage("second");
     await flush();
     const state = ws.getState();
-    const restored = Workspace.fromState(
-      state,
-      (() => {
-        const registry = new HostRegistry();
-        registry.register(new LocalHost("local", "Local"));
-        return registry;
-      })(),
-      { onNewMessage: () => {}, onStreamEvent: () => {}, onMessageDone: () => {} },
-    );
+    const restored = Workspace.fromState(state, localRegistry(), workspaceCallbacks);
     const second = restored.messages.find((m) => m.content === "second")!;
     expect(second).toMatchObject({ status: "queued" });
     expect(second.steering).toBeUndefined();
@@ -1567,16 +1489,13 @@ describe("codex steering through the workspace", () => {
   });
 
   it("makes a steered message from another session the one its sender waits on once read", async () => {
-    const ws = makeWorkspace();
+    const ws = await startWorkspace();
     const [entry] = ws.agents.values();
-    await ws.sendMessage("first");
-    server.startTurn();
     const from = { workspaceId: "lead", name: "lead", role: "lead" as const };
     ws.deliver("note", from, "[From the project lead] note");
     await flush();
     const note = ws.messages.find((m) => m.content === "note")!;
-    userMessage("u1", null);
-    userMessage("u2", note.id);
+    readPromptAndSteer(note.id);
     expect(entry.delivered?.id).toBe(note.id);
     expect(entry.input?.id).toBe(note.id);
   });

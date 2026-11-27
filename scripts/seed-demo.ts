@@ -1,22 +1,14 @@
-// Fills a dev instance's base dir (its AGENT_TEAM_BASE_DIR) with a demo to
-// try the UI on: a clone of this repository with worktrees, a project with
-// its lead and worker sessions (history with tools, cards, delivered messages
-// and file references), an objectives board with dependencies, and an
-// archived workspace from before projects (the lead's history). No session
-// is started: the
-// agents are idle until someone writes to them, and then they work in the
-// clone, which has no remote.
-//
-//   npm run demo -- .agent-team/dev-9801
-import { execFileSync } from "child_process";
-import * as fs from "fs";
-import * as path from "path";
-import { seedFileLinks } from "./demo-file-links";
+// Seed a dev instance with a remote-free Git clone, worktrees, transcripts and a board.
+// No sessions start. Usage: npm run demo -- .agent-team/dev-9801
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { ProjectStore } from "../service/src/project/store";
 import { ObjectiveStore, type Objective } from "../service/src/project/objectives";
 import { IssueStore } from "../service/src/project/issues";
 import { writeNote } from "../service/src/project/notes";
-import { closeHistory, saveIndex, saveWorkspace } from "../service/src/workspace/state";
+import { saveIndex } from "../service/src/workspace/state";
 import { LEAD_MODEL } from "../service/src/project/manager";
 import { backendForModel, defaultEffortForModel } from "../service/src/config/presets";
 import type {
@@ -27,24 +19,27 @@ import type {
 } from "../service/src/workspace/workspace";
 import type { StreamEvent } from "../service/src/session/types";
 
-function findRepoRoot(): string {
-  const start = typeof __dirname === "string" ? __dirname : process.cwd();
-  let dir = path.resolve(start);
-  for (;;) {
-    if (
-      fs.existsSync(path.join(dir, "package.json")) &&
-      fs.existsSync(path.join(dir, "service")) &&
-      fs.existsSync(path.join(dir, "webview"))
-    ) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return path.resolve(process.cwd());
-    dir = parent;
-  }
-}
+import { isScriptMain, REPO_ROOT as ROOT } from "./script-paths.mjs";
+import { seedCommit, seedGit as git, seedWorkspaces } from "./seed-corpus";
 
-const ROOT = findRepoRoot();
+// Use actual scratch paths for both Markdown cases: a native absolute path
+// with a line suffix, and a file URL with a line range.
+function seedFileLinks(demo: string) {
+  const root = path.join(demo, "_reports");
+  fs.mkdirSync(root);
+  const links = [
+    { label: "Parser trace", file: path.join(root, "解析 trace.txt"), line: 42, end: 42 },
+    { label: "Resolver report", file: path.join(root, "解析 report.txt"), line: 12, end: 20 },
+  ];
+  for (const { file, line } of links) {
+    const lines = Array.from({ length: 90 }, (_, i) => `frame ${i + 1}`);
+    lines[line - 1] = randomUUID();
+    fs.writeFileSync(file, lines.join("\n"));
+  }
+  const drivePath = links[0].file.replaceAll("\\", "\\\\");
+  const markdown = `[${links[0].label}](<${drivePath}:42>) · [${links[1].label}](${pathToFileURL(links[1].file).href}#L12-L20)`;
+  return { markdown, links };
+}
 
 export interface SeedDemoOptions {
   quiet?: boolean;
@@ -98,21 +93,9 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
   const demo = path.join(base, "demo");
   const repo = path.join(demo, "agent-team");
   const tree = (name: string) => path.join(demo, "agent-team-wt", name);
-  const git = (...args: string[]) => execFileSync("git", args, { stdio: "pipe" });
   const commit = (dir: string, file: string, text: string, message: string) => {
     fs.writeFileSync(path.join(dir, file), text);
-    git("-C", dir, "add", file);
-    git(
-      "-C",
-      dir,
-      "-c",
-      "user.name=demo",
-      "-c",
-      "user.email=demo@localhost",
-      "commit",
-      "-qm",
-      message,
-    );
+    seedCommit(dir, "demo", "demo@localhost", file, message);
   };
 
   let result: SeedDemoResult;
@@ -256,40 +239,35 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
       timestamp: ago(min),
       status: "done",
     });
-    // A panel tool with no summary of its own shows its input.
-    const report = (name: "report_progress" | "finish_task", text: string, step: number) => ({
-      ...panelTool(name, {}, "Delivered to the lead.", step),
-      content: `**${name}**\n\n> ${text}`,
-    });
-    const panelTool = (name: string, input: object, result: string, step: number): StreamEvent => ({
-      kind: "tool_use",
-      content: `**${name}**\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
-      toolName: `mcp__panel__${name}`,
-      toolUseId: `toolu_demo${++tool}`,
-      toolResult: result,
-      step,
-      contentOffset: 0,
-    });
-
     let tool = 0;
-    const read = (file: string, result: string, step: number, at = 0): StreamEvent => ({
+    const toolCall = (
+      toolName: string,
+      content: string,
+      toolResult: string,
+      step: number,
+      contentOffset = 0,
+    ): StreamEvent => ({
       kind: "tool_use",
-      content: `**Read** \`${file}\``,
-      toolName: "Read",
+      content,
+      toolName,
       toolUseId: `toolu_demo${++tool}`,
-      toolResult: result,
+      toolResult,
       step,
-      contentOffset: at,
+      contentOffset,
     });
-    const bash = (command: string, result: string, step: number, at = 0): StreamEvent => ({
-      kind: "tool_use",
-      content: `**Bash**\n\`\`\`bash\n${command}\n\`\`\``,
-      toolName: "Bash",
-      toolUseId: `toolu_demo${++tool}`,
-      toolResult: result,
-      step,
-      contentOffset: at,
-    });
+    const panelTool = (name: string, input: object, result: string, step: number) =>
+      toolCall(
+        `mcp__panel__${name}`,
+        `**${name}**\n\`\`\`json\n${JSON.stringify(input, null, 2)}\n\`\`\``,
+        result,
+        step,
+      );
+    const report = (name: "report_progress" | "finish_task", text: string, step: number) =>
+      toolCall(`mcp__panel__${name}`, `**${name}**\n\n> ${text}`, "Delivered to the lead.", step);
+    const read = (file: string, result: string, step: number) =>
+      toolCall("Read", `**Read** \`${file}\``, result, step);
+    const bash = (command: string, result: string, step: number) =>
+      toolCall("Bash", `**Bash**\n\`\`\`bash\n${command}\n\`\`\``, result, step);
     const edit = (file: string, from: string, to: string, step: number, at = 0): StreamEvent => ({
       kind: "tool_use",
       content: `**Edit** \`${file}\`\n\`\`\`diff\n${from
@@ -646,14 +624,8 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
     ];
 
     const all = [lead, mobile, wake, routes, solo, past];
-    try {
-      for (const w of all) {
-        w.lastActivityAt = Math.max(...w.messages!.map((m) => m.timestamp));
-        saveWorkspace(base, w);
-      }
-    } finally {
-      closeHistory(base);
-    }
+    for (const w of all) w.lastActivityAt = Math.max(...w.messages!.map((m) => m.timestamp));
+    seedWorkspaces(base, all);
 
     // The board.
     const objectives = new ObjectiveStore(store.objectivesDir(project.id));
@@ -858,18 +830,7 @@ export function seedDemo(baseDir: string, options: SeedDemoOptions = {}): SeedDe
   }
 }
 
-function isMainModule(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  const self = path.join(ROOT, "scripts", "seed-demo.ts");
-  try {
-    return fs.realpathSync(entry) === fs.realpathSync(self);
-  } catch {
-    return path.resolve(entry) === path.resolve(self);
-  }
-}
-
-if (isMainModule()) {
+if (isScriptMain("seed-demo.ts")) {
   if (!process.argv[2]) throw new Error("usage: npm run demo -- <base dir of a dev instance>");
   // npm runs scripts from the package root; a relative path is the caller's.
   const target = path.resolve(process.env.INIT_CWD ?? process.cwd(), process.argv[2]);

@@ -5,57 +5,25 @@ import { cdp, page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
 import type { Workspace } from "../../src/state/useServer";
+import { themedViewport } from "../helpers/browser";
+import { project as makeProject, workspace } from "../helpers/fixtures";
+import { sidebarProps } from "../helpers/sidebar";
 import "../../src/styles.css";
 
 const noop = () => {};
-const project = {
-  id: "p",
-  name: "Project",
-  root: "/repo",
-  createdAt: 1,
-  leadWorkspaceId: "lead",
-  objectives: [],
-};
-function ws(id: string, extra: Partial<Workspace> = {}): Workspace {
-  return {
-    id,
-    name: id,
-    cwd: "/repo",
-    hostId: "local",
-    project: "repo",
-    createdAt: 1,
-    agents: [],
-    messages: [],
-    projectLink: { projectId: "p", role: "worker" },
-    ...extra,
-  };
-}
+const project = makeProject("p");
+const ws = (id: string, extra: Partial<Workspace> = {}) =>
+  workspace(id, { projectLink: { projectId: "p", role: "worker" }, ...extra });
 const workspaces = [
   ws("lead", { projectLink: { projectId: "p", role: "lead" } }),
   ...Array.from({ length: 28 }, (_, i) => ws(`idle-${i}`)),
   ...Array.from({ length: 28 }, (_, i) => ws(`old-${i}`, { archivedAt: 2 })),
   ws("other", { projectLink: undefined, cwd: "/other" }),
 ];
-const props: SidebarProps = {
-  projects: [project],
-  workspaces,
-  activeWsId: "lead",
-  connected: false,
-  groupOverrides: {},
-  searchQuery: "",
-  searchHits: null,
-  systemStatus: null,
-  onSelect: noop,
-  onDelete: noop,
-  onToggleGroup: noop,
-  onSearchChange: noop,
-  onJump: noop,
-  onCreate: noop,
-  onCreateIn: noop,
-  onReplayDemo: noop,
-  onDebugSnapshot: noop,
-  onPurgeArchived: noop,
-};
+const props = sidebarProps(
+  { projects: [project], workspaces, activeWsId: "lead", connected: false },
+  () => noop,
+);
 function Drawer(extra: Partial<SidebarProps>) {
   const [groups, setGroups] = useState<Record<string, boolean>>({});
   return (
@@ -120,10 +88,7 @@ afterEach(() => {
 for (const theme of ["light", "dark"])
   for (const width of [1280, 390])
     describe(`${theme} at ${width}px`, () => {
-      async function viewport() {
-        await page.viewport(width, 650);
-        document.documentElement.dataset.theme = theme;
-      }
+      const viewport = () => themedViewport(width, 650, theme);
       it("keeps disclosure labels, hit boxes and neighboring row edges stable across overflow", async () => {
         await viewport();
         render(<Drawer />);

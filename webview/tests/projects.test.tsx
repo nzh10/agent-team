@@ -4,34 +4,16 @@ import { groupWorkspaces } from "../src/sidebar/groups";
 import { Sidebar, type SidebarProps } from "../src/sidebar/Sidebar";
 import { MessageItem, chipLabelFor } from "../src/chat/messages";
 import { CreateWorkspaceDialog } from "../src/workspace/dialogs";
-import { useServer, type Message, type Project, type Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { useServer, type Message, type Workspace } from "../src/state/useServer";
+import { FakeSocket, initFrame, messagePage } from "./fakeSocket";
+import { project as makeProject, workspace } from "./helpers/fixtures";
+import { sidebarProps as makeSidebarProps } from "./helpers/sidebar";
 
 const NOW = 1_800_000_000_000;
 
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: "/repo",
-  git: null,
-  pr: null,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW - 5000,
-  ...over,
-});
-
-const project: Project = {
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [],
-};
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, { git: null, pr: null, createdAt: NOW - 5000, lastMessageAt: NOW - 5000, ...over });
+const project = makeProject("p1", { name: "clice", root: "/repo/clice", createdAt: NOW - 10_000 });
 
 const lead = ws("lead", {
   name: "clice · lead",
@@ -54,28 +36,17 @@ describe("project groups", () => {
     expect(groups[0].workspaces.map((w) => w.id)).toEqual(["lead", "w1"]);
   });
 
-  const sidebarProps = (): SidebarProps => ({
-    workspaces: [lead, worker],
-    projects: [project],
-    activeWsId: "lead",
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: vi.fn(),
-    onDelete: vi.fn(),
-    onToggleGroup: vi.fn(),
-    onSearchChange: vi.fn(),
-    onJump: vi.fn(),
-    onCreate: vi.fn(),
-    onCreateIn: vi.fn(),
-    onReplayDemo: vi.fn(),
-    onDebugSnapshot: vi.fn(),
-    onPurgeArchived: vi.fn(),
-    onDeleteProject: vi.fn(),
-  });
+  const sidebarProps = () =>
+    makeSidebarProps(
+      {
+        workspaces: [lead, worker],
+        projects: [project],
+        activeWsId: "lead",
+        now: NOW,
+        onDeleteProject: vi.fn(),
+      },
+      () => vi.fn(),
+    );
 
   it("starts a new session in the project root without opening the lead", () => {
     const props = sidebarProps();
@@ -267,14 +238,8 @@ describe("project frames", () => {
     };
     act(() => {
       ws.open();
-      ws.receive({
-        type: "init",
-        workspaces: [lead, worker],
-        config: { presets: [], models: [], commands: [], hosts: {} },
-        hosts: [],
-        projects: [project],
-      });
-      ws.receive({ type: "workspace_messages", workspaceId: "w1", messages: [history] });
+      ws.receive(initFrame([lead, worker], { projects: [project] }));
+      ws.receive(messagePage("w1", [history]));
     });
     expect(result.current.projects).toEqual([project]);
 
@@ -353,36 +318,25 @@ describe("archives in the sidebar", () => {
       lastMessageAt: NOW - 2000,
       ...over,
     });
-  const props = (over: Partial<SidebarProps> = {}): SidebarProps => ({
-    workspaces: [
-      lead,
-      worker,
-      archived("old-a"),
-      archived("old-b", { cwd: "/wt/clice-x" }),
-      archived("old-c", { cwd: "/repo/clice-wt-1" }),
-    ],
-    projects: [project],
-    activeWsId: "lead",
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: vi.fn(),
-    onDelete: vi.fn(),
-    onToggleGroup: vi.fn(),
-    onSearchChange: vi.fn(),
-    onJump: vi.fn(),
-    onCreate: vi.fn(),
-    onCreateIn: vi.fn(),
-    onReplayDemo: vi.fn(),
-    onDebugSnapshot: vi.fn(),
-    onPurgeArchived: vi.fn(),
-    onRestoreProject: vi.fn(),
-    onDeleteProject: vi.fn(),
-    ...over,
-  });
+  const props = (over: Partial<SidebarProps> = {}) =>
+    makeSidebarProps(
+      {
+        workspaces: [
+          lead,
+          worker,
+          archived("old-a"),
+          archived("old-b", { cwd: "/wt/clice-x" }),
+          archived("old-c", { cwd: "/repo/clice-wt-1" }),
+        ],
+        projects: [project],
+        activeWsId: "lead",
+        now: NOW,
+        onRestoreProject: vi.fn(),
+        onDeleteProject: vi.fn(),
+        ...over,
+      },
+      () => vi.fn(),
+    );
   const names = (c: HTMLElement) =>
     [...c.querySelectorAll(".task-item .task-name-text")].map((e) => e.textContent);
 

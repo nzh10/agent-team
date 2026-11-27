@@ -8,19 +8,12 @@ import { App } from "../../src/App";
 import { buildFrames, DEMO_WS_ID } from "../../src/dev/replayFixture";
 import type { Project, Workspace } from "../../src/state/useServer";
 import { configureTelemetry } from "../../src/telemetry";
-import { FakeSocket } from "../fakeSocket";
+import { FakeSocket, initFrame } from "../fakeSocket";
+import { deferred } from "../helpers/deferred";
+import { project, workspace as makeWorkspace } from "../helpers/fixtures";
 import "../../src/styles.css";
 
-const workspace = (id: string, name: string) => ({
-  id,
-  name,
-  hostId: "local",
-  cwd: "/repo",
-  project: "repo",
-  agents: [],
-  messages: [],
-  createdAt: 1,
-});
+const workspace = (id: string, name: string) => makeWorkspace(id, { name });
 const ws = workspace("local:primary", "Primary workspace");
 const other = workspace("other", "Other workspace");
 const statsUrl = (id: string, offset = 0) =>
@@ -86,13 +79,12 @@ function connect(
 ) {
   act(() => {
     sock.open();
-    sock.receive({
-      type: "init",
-      workspaces,
-      projects,
-      config: { presets: [], models: [], hosts: {}, telemetryEnabled },
-      hosts: [],
-    });
+    sock.receive(
+      initFrame(workspaces, {
+        projects,
+        config: { presets: [], models: [], hosts: {}, telemetryEnabled },
+      }),
+    );
   });
 }
 
@@ -167,17 +159,7 @@ it.each([
           checks: "success",
         },
       };
-      boot([linked], true, [
-        {
-          id: "p",
-          name: "Project",
-          root: "/repo",
-          leadWorkspaceId: ws.id,
-          createdAt: 1,
-          objectives: [],
-          status: "sealed",
-        },
-      ]);
+      boot([linked], true, [project("p", { leadWorkspaceId: ws.id, status: "sealed" })]);
     } else boot([ws], true);
     expect(fetchStats).not.toHaveBeenCalled();
 
@@ -323,14 +305,13 @@ it("keeps step disclosures touch-sized on a landscape phone", async () => {
 
 it("aborts the previous workspace request and retries an error without leaking stale stats", async () => {
   await page.viewport(1440, 820);
-  let finishPrevious!: (response: Response) => void;
-  const previousResponse = new Promise<Response>((resolve) => (finishPrevious = resolve));
+  const { promise: previousResponse, resolve: finishPrevious } = deferred<Response>();
   let attempts = 0;
-  const fetchStats = vi.fn(async (url: string, _options: RequestInit) => {
+  const fetchStats = vi.fn((url: string, _options: RequestInit) => {
     if (url === statsUrl(ws.id)) return previousResponse;
     if (url === statsUrl(other.id) && ++attempts > 1)
-      return Response.json({ turns: [], total: 0, offset: 0, limit: 20 });
-    return new Response(null, { status: 500 });
+      return Promise.resolve(Response.json({ turns: [], total: 0, offset: 0, limit: 20 }));
+    return Promise.resolve(new Response(null, { status: 500 }));
   });
   vi.stubGlobal("fetch", (url: string, options: RequestInit) =>
     url.startsWith("api/workspaces/")

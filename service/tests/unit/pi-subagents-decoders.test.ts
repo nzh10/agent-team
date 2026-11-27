@@ -17,6 +17,14 @@ import {
 } from "../../src/session/pi-subagents";
 import { extractPiToolResultText, formatPiToolUse } from "../../src/session/pi-tool-format";
 import type { ActiveAsyncRunRecord, StreamEvent } from "../../src/session/types";
+import {
+  assistantText,
+  sessionMessage,
+  textBlocks,
+  transcriptMessage,
+  writeJsonl,
+  writeStatusJson,
+} from "./helpers/subagent-artifacts";
 
 function restoredMessage(name: string) {
   const file = path.join(__dirname, "../snap/pi/messages", `${name}.jsonl`);
@@ -31,10 +39,6 @@ function temporaryDirectory(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-decoders-"));
   temporaryDirectories.push(directory);
   return directory;
-}
-
-function writeJsonl(filePath: string, records: unknown[]): void {
-  fs.writeFileSync(filePath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 }
 
 afterEach(() => {
@@ -321,12 +325,16 @@ describe("Pi tool Markdown normalization", () => {
   });
 });
 
+const notifyWire = (details: object) => ({
+  role: "custom",
+  customType: "subagent-notify",
+  details,
+});
+
 describe("subagent-notify wire decoder", () => {
   it("decodes one run with complete child artifact metadata", () => {
-    const runs = decodeSubagentNotifyWire({
-      role: "custom",
-      customType: "subagent-notify",
-      details: {
+    const runs = decodeSubagentNotifyWire(
+      notifyWire({
         runId: "run-1",
         mode: "workflow",
         status: "completed",
@@ -345,8 +353,8 @@ describe("subagent-notify wire decoder", () => {
             usage: { input: 3, output: 4 },
           },
         ],
-      },
-    });
+      }),
+    );
     expect(runs).toHaveLength(1);
     expect(runs[0]).toMatchObject({ runId: "run-1", mode: "workflow", status: "completed" });
     expect(runs[0].children[0]).toMatchObject({
@@ -362,18 +370,16 @@ describe("subagent-notify wire decoder", () => {
   });
 
   it("joins separated output previews by run identity rather than output position", () => {
-    const [run] = decodeSubagentNotifyWire({
-      role: "custom",
-      customType: "subagent-notify",
-      details: {
+    const [run] = decodeSubagentNotifyWire(
+      notifyWire({
         runId: "root",
         childRuns: [{ runId: "a" }, { runId: "b" }],
         childOutputs: [
           { runId: "b", preview: "second" },
           { runId: "a", preview: "first" },
         ],
-      },
-    });
+      }),
+    );
     expect(run.children.map((c) => c.summary)).toEqual(["first", "second"]);
   });
 
@@ -386,16 +392,14 @@ describe("subagent-notify wire decoder", () => {
   });
 
   it("decodes batches independently and rejects every other wire message", () => {
-    const runs = decodeSubagentNotifyWire({
-      role: "custom",
-      customType: "subagent-notify",
-      details: {
+    const runs = decodeSubagentNotifyWire(
+      notifyWire({
         runs: [
           { runId: "single", mode: "single", status: "completed", results: [{}] },
           { runId: "parallel", mode: "parallel", status: "stopped", childRuns: [{ runId: "b" }] },
         ],
-      },
-    });
+      }),
+    );
     expect(runs.map((run) => run.runId)).toEqual(["single", "parallel"]);
     expect(runs[0].children[0].canonicalChildId).toBe("step:0");
     expect(runs[1].children[0].canonicalChildId).toBe("b");
@@ -412,12 +416,7 @@ describe("native Pi Session v3 decoder", () => {
     const sessionFile = path.join(directory, "session.jsonl");
     writeJsonl(sessionFile, [
       { type: "session", version: 3, id: "session" },
-      {
-        type: "message",
-        id: "root",
-        parentId: null,
-        message: { role: "assistant", content: [{ type: "text", text: "root" }] },
-      },
+      sessionMessage("root", null, assistantText("root")),
       {
         type: "thinking_level_change",
         id: "inactive",
@@ -437,55 +436,39 @@ describe("native Pi Session v3 decoder", () => {
         parentId: "model",
         thinkingLevel: "high",
       },
-      {
-        type: "message",
-        id: "early-result",
-        parentId: "effort",
-        message: {
-          role: "toolResult",
-          toolCallId: "call-1",
-          toolName: "read",
-          content: "before the call",
-        },
-      },
-      {
-        type: "message",
-        id: "active",
-        parentId: "early-result",
-        message: {
-          role: "assistant",
-          provider: "resolved-provider",
-          model: "resolved-id",
-          content: [
-            { type: "thinking", thinking: "consider" },
-            { type: "text", text: "active branch" },
-            {
-              type: "toolCall",
-              id: "call-1",
-              name: "read",
-              arguments: { path: "a.ts", offset: 2 },
-            },
-            { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
-          ],
-        },
-      },
-      {
-        type: "message",
-        id: "result",
-        parentId: "active",
-        message: {
-          role: "toolResult",
-          toolCallId: "call-1",
-          toolName: "read",
-          content: [{ type: "text", text: "file body" }],
-        },
-      },
-      {
-        type: "message",
-        id: "orphan-result",
-        parentId: "result",
-        message: { role: "tool_result", toolName: "read", content: "no call id" },
-      },
+      sessionMessage("early-result", "effort", {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read",
+        content: "before the call",
+      }),
+      sessionMessage("active", "early-result", {
+        role: "assistant",
+        provider: "resolved-provider",
+        model: "resolved-id",
+        content: [
+          { type: "thinking", thinking: "consider" },
+          { type: "text", text: "active branch" },
+          {
+            type: "toolCall",
+            id: "call-1",
+            name: "read",
+            arguments: { path: "a.ts", offset: 2 },
+          },
+          { type: "toolCall", name: "read", arguments: { path: "b.ts" } },
+        ],
+      }),
+      sessionMessage("result", "active", {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read",
+        content: textBlocks("file body"),
+      }),
+      sessionMessage("orphan-result", "result", {
+        role: "tool_result",
+        toolName: "read",
+        content: "no call id",
+      }),
       {
         type: "model_change",
         id: "unused-model",
@@ -548,21 +531,17 @@ describe("child transcript artifact decoder and reconstruction", () => {
     const directory = temporaryDirectory();
     const transcript = path.join(directory, "child.jsonl");
     writeJsonl(transcript, [
-      {
-        recordType: "message",
+      transcriptMessage("assistant", {
         role: "assistant",
-        message: {
-          role: "assistant",
-          provider: "artifact-provider",
-          model: "artifact-model",
-          thinkingLevel: "medium",
-          content: [
-            { type: "thinking", thinking: "artifact thought" },
-            { type: "text", text: "artifact text" },
-            { type: "toolCall", id: "call-1", name: "read", arguments: { path: "ignored.ts" } },
-          ],
-        },
-      },
+        provider: "artifact-provider",
+        model: "artifact-model",
+        thinkingLevel: "medium",
+        content: [
+          { type: "thinking", thinking: "artifact thought" },
+          { type: "text", text: "artifact text" },
+          { type: "toolCall", id: "call-1", name: "read", arguments: { path: "ignored.ts" } },
+        ],
+      }),
       {
         recordType: "tool_start",
         toolCallId: "call-1",
@@ -578,21 +557,17 @@ describe("child transcript artifact decoder and reconstruction", () => {
           role: "toolResult",
           toolCallId: "call-1",
           toolName: "read",
-          content: [{ type: "text", text: "fallback result body" }],
+          content: textBlocks("fallback result body"),
           isMarkdown: true,
           durationMs: 17,
         },
       },
-      {
-        recordType: "message",
-        role: "toolResult",
-        message: { toolCallId: "unknown", toolName: "read", content: "unmatched call id" },
-      },
-      {
-        recordType: "message",
-        role: "tool_result",
-        message: { toolName: "read", content: "no call id" },
-      },
+      transcriptMessage("toolResult", {
+        toolCallId: "unknown",
+        toolName: "read",
+        content: "unmatched call id",
+      }),
+      transcriptMessage("tool_result", { toolName: "read", content: "no call id" }),
       { recordType: "truncated", message: "byte limit reached" },
     ]);
     const { events, model, effort } = decodeChildTranscriptArtifact(transcript);
@@ -648,25 +623,16 @@ describe("child transcript artifact decoder and reconstruction", () => {
     const transcript = path.join(directory, "transcript.jsonl");
     writeJsonl(sessionFile, [
       { type: "session", version: 3 },
-      {
-        type: "message",
-        id: "leaf",
-        parentId: null,
-        message: { role: "assistant", content: [{ type: "text", text: "from session" }] },
-      },
+      sessionMessage("leaf", null, assistantText("from session")),
     ]);
     writeJsonl(transcript, [
-      {
-        recordType: "message",
+      transcriptMessage("assistant", {
         role: "assistant",
-        message: {
-          role: "assistant",
-          provider: "p",
-          model: "artifact",
-          thinkingLevel: "low",
-          content: [{ type: "text", text: "from transcript" }],
-        },
-      },
+        provider: "p",
+        model: "artifact",
+        thinkingLevel: "low",
+        content: textBlocks("from transcript"),
+      }),
     ]);
     expect(reconstructSubagentChild({ sessionFile, transcriptPath: transcript })).toEqual({
       events: [{ kind: "text", content: "from session" }],
@@ -705,54 +671,61 @@ function activeRun(
 }
 
 function writeStatus(asyncDir: string, overrides: Record<string, unknown> = {}): void {
-  fs.writeFileSync(
-    path.join(asyncDir, "status.json"),
-    JSON.stringify({
-      runId: "run-1",
-      sessionId: "owner-1",
-      mode: "parallel",
-      state: "running",
-      steps: [
-        { childId: "child-a", status: "running" },
-        { childId: "child-b", status: "running" },
-      ],
-      ...overrides,
-    }),
-  );
+  writeStatusJson(asyncDir, {
+    runId: "run-1",
+    sessionId: "owner-1",
+    mode: "parallel",
+    state: "running",
+    steps: [
+      { childId: "child-a", status: "running" },
+      { childId: "child-b", status: "running" },
+    ],
+    ...overrides,
+  });
+}
+
+function stopFixture(overrides?: Parameters<typeof writeStatus>[1]) {
+  const asyncDir = temporaryDirectory();
+  writeStatus(asyncDir, overrides);
+  return activeRun(asyncDir);
+}
+
+async function stopWithMock(
+  target: NonNullable<ReturnType<typeof resolveStopTarget>>,
+  requestPath: string,
+  ownsSession: Parameters<typeof executeFallbackAsyncStop>[1]["ownsSession"] = () => true,
+) {
+  const request = vi.fn(() => Promise.resolve(requestPath));
+  const result = await executeFallbackAsyncStop(target, {
+    piSubagentsRoot: "/unused",
+    ownsSession,
+    requestAsyncStopImpl: request,
+  });
+  return { result, request };
 }
 
 describe("exact-scope disconnected stop fallback", () => {
   it("stops a whole run without child targeting fields", async () => {
-    const asyncDir = temporaryDirectory();
-    writeStatus(asyncDir);
-    const run = activeRun(asyncDir);
+    const run = stopFixture();
     const target = resolveStopTarget([run], "run-1");
     expect(target).toEqual({ scope: "run", run });
-    const requestAsyncStopImpl = vi.fn(() => Promise.resolve("/tmp/stop-request.json"));
-    const result = await executeFallbackAsyncStop(target!, {
-      piSubagentsRoot: "/unused",
-      ownsSession: (sessionId) => sessionId === "owner-1",
-      requestAsyncStopImpl,
-    });
+    const { result, request } = await stopWithMock(
+      target!,
+      "/tmp/stop-request.json",
+      (sessionId) => sessionId === "owner-1",
+    );
     expect(result).toEqual({ ok: true, requestPath: "/tmp/stop-request.json" });
-    expect(requestAsyncStopImpl).toHaveBeenCalledWith(asyncDir, { source: "panel-host-fallback" });
+    expect(request).toHaveBeenCalledWith(run.asyncDir, { source: "panel-host-fallback" });
   });
 
   it("stops only the requested child with targetIndex and canonical childId", async () => {
-    const asyncDir = temporaryDirectory();
-    writeStatus(asyncDir);
-    const run = activeRun(asyncDir);
+    const run = stopFixture();
     const target = resolveStopTarget([run], "call-1:0");
     expect(target).toMatchObject({ scope: "child", child: { canonicalChildId: "child-a" } });
-    const requestAsyncStopImpl = vi.fn(() => Promise.resolve("/tmp/child-stop.json"));
-    const result = await executeFallbackAsyncStop(target!, {
-      piSubagentsRoot: "/unused",
-      ownsSession: () => true,
-      requestAsyncStopImpl,
-    });
+    const { result, request } = await stopWithMock(target!, "/tmp/child-stop.json");
     expect(result.ok).toBe(true);
-    expect(requestAsyncStopImpl).toHaveBeenCalledTimes(1);
-    expect(requestAsyncStopImpl).toHaveBeenCalledWith(asyncDir, {
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(run.asyncDir, {
       targetIndex: 0,
       childId: "child-a",
       source: "panel-host-fallback",
@@ -778,18 +751,11 @@ describe("exact-scope disconnected stop fallback", () => {
       },
     ],
   ])("rejects %s without writing any stop request", async (_label, overrides) => {
-    const asyncDir = temporaryDirectory();
-    writeStatus(asyncDir, overrides);
-    const run = activeRun(asyncDir);
+    const run = stopFixture(overrides);
     const target = resolveStopTarget([run], "call-1:0")!;
-    const requestAsyncStopImpl = vi.fn(() => Promise.resolve("/tmp/should-not-exist.json"));
-    const result = await executeFallbackAsyncStop(target, {
-      piSubagentsRoot: "/unused",
-      ownsSession: () => true,
-      requestAsyncStopImpl,
-    });
+    const { result, request } = await stopWithMock(target, "/tmp/should-not-exist.json");
     expect(result).toEqual({ ok: false, error: "child_stop_unavailable_bridge_disconnected" });
-    expect(requestAsyncStopImpl).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 
   it("rejects a closed stop inbox", async () => {
@@ -798,13 +764,12 @@ describe("exact-scope disconnected stop fallback", () => {
     fs.mkdirSync(path.join(asyncDir, "control"), { recursive: true });
     fs.writeFileSync(path.join(asyncDir, "control", "stop-inbox-closed.json"), "{}");
     const run = activeRun(asyncDir);
-    const requestAsyncStopImpl = vi.fn(() => Promise.resolve("/tmp/should-not-exist.json"));
-    const result = await executeFallbackAsyncStop(
+    const { result, request } = await stopWithMock(
       { scope: "run", run },
-      { piSubagentsRoot: "/unused", ownsSession: () => true, requestAsyncStopImpl },
+      "/tmp/should-not-exist.json",
     );
     expect(result.ok).toBe(false);
-    expect(requestAsyncStopImpl).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 });
 
