@@ -640,6 +640,8 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   private tainted = false;
   private processGeneration = 0;
   private activeTurn: Turn | null = null;
+  // A send awaiting Pi's command-specific preflight is not the owner of a native wake.
+  private openingTurn?: Turn;
   private boundarySource?: () => BoundarySteer | undefined;
   private sessionFile: string | null = null;
   private expectedLeafAnchorId: string | null = null;
@@ -773,7 +775,10 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
   }
 
   get isRunning(): boolean {
-    return Boolean(this.activeTurn && !this.activeTurn.settled);
+    return Boolean(
+      (this.activeTurn && !this.activeTurn.settled) ||
+      (this.openingTurn && !this.openingTurn.settled),
+    );
   }
   get runState(): RunState {
     return this.isRunning ? "working" : this.activeAsyncRuns.length ? "waiting" : "idle";
@@ -1334,26 +1339,40 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     if (compact && envelope.attachmentIds?.length)
       throw new Error("/compact does not accept attachments");
     turn.compact = Boolean(compact);
-    this.activeTurn = turn;
+    this.activeTurn = this.openingTurn = turn;
+    const checkBeforeWrite = () => {
+      if (
+        this.openingTurn === turn &&
+        this.activeTurn !== turn &&
+        !this.interrupting &&
+        !this.disposed &&
+        this.processGeneration === turn.generation
+      )
+        throw new PiRpcResponseError(
+          compact ? "compact" : "prompt",
+          "Pi is already processing a turn",
+        );
+      if (!this.live(turn) || this.interrupting) throw new Error("Pi prompt dispatch cancelled");
+    };
     try {
       this.emit("runState", "working");
       const images = readPiAttachments(this.config.uploadsDir, envelope.attachmentIds);
       await this.ensureStarted();
       if (this.interrupting) await this.interrupting;
-      if (!this.live(turn)) throw new Error("Pi prompt dispatch cancelled");
+      checkBeforeWrite();
       const rpc = this.rpc!;
       await this.applyOptions(rpc, turn.generation);
-      if (!this.live(turn) || this.interrupting) throw new Error("Pi prompt dispatch cancelled");
+      checkBeforeWrite();
       if (this.compactionBoundary) await this.syncCompactionCheckpoint(rpc);
       const onBeforeWrite = () => {
         if (this.compactionBoundary)
           throw new PiRpcResponseError("compact", "Waiting for Pi compaction checkpoint");
-        if (this.compactingRpc === rpc || (compact && turn.started))
+        if (this.compactingRpc === rpc)
           throw new PiRpcResponseError(
             compact ? "compact" : "prompt",
             "Pi is already processing a turn",
           );
-        if (!this.live(turn) || this.interrupting) throw new Error("Pi prompt dispatch cancelled");
+        checkBeforeWrite();
         const acpError = this.acpPromptError(envelope.text, Boolean(compact));
         if (acpError) throw new PiRpcResponseError(compact ? "compact" : "prompt", acpError);
         const hadUnanchoredInput = this.hasUnanchoredInput;
@@ -1416,19 +1435,17 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       const reply = await rpc.prompt(wireText, {
         images,
         onBeforeWrite,
+        onStarted: () => {
+          if (this.openingTurn !== turn || turn.settled || !this.current(turn.generation, rpc))
+            return;
+          this.openingTurn = undefined;
+          this.activeTurn = turn;
+        },
         ...(/^\/quota(?:\s|$)/.test(envelope.text.trimStart()) && { timeoutMs: 50_000 }),
       });
       if (reply?.disposition === "handled") {
-        if (!turn.started) {
-          this.clearUnacceptedInputClaim(turn);
-          this.finish(turn);
-        } else if (this.live(turn)) {
-          turn.inputId = undefined;
-          turn.reportId = undefined;
-          if (turn.modelTrigger === turn.trigger) turn.modelTrigger = "auto";
-          turn.trigger = "auto";
-          this.emitWakeup();
-        }
+        this.clearUnacceptedInputClaim(turn);
+        this.finish(turn);
         return turn.paired
           ? { disposition: "rejected", error: "Pi did not run the paired prompt" }
           : { disposition: "handled" };
@@ -1449,33 +1466,31 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
         const retryable = /already processing|waiting for Pi compaction checkpoint/i.test(
           error.message,
         );
-        if (retryable && turn.started) {
-          // An unsolicited Pi turn (e.g. subagent-notify wakeup) started before
-          // Pi rejected this prompt as busy. Keep the running turn alive as a
-          // wakeup turn so its agent_settled transitions back to idle and dequeues.
-          turn.inputId = undefined;
-          turn.reportId = undefined;
-          if (turn.modelTrigger === turn.trigger) turn.modelTrigger = "auto";
-          turn.trigger = "auto";
-          turn.written = false;
-          this.emitWakeup();
-        } else {
-          this.clearUnacceptedInputClaim(turn);
-          this.finish(turn);
-        }
+        this.clearUnacceptedInputClaim(turn);
+        this.finish(turn);
         return {
           disposition: "rejected",
           error: piAcpAuthGuidance(error.message, this.usesAcpModel()) ?? error.message,
           ...(retryable && { retryable: true }),
         };
       }
-      if (turn.written && this.live(turn)) {
+      if (
+        turn.written &&
+        !turn.settled &&
+        !this.disposed &&
+        this.processGeneration === turn.generation
+      ) {
         const retiring = this.retireProcess();
-        // A failed RPC write/read is not a settled provider error: execution may have begun.
-        this.finish(turn, { kind: "error", content: message(error) });
+        // A missing receipt leaves this process ambiguous, even if a native wake raced it.
+        this.failProcessTurns(message(error));
         await retiring;
       } else this.finish(turn);
       throw error;
+    } finally {
+      if (this.openingTurn === turn) {
+        this.openingTurn = undefined;
+        if (this.activeTurn !== turn && !this.isRunning) this.emit("runState", this.runState);
+      }
     }
   }
 
@@ -1739,6 +1754,15 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     }
     if (event.type === "compaction_start" || event.type === "compaction_end") {
       const reason = text(event.reason) ?? "unknown";
+      if (
+        event.type === "compaction_start" &&
+        reason === "manual" &&
+        this.openingTurn?.compact &&
+        this.openingTurn.written
+      ) {
+        this.activeTurn = this.openingTurn;
+        this.openingTurn = undefined;
+      }
       const turn = this.activeTurn;
       const manual = reason === "manual" && turn?.compact && turn.written && this.live(turn);
       if (event.type === "compaction_start") {
@@ -1825,12 +1849,14 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       }
     }
     if (event.type === "agent_start") {
-      if (!this.isRunning) {
+      if (!this.activeTurn || this.activeTurn.settled || this.activeTurn === this.openingTurn) {
+        const uncertainWrite = this.openingTurn?.written;
         this.activeTurn = newTurn(this.processGeneration);
         this.emit("runState", "working");
-        this.emitWakeup();
+        // A transport cut may have lost preflight: don't label an unproven write as a wakeup.
+        if (!uncertainWrite) this.emitWakeup();
       }
-      this.activeTurn!.started = true;
+      this.activeTurn.started = true;
       return;
     }
     const turn = this.activeTurn;
@@ -4097,7 +4123,6 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
     transportBroken = false,
   ): void {
     if (!this.current(generation, rpc)) return;
-    const turn = this.activeTurn;
     if (transportBroken) void this.retireProcess();
     else {
       this.cancelDialogs();
@@ -4108,6 +4133,17 @@ export class PiSession extends EventEmitter implements HostSessionHandle {
       this.unregisterRoute();
       // Independent runners can still finish after an unexpected Pi exit.
       void this.reconcileAsyncRuns();
+    }
+    this.failProcessTurns(reason);
+  }
+
+  private failProcessTurns(reason: string): void {
+    const opening = this.openingTurn;
+    const turn = this.activeTurn;
+    if (opening && opening !== turn && !opening.settled) {
+      opening.settled = true;
+      if (opening.written)
+        this.emit("prompt_outcome_unknown", { inputId: opening.inputId, reason });
     }
     if (turn && !turn.settled) {
       this.closeTurnTools(turn, reason);

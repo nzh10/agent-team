@@ -21,6 +21,8 @@ import type {
 } from "../../src/session/types";
 import { summarizeEvent, toWireMessage } from "../../src/workspace/summary";
 import { Workspace, type Message, type WorkspaceCallbacks } from "../../src/workspace/workspace";
+import { PiRpcPlayer } from "../snap/pi-rpc-player";
+import { piFrame, piFrames, piReply } from "../snap/pi-wire";
 import { setupProjects } from "./projectHarness";
 
 const dirs: string[] = [];
@@ -98,7 +100,7 @@ class StubSession extends EventEmitter implements HostSessionHandle {
   }
 }
 
-function makeWorkspace(overrides: Partial<WorkspaceCallbacks> = {}) {
+function makeWorkspace(overrides: Partial<WorkspaceCallbacks> = {}, pi?: PiSession) {
   const dir = tempDir("yaat-w5-ws-");
   const session = new StubSession({ cwd: dir, backend: "pi", model: "mock/model" });
   const host: Host = {
@@ -107,7 +109,7 @@ function makeWorkspace(overrides: Partial<WorkspaceCallbacks> = {}) {
     type: "local",
     connected: true,
     getInfo: () => ({ id: "local", label: "local", type: "local", connected: true }),
-    createSession: () => session,
+    createSession: () => pi ?? session,
     destroySession: () => Promise.resolve(),
     restoreSession: () => session,
   };
@@ -706,6 +708,123 @@ describe("Pi workspace lifecycle regressions", () => {
     await h.manager.sealProject(project.id, "done");
     expect(() => h.manager.ensureFor(h.root)).toThrow(/sealed/i);
   });
+
+  function notifyPlayer() {
+    const dir = tempDir("yaat-pi-notify-");
+    const player = new PiRpcPlayer(dir, "mock/model", 1000);
+    const panel = new PanelHttpServer();
+    const pi = new PiSession(
+      { backend: "pi", cwd: dir, piAgentDir: dir },
+      {
+        panelHttp: panel,
+        rpcFactory: player.connect,
+      },
+    );
+    cleanups.push(
+      () => panel.close(),
+      () => pi.dispose(),
+    );
+    return { player, pi };
+  }
+
+  it("retires a questionable report write even when a wake has taken over the stream", async () => {
+    const { pi, player } = notifyPlayer();
+    const unknown = vi.fn();
+    pi.on("prompt_outcome_unknown", unknown);
+    const sending = pi.send({ inputId: "report", text: "worker report", reportId: "r1" });
+    await player.expect({ type: "prompt", message: "worker report" });
+    player.play(piFrame("agent_start"));
+    player.play({ ...piReply("prompt"), data: {} });
+    await expect(sending).rejects.toThrow("unknown prompt disposition");
+    expect(unknown).toHaveBeenCalledExactlyOnceWith({
+      inputId: "report",
+      reason: "Pi returned an unknown prompt disposition",
+    });
+    expect(pi.isRunning).toBe(false);
+    await pi.ensureStarted();
+    expect(player.connections).toHaveLength(2);
+    await player.finish();
+  });
+
+  it("waits for manual compaction acceptance when Pi aborts a wake first", async () => {
+    const { pi, player } = notifyPlayer();
+    const { ws } = makeWorkspace({}, pi);
+    const sending = ws.sendMessage("/compact");
+    await player.expect({ type: "compact" });
+    const row = firstUserMessage(ws)!;
+    player.play(piFrame("agent_start"));
+    player.play({ ...piFrame("agent_settled"), aborted: true });
+    expect(row.status).toBe("dispatching");
+    await player.expect({ type: "get_session_stats" });
+    player.play(piReply("get_session_stats"));
+    player.play({ type: "compaction_start", reason: "manual" });
+    expect(row.status).toBe("done");
+    player.play({ type: "compaction_end", reason: "manual", aborted: true, willRetry: false });
+    player.play({
+      type: "response",
+      command: "compact",
+      success: false,
+      error: "Compaction cancelled",
+    });
+    await sending;
+    expect(pi.isRunning).toBe(false);
+    await player.finish();
+  });
+
+  it.each(["before write", "busy", "started"])(
+    "keeps a worker report separate from a native wake (%s)",
+    async (receipt) => {
+      const { pi, player } = notifyPlayer();
+      const states: string[] = [];
+      const { ws, agent } = makeWorkspace(
+        { onReportDeliveryState: (_id, state) => states.push(state) },
+        pi,
+      );
+      const text = "[agent-team:report:r1]\nFinished: worker report";
+      const report = queueWorkerReport(ws, agent.id, "input", "r1", text);
+      await pi.ensureStarted();
+      ws.dequeueNext(agent.id);
+      const prompt = { type: "prompt", message: text };
+      if (receipt !== "before write") await player.expect(prompt);
+      const wake = piFrames("pi-subagents-async");
+      // Do not yield between frames: one stdout read can contain the wake, a busy
+      // rejection and settlement before the rejected send() promise resumes.
+      for (const frame of wake.slice(wake.map((f) => f.type).lastIndexOf("agent_start"))) {
+        if (frame.type === "response") continue;
+        if (frame.type === "agent_settled" && receipt === "busy") {
+          player.play({
+            type: "response",
+            command: "prompt",
+            success: false,
+            error:
+              "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+          });
+        }
+        player.play(frame);
+      }
+      const written = receipt !== "before write";
+      expect(report.status).toBe(written ? "dispatching" : "starting");
+      expect(states).toEqual(written ? ["dispatching"] : []);
+      await player.expect({ type: "get_session_stats" });
+      player.play(piReply("get_session_stats"));
+      if (receipt !== "started") await player.expect(prompt);
+      player.play(piReply("prompt"));
+      player.play(piFrame("agent_start"));
+      const user = piFrame("message_end", { role: "user" });
+      player.play({ ...user, message: { ...user.message, content: [{ type: "text", text }] } });
+      player.play(piFrame("agent_settled"));
+      expect(report.status).toBe("done");
+      expect(states).toEqual([
+        ...(written ? ["dispatching"] : []),
+        ...(receipt !== "started" ? ["enqueued", "dispatching"] : []),
+        "sent_to_pi",
+        "settled",
+      ]);
+      await player.expect({ type: "get_session_stats" });
+      player.play(piReply("get_session_stats"));
+      await player.finish();
+    },
+  );
 
   it("requeues retryable busy prompt rejections instead of permanently failing reports", async () => {
     vi.useFakeTimers();

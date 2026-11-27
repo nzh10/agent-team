@@ -143,6 +143,8 @@ export interface PiRpcRequestOptions {
 export interface PiRpcPromptOptions extends PiRpcRequestOptions {
   images?: PiRpcImage[];
   onBeforeWrite?: () => void;
+  /** Runs in stdout frame order, before a following agent_start in the same read. */
+  onStarted?: () => void;
 }
 
 export interface PiRpcStreams {
@@ -297,6 +299,10 @@ export class PiRpcClient extends EventEmitter {
       (id) => ({ id, type: "prompt", message, ...(options.images && { images: options.images }) }),
       options,
       options.onBeforeWrite,
+      (data) => {
+        if ((data as { disposition?: string } | undefined)?.disposition === "started")
+          options.onStarted?.();
+      },
     ) as Promise<{ disposition: string }>;
   }
 
@@ -400,6 +406,7 @@ export class PiRpcClient extends EventEmitter {
     makeCommand: (id: string) => AllowedCommand,
     options: PiRpcRequestOptions,
     onBeforeWrite?: () => void,
+    onResponse?: (data: unknown) => void,
   ): Promise<unknown> {
     if (this.terminalError) return Promise.reject(this.terminalError);
     const id = `req-${++this.nextRequestId}`;
@@ -410,7 +417,15 @@ export class PiRpcClient extends EventEmitter {
         reject(new Error(`Pi RPC ${command} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       timer.unref();
-      this.pending.set(id, { command, resolve, reject, timer });
+      this.pending.set(id, {
+        command,
+        reject,
+        timer,
+        resolve: (data) => {
+          onResponse?.(data);
+          resolve(data);
+        },
+      });
     });
     void this.enqueueWrite(makeCommand(id), onBeforeWrite).catch((error: unknown) => {
       const request = this.pending.get(id);
