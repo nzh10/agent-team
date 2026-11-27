@@ -315,6 +315,7 @@ button {
 }
 
 .sidebar-header {
+  container: sidebar-header / inline-size;
   padding: calc(12px + env(safe-area-inset-top, 0px)) 12px 10px 16px;
   font-size: 11px;
   font-weight: 600;
@@ -327,10 +328,25 @@ button {
 }
 .sidebar-title {
   min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@container sidebar-header (max-width: 265px) {
+  .sidebar-title {
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .sidebar-title:has(.disconnected) > span:first-child {
+    display: none;
+  }
 }
 .sidebar-actions {
   display: flex;
   flex-shrink: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 2px;
 }
 .sidebar-header button {
@@ -365,6 +381,11 @@ button {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
+.sidebar-header .sidebar-push[aria-disabled="true"] {
+  color: var(--text-muted);
+  background: none;
+  cursor: default;
+}
 .sidebar-header button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
@@ -376,6 +397,7 @@ button {
 .sidebar-header .sidebar-debug:hover {
   opacity: 1;
 }
+.sidebar-header .sidebar-push[aria-pressed="true"],
 .sidebar-header .sidebar-debug[aria-pressed="true"],
 .sidebar-header .sidebar-debug[aria-expanded="true"] {
   opacity: 1;
@@ -4434,8 +4456,19 @@ button.quote-bar-content:focus-visible {
     padding: 0;
     text-align: left;
   }
+  /* Six header actions share the fixed 280px drawer with the workspace title. */
+  .sidebar-header {
+    padding-left: 8px;
+  }
+  .sidebar-title {
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .sidebar-actions {
+    gap: 0;
+  }
   .sidebar-header button {
-    width: 36px;
+    width: 32px;
     height: 36px;
   }
   .sidebar-header .icon {

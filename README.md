@@ -97,6 +97,7 @@ new work. The panel provides the orchestration and UI, not a model of its own.
   later; the banner says what it is waiting for and when it returns.
 - **Git awareness** — branch, dirty count and open PRs per folder.
 - **Search** across every workspace's messages from the sidebar.
+- **[Native notifications](docs/NOTIFICATIONS.md)** — opt in with the sidebar bell for background alerts on desktop, Android Chrome, and iOS Home-Screen apps.
 - **Mobile-first UI** — installable PWA, safe-area aware, composer pinned above
   the keyboard. Coming back from the background re-syncs the open transcript
   and replaces a socket the phone silently dropped, so a turn that finished

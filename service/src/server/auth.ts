@@ -52,7 +52,8 @@ export class Auth {
           // Relative: the app may live under a reverse-proxy prefix, and a
           // home-screen app that navigates outside its manifest scope gets
           // Safari's toolbar back.
-          res.setHeader("Location", "./");
+          const ws = new URL(req.url ?? "/login", "http://localhost").searchParams.get("ws");
+          res.setHeader("Location", ws ? `./?ws=${encodeURIComponent(ws)}` : "./");
           res.end();
         } else {
           res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -132,7 +133,7 @@ button{width:100%;padding:10px;border:none;border-radius:6px;background:#238636;
 button:active{background:#2ea043}
 </style>
 </head><body>
-<form method="POST" action="login">
+<form method="POST">
 <h2>Agent Team</h2>
 <!--ERROR-->
 <label>Username</label><input name="username" autocomplete="username" required>

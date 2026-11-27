@@ -10,6 +10,7 @@ import type { Message, WorkspaceState, AgentState } from "../../src/workspace/wo
 import type { Project } from "../../src/project/store";
 import type { Objective } from "../../src/project/objectives";
 
+import { PushStore } from "../../src/push/store";
 import { Server } from "../../src/server/server";
 import { ProjectManager } from "../../src/project/manager";
 import {
@@ -1394,8 +1395,40 @@ describe("server restart with projects", () => {
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
   });
 
+  it("delivers the final Lead reply only when the reporting worker settles after the Lead", async () => {
+    const { base, web } = seed();
+    const push = vi
+      .spyOn(PushStore.prototype, "broadcast")
+      .mockResolvedValue({ accepted: 0, expired: 0, failed: 0, errors: {} });
+    const { send, stop } = await start(base, web);
+    try {
+      send({ type: "send_message", workspaceId: "ws-live", content: "Finish the report" });
+      await until(() => launches.length === 1, "worker launch");
+      const worker = launches[0];
+      await worker
+        .panel!.tools.find((tool) => tool.name === "finish_task")!
+        .handler({ summary: "Ready." });
+      await until(() => launches.length === 2, "Lead launch");
+      const lead = launches[1];
+      lead.emit({ kind: "text_delta", content: "**Ready to merge**." });
+      lead.emit({ kind: "result", content: "" });
+      expect(push).not.toHaveBeenCalled();
+      worker.emit({ kind: "result", content: "" });
+      await until(() => push.mock.calls.length > 0, "deferred notification");
+      expect(push.mock.calls.flat()).toEqual([
+        { wsId: "ws-lead", trigger: "reply", body: "Ready to merge." },
+      ]);
+    } finally {
+      await stop();
+      fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 });
+    }
+  });
+
   it("shows a worker waiting for the user to a client that connects, and once restored", async () => {
     const { base, web } = seed();
+    const push = vi
+      .spyOn(PushStore.prototype, "broadcast")
+      .mockResolvedValue({ accepted: 0, expired: 0, failed: 0, errors: {} });
     const waiting = (agentId: string): Message[] => [
       {
         id: `${agentId}-t`,
@@ -1459,6 +1492,14 @@ describe("server restart with projects", () => {
           .filter((w) => w.id === "ws-w");
       await until(() => updated().length > 0, "the restored worker's update");
       expect(updated()[0].awaitsUser).toBe(true);
+      expect(push).not.toHaveBeenCalled(); // History load, restore, and both init snapshots.
+      launches[0].emit({ kind: "text_delta", content: "Which revision?" });
+      expect(push).not.toHaveBeenCalled();
+      launches[0].emit({ kind: "result", content: "" });
+      await until(() => push.mock.calls.length > 0, "live worker notification");
+      expect(push.mock.calls.flat()).toEqual([
+        { trigger: "yourTurn", wsId: "ws-live", body: "Waiting for your reply" },
+      ]);
     } finally {
       await stop();
       log.mockRestore();

@@ -8,6 +8,8 @@ import * as zlib from "zlib";
 import { parseUsageRequest, type UsageRequest } from "../usage/request";
 import { sessionStatsView, usageView } from "../usage/service";
 import { statsRequest } from "../usage/session-stats";
+import { PushStore, SubscriptionLimit } from "../push/store";
+import { InvalidSubscription } from "../push/transport";
 import type { Auth } from "./auth";
 import { formatReport, type RuntimeReport } from "../config/diagnostics";
 import { NotRegularFile, readFileView, resolveFilePath } from "../repo/files";
@@ -67,6 +69,7 @@ export class HttpHandler {
     private notesOf: (workspaceId: string) => string | undefined = () => undefined,
     private diagnostics?: () => RuntimeReport,
     private telemetry?: TelemetryStore,
+    private push = new PushStore(baseDir),
   ) {}
 
   handle(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -83,7 +86,10 @@ export class HttpHandler {
         }
         // Install metadata must be fetchable without a session: iOS reads the
         // manifest and icons when adding to the home screen.
-        const publicAsset = pathname === "/manifest.webmanifest" || pathname.startsWith("/icons/");
+        const publicAsset =
+          pathname === "/sw.js" ||
+          pathname === "/manifest.webmanifest" ||
+          pathname.startsWith("/icons/");
         if (!publicAsset && !this.auth.isAuthenticated(req)) {
           if (
             pathname === "/api" ||
@@ -95,12 +101,28 @@ export class HttpHandler {
           // Resolve from the browser's encoded path, below any proxy mount prefix.
           const depth = url.pathname.slice(1).split("/").length - 1;
           res.statusCode = 302;
-          res.setHeader("Location", `${"../".repeat(depth)}login`);
+          const ws = (pathname === "/" || pathname === "/index.html") && url.searchParams.get("ws");
+          res.setHeader(
+            "Location",
+            `${"../".repeat(depth)}login${ws ? `?ws=${encodeURIComponent(ws)}` : ""}`,
+          );
           res.end();
           return;
         }
       }
 
+      if (pathname.startsWith("/api/push/")) {
+        void this.handlePush(req, res, pathname.slice("/api/push/".length)).catch(
+          (err: unknown) => {
+            if (err instanceof SubscriptionLimit)
+              return json(res, 409, { error: "Subscription limit reached" });
+            if (err instanceof InvalidSubscription)
+              return json(res, 400, { error: "Invalid push subscription" });
+            json(res, 503, { error: "Push service unavailable" });
+          },
+        );
+        return;
+      }
       if (req.method === "POST" && pathname === "/api/telemetry" && this.telemetry) {
         receiveTelemetry(req, res, this.telemetry);
         return;
@@ -248,7 +270,10 @@ export class HttpHandler {
       const ext = path.extname(target);
       res.setHeader("Content-Type", MIME[ext] ?? "application/octet-stream");
       // Everything under assets/ is content-hashed by Vite (JS, CSS, fonts).
-      if (pathname.startsWith("/assets/")) {
+      if (pathname === "/sw.js") {
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Service-Worker-Allowed", "./");
+      } else if (pathname.startsWith("/assets/")) {
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       } else if (pathname.startsWith("/icons/") || pathname.startsWith("/file-icons/")) {
         // Not content-hashed, so not immutable; a day spares the home-screen
@@ -267,6 +292,37 @@ export class HttpHandler {
       res.statusCode = 500;
       res.end(String(e));
     }
+  }
+
+  private async handlePush(req: http.IncomingMessage, res: http.ServerResponse, action: string) {
+    if (req.method === "GET" && action === "public-key")
+      return json(res, 200, { publicKey: this.push.publicKey() });
+    if (req.method !== "POST" || !["subscribe", "unsubscribe", "test"].includes(action))
+      return json(res, 404, { error: "No such push action" });
+    if (req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json")
+      return json(res, 415, { error: "Send JSON" });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req as AsyncIterable<Buffer>) {
+      size += chunk.length;
+      if (size > 8192) return json(res, 413, { error: "Too large" });
+      chunks.push(chunk);
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString());
+    } catch {
+      return json(res, 400, { error: "Invalid JSON" });
+    }
+    if (action === "test")
+      return json(
+        res,
+        200,
+        await this.push.broadcast({ trigger: "test", test: true, body: "Test notification" }),
+      );
+    if (action === "subscribe") await this.push.subscribe(body);
+    else this.push.unsubscribe((body as { endpoint?: unknown } | null)?.endpoint);
+    json(res, 200, { ok: true });
   }
 
   private serveAvatar(name: string, res: http.ServerResponse): void {

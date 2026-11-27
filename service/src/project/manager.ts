@@ -5,6 +5,7 @@ import { ProjectNotesStore } from "./notes";
 import {
   ReportJournalStore,
   buildReportEnvelope,
+  reportLeadMessageId,
   deliveryStateRank,
   reconcileReportDeliveryState,
   type FrozenReportPlan,
@@ -140,6 +141,16 @@ export interface ProjectHost {
   cancelWorkspaceTimers?(workspace: Workspace): void;
   // Its name or project link changed.
   workspaceChanged(workspace: Workspace): void;
+  onWorkerWaiting?(workspace: Workspace): void;
+  onRecoveryExhausted?(workspace: Workspace): void;
+  onRecoveredReply?(
+    w: Workspace,
+    agentId: string,
+    reply: Message,
+    direct: boolean,
+    inputIds: string[],
+  ): void;
+  onWorkersSettling?(lead: Workspace): void;
   broadcast(msg: unknown): void;
 }
 
@@ -200,6 +211,17 @@ export class ProjectManager {
     },
     slot: (delay) => this.takeStartSlot(delay),
     drain: (w) => this.leadAgentsChanged(w),
+    exhausted: (w) => this.host.onRecoveryExhausted?.(w),
+    recovered: (w, agentId, reply, originId, reports) => {
+      const origin = originId && w.findMessage(originId);
+      this.host.onRecoveredReply?.(
+        w,
+        agentId,
+        reply,
+        !!origin && origin.kind === "user" && !origin.from,
+        [...(originId ? [originId] : []), ...reports.map(reportLeadMessageId)],
+      );
+    },
   });
 
   constructor(
@@ -686,7 +708,9 @@ export class ProjectManager {
       this.store.get(w.projectLink.projectId)?.status !== "active"
     )
       return;
-    this.showAwaiting(w);
+    this.showAwaiting(w, true);
+    const lead = this.leadOf(w.projectLink.projectId);
+    if (lead) this.host.onWorkersSettling?.(lead);
     this.settleAfter(w, SETTLE_MS);
   }
 
@@ -695,11 +719,14 @@ export class ProjectManager {
   }
 
   // Only an edge into waiting counts, not each snapshot or later idle check.
-  showAwaiting(w: Workspace): void {
+  showAwaiting(w: Workspace, live = false): void {
     const waiting = this.waits(w);
     if (waiting === w.projectedAwaitsUser) return;
     w.projectedAwaitsUser = waiting;
-    if (waiting) w.unseen++;
+    if (waiting) {
+      w.unseen++;
+      if (live) this.host.onWorkerWaiting?.(w);
+    }
     this.host.persistWorkspace(w);
     this.host.workspaceChanged(w);
   }
@@ -2275,6 +2302,19 @@ export class ProjectManager {
       if (tasks.some((task, i) => task !== current.tasks[i])) next = { ...next, tasks };
       if (next !== current) this.saveObjective(id, next);
     }
+  }
+
+  // A reply to a progress report or an older final in a batch is not the Lead's wrap-up.
+  finalReportState(w: Workspace, ids: string[]): "none" | "busy" | "ready" {
+    const id = w.projectLink!.projectId;
+    const latest = this.journal(id)
+      .list()
+      .reverse()
+      .find((row) => row.kind === "final");
+    if (!latest || !ids.includes(latest.leadMessageId)) return "none";
+    return this.workers(id).every((worker) => worker.isArchived || worker.isQuiet)
+      ? "ready"
+      : "busy";
   }
 
   leadAgentsChanged(workspace: Workspace): void {

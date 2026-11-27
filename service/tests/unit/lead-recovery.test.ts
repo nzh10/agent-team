@@ -45,6 +45,7 @@ async function outage() {
 describe("bounded project Lead recovery", () => {
   it("batches worker reports, survives restart and recovers once before the 02:30 cutoff", async () => {
     const h = await outage();
+    const recovered = (h.host.onRecoveredReply = vi.fn());
     const deadline = h.lead.leadOutage!.deadline;
     await h.call(h.lead, "start_session", { title: "worker", cwd: "wt", task: "work" });
     await h.call(h.lead, "start_session", {
@@ -84,12 +85,50 @@ describe("bounded project Lead recovery", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(h.lead.leadOutage).toBeUndefined();
     expect(h.journal().map((r) => r.leadDelivery.state)).toEqual(Array(3).fill("sent_to_pi"));
+    expect(recovered).toHaveBeenCalledWith(
+      h.lead,
+      h.entry().info.id,
+      expect.objectContaining({ content: "read both" }),
+      true,
+      expect.arrayContaining(h.journal().map((r) => r.leadMessageId)),
+    );
     expect(h.session(second).sent).toHaveLength(1);
     expect(h.session(w).sent).toHaveLength(1);
     expect(h.lead.messages.filter((m) => m.events?.some((e) => e.kind === "error"))).toHaveLength(
       6,
     );
   });
+
+  it.each(["finish_task", "report_progress"])(
+    "classifies a recovered %s report independently of the synthetic panel input",
+    async (tool) => {
+      useRecoveryClock();
+      const h = setupProjects(),
+        { lead } = h.create("demo");
+      const recovered = vi.fn();
+      h.host.onRecoveredReply = (w, _agentId, reply, direct, ids) =>
+        void recovered(direct, h.manager.finalReportState(w, ids), reply.content);
+      await h.call(lead, "start_session", { title: "worker", cwd: "wt", task: "work" });
+      const [worker] = h.workers();
+      await h.call(
+        worker,
+        tool,
+        tool === "finish_task" ? { summary: "ready" } : { text: "working" },
+      );
+      h.endTurn(worker);
+      const s = h.session(lead);
+      s.isRunning = false;
+      s.emit("event", { kind: "error", networkFailure: true, content: "connection refused" });
+      await vi.advanceTimersByTimeAsync(lead.leadOutage!.next - Date.now());
+      s.emit("event", { kind: "text_delta", content: "Recovered." });
+      h.endTurn(lead);
+      expect(recovered).toHaveBeenCalledWith(
+        false,
+        tool === "finish_task" ? "ready" : "none",
+        "Recovered.",
+      );
+    },
+  );
 
   it("pairs only newly arrived Codex reports with a manual message and cancels the automatic wake", async () => {
     const h = await outage();
@@ -117,6 +156,7 @@ describe("bounded project Lead recovery", () => {
     "%s persists the hold; reconnecting never wakes Lead",
     async (mode) => {
       const h = await outage();
+      const exhausted = (h.host.onRecoveryExhausted = vi.fn());
       if (mode === "Stop") await h.lead.interruptAgent(h.entry().info.id);
       else {
         const { started, deadline } = h.lead.leadOutage!;
@@ -136,6 +176,7 @@ describe("bounded project Lead recovery", () => {
       h.restore();
       await vi.advanceTimersByTimeAsync(60 * minute);
       expect(h.session(h.lead).sent).toEqual([]);
+      expect(exhausted).toHaveBeenCalledTimes(mode === "Stop" ? 0 : 1);
       await h.lead.sendMessage("new manual request");
       expect(h.session(h.lead).sent).toEqual(["new manual request"]);
     },

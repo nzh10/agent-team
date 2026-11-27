@@ -59,6 +59,8 @@ import {
   probePiCatalog,
   type ModelDiscoverySnapshot,
 } from "./model-discovery";
+import { PushCues } from "../push/cues";
+import { PushStore } from "../push/store";
 import { HttpHandler } from "./http";
 import { DeployControl, DEPLOY_RETRY, type DeployTarget } from "./deploy-control";
 import { QuotaMonitor, type QuotaRefreshOptions } from "./quota";
@@ -134,6 +136,19 @@ export class Server {
   private alive = new WeakSet<WebSocket>();
   private auth: Auth;
   private http: HttpHandler;
+  private push: PushStore;
+  private cues = new PushCues(
+    (w) =>
+      this.restored &&
+      !this.closing &&
+      (!w.projectLink || this.projects.get(w.projectLink.projectId)?.archivedAt == null),
+    (w, ids) => this.projects.finalReportState(w, ids),
+    (notice) => {
+      void this.push
+        .broadcast(notice)
+        .catch(() => console.warn("[push] Notification delivery unavailable"));
+    },
+  );
   private codexQuota = new CodexQuotaSource(
     () => this.codexAuth.authenticated && this.codexAuth.accountType === "chatgpt",
   );
@@ -181,6 +196,7 @@ export class Server {
     bootFence?: string,
   ) {
     this.baseDir = baseDir;
+    this.push = new PushStore(baseDir);
     this.bootFence = bootFence;
     this.history = new HistoryService(historyIndexFile(baseDir), historyFile(baseDir));
     this.uploadsDir = path.join(baseDir, "uploads");
@@ -250,6 +266,7 @@ export class Server {
           this.ccpaProxy?.health() ?? null,
         ),
       this.telemetry,
+      this.push,
     );
     this.httpServer = http.createServer((req, res) => this.http.handle(req, res));
     this.wss = new WebSocketServer({
@@ -1580,6 +1597,13 @@ export class Server {
       persistWorkspace: (w) => this.persistWorkspace(w.id),
       saveWorkspaceNow: (w) => this.persistWorkspaceNow(w.id),
       cancelWorkspaceTimers: (w) => this.cancelWorkspaceRetries(w),
+      onWorkerWaiting: (w) => this.cues.waiting(w),
+      onWorkersSettling: (w) => this.cues.flush(w),
+      onRecoveredReply: (w, agentId, reply, direct, ids) =>
+        this.cues.conclusion(w, agentId, reply, direct, ids),
+      onRecoveryExhausted: (w) => {
+        if (w.leadOutage) this.cues.failure(w, w.leadOutage.agentId);
+      },
       workspaceChanged: (w) =>
         this.broadcastUI({ type: "workspace_updated", workspace: this.listInfo(w) }),
       broadcast: (msg) => this.broadcastUI(msg),
@@ -2002,14 +2026,16 @@ export class Server {
       onAgentState: (wsId, agentId, state) => {
         this.broadcastUI({ type: "agent_state", workspaceId: wsId, agentId, state });
         const ws = this.workspaces.get(wsId);
-        if (ws) this.projects.showAwaiting(ws);
+        if (ws) this.projects.showAwaiting(ws, true);
         if (ws && state === "idle") {
           this.projects.workerIdle(ws);
           this.flushPendingLeadTools(ws);
         }
       },
-      onLeadTerminal: (w, agentId, reply, interrupted) =>
-        this.projects.recovery.terminal(w, agentId, reply, interrupted),
+      onLeadTerminal: (w, agentId, reply, interrupted, liveTurn) => {
+        this.projects.recovery.terminal(w, agentId, reply, interrupted);
+        if (liveTurn) this.cues.terminal(w, agentId, reply, interrupted);
+      },
       onLeadStop: (w, agentId) => this.projects.recovery.stop(w, agentId),
       prepareManualInput: (w, agentId, pair) => this.projects.recovery.manual(w, agentId, pair),
       onSaveNow: () => this.persistWorkspaceNow(id),
@@ -2027,7 +2053,7 @@ export class Server {
         this.deploy?.observe(true);
         this.broadcastUI({ type: "ui_dialog_request", dialog });
         const w = this.workspaces.get(id);
-        if (w) this.projects.showAwaiting(w);
+        if (w) this.projects.showAwaiting(w, true);
       },
       onUiDialogResolved: (dialog) => {
         this.broadcastUI({ type: "ui_dialog_resolved", ...dialog });

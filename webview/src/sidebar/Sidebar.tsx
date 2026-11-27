@@ -31,6 +31,7 @@ import { ConfirmDialog } from "../workspace/dialogs";
 import { QuotaPanel } from "./QuotaPanel";
 import { formatShortDateTime, quotaTone } from "./quota";
 import { attentionBreakdown, sessionAttention, summarizeAttention } from "./attention";
+import { usePush } from "./usePush";
 import { StreamSilence } from "./StreamSilence";
 import { UsageDashboard } from "../usage/UsageDashboard";
 
@@ -194,6 +195,7 @@ export interface SidebarProps {
 }
 
 export const Sidebar = memo(function Sidebar(p: SidebarProps) {
+  const push = usePush(p.connected);
   const now = p.now ?? Date.now();
   const snapshotReady = p.snapshotReady ?? p.workspaces.length > 0;
   const debug = new URLSearchParams(window.location.search).get("debug") === "1";
@@ -202,7 +204,8 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
   const [snapshotStatus, setSnapshotStatus] = useState<"idle" | "saving" | "saved" | "error">(
     "idle",
   );
-  const snapshotUpload = useRef<Promise<unknown> | null>(null);
+  const [snapshotStatusHidden, setSnapshotStatusHidden] = useState(false);
+  const snapshotUpload = useRef<{ showResult: boolean } | null>(null);
   const snapshotStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const debugId = useId();
   const debugTrigger = useRef<HTMLButtonElement>(null);
@@ -274,23 +277,40 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
     };
   }, [debugOpen]);
 
-  const saveSnapshot = () => {
-    if (snapshotUpload.current) return;
+  const clearSnapshotTimer = () => {
     if (snapshotStatusTimer.current) {
       clearTimeout(snapshotStatusTimer.current);
       snapshotStatusTimer.current = null;
     }
+  };
+  const dismissSnapshotStatus = () => {
+    clearSnapshotTimer();
+    if (snapshotUpload.current) {
+      // A push action takes over the status, not the in-flight upload guard.
+      snapshotUpload.current.showResult = false;
+      setSnapshotStatusHidden(true);
+    } else setSnapshotStatus("idle");
+  };
+  const saveSnapshot = () => {
+    if (snapshotUpload.current) return;
+    clearSnapshotTimer();
+    push.clearStatus();
     let pending: Promise<unknown>;
     try {
       pending = Promise.resolve(p.onDebugSnapshot());
     } catch (err) {
       pending = Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }
-    snapshotUpload.current = pending;
+    const upload = (snapshotUpload.current = { showResult: true });
+    setSnapshotStatusHidden(false);
     setSnapshotStatus("saving");
     const settle = (status: "saved" | "error") => {
-      if (snapshotUpload.current !== pending) return;
+      if (snapshotUpload.current !== upload) return;
       snapshotUpload.current = null;
+      if (!upload.showResult) {
+        setSnapshotStatus("idle");
+        return;
+      }
       setSnapshotStatus(status);
       snapshotStatusTimer.current = setTimeout(
         () => {
@@ -797,9 +817,26 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
     <>
       <div className="sidebar-header">
         <span className="sidebar-title">
-          Workspaces {!p.connected && <span className="disconnected">offline</span>}
+          <span>Workspaces</span> {!p.connected && <span className="disconnected">offline</span>}
         </span>
         <span className="sidebar-actions">
+          <button
+            type="button"
+            className="sidebar-push"
+            aria-label="Notifications"
+            aria-pressed={push.subscribed}
+            aria-disabled={push.unavailable || push.busy}
+            title={push.hint}
+            onClick={() => {
+              if (push.busy) return;
+              dismissSnapshotStatus();
+              void push.toggle().then((explain) => {
+                if (explain) setDebugOpen(true);
+              });
+            }}
+          >
+            <Icon name="bell" />
+          </button>
           {window.yaatTheme && <ThemeToggle controller={window.yaatTheme} />}
           <button title="New session" onClick={p.onCreate}>
             <Icon name="plus" />
@@ -843,7 +880,16 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
           role="group"
           aria-label="Debug tools"
         >
-          {snapshotStatusText && (
+          {(snapshotStatusHidden || !snapshotStatusText) && push.status && (
+            <span
+              className={`sidebar-debug-status${push.status.tone ? ` sidebar-debug-status-${push.status.tone}` : ""}`}
+              role="status"
+              title={push.status.text}
+            >
+              {push.status.text}
+            </span>
+          )}
+          {!snapshotStatusHidden && snapshotStatusText && (
             <span
               className={`sidebar-debug-status sidebar-debug-status-${snapshotStatus}`}
               role="status"
@@ -852,6 +898,19 @@ export const Sidebar = memo(function Sidebar(p: SidebarProps) {
               {snapshotStatusText}
             </span>
           )}
+          <button
+            type="button"
+            className="sidebar-debug-action"
+            aria-label="Send test push"
+            title="Send test push"
+            disabled={!p.connected || push.testing}
+            onClick={() => {
+              dismissSnapshotStatus();
+              void push.testPush();
+            }}
+          >
+            <Icon name="bell" />
+          </button>
           <a
             className="sidebar-debug-action"
             href="api/diagnostics?format=text"

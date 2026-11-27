@@ -993,7 +993,7 @@ describe("ProjectManager", () => {
   });
 
   it("delivers a worker's report to the lead and moves its task to review", async () => {
-    const { create, call, session, workspaces, objectives } = setup();
+    const { create, call, session, workspaces, objectives, manager, endTurn } = setup();
     const { lead } = create("clice");
     await withTask(call, lead);
     await call(lead, "start_session", {
@@ -1017,6 +1017,10 @@ describe("ProjectManager", () => {
       from: { workspaceId: worker.id, name: "modules" },
     });
     expect(objectives()[0].tasks[0].state).toBe("review");
+    expect(manager.finalReportState(lead, [report.id])).toBe("busy");
+    endTurn(worker);
+    expect(manager.finalReportState(lead, [report.id])).toBe("ready");
+    expect(manager.finalReportState(lead, ["progress"])).toBe("none");
   });
 
   it("writes the objective's context with the finished report, and sends nothing when it is refused", async () => {

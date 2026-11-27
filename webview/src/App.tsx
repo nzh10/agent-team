@@ -370,7 +370,7 @@ export function App() {
 
   const [activeWsId, setActiveWsId] = useState<string | null>(() => {
     try {
-      return localStorage.getItem("activeWsId");
+      return new URL(location.href).searchParams.get("ws") || localStorage.getItem("activeWsId");
     } catch {
       return null;
     }
@@ -800,6 +800,30 @@ export function App() {
     [onSelectWorkspace],
   );
 
+  useEffect(() => {
+    const sw = navigator.serviceWorker;
+    if (!sw) return;
+    const open = (event: MessageEvent) => {
+      const { type, wsId } = (event.data ?? {}) as { type?: unknown; wsId?: unknown };
+      if (type !== "yaat.open-workspace" || typeof wsId !== "string" || !wsId) return;
+      const url = new URL(location.href);
+      url.searchParams.set("ws", wsId);
+      history.replaceState(history.state, "", url);
+      setBoardProjectId(null);
+      setOpenPanel(null);
+      onSelectWorkspace(wsId);
+      // Keep an existing draft on a network outage; only login requires a navigation.
+      if (!connected)
+        void fetch("api/push/public-key")
+          .then((r) => {
+            if (r.status === 401) location.assign(url);
+          })
+          .catch(() => {});
+    };
+    sw.addEventListener("message", open);
+    return () => sw.removeEventListener("message", open);
+  }, [onSelectWorkspace, connected]);
+
   const agentActions = useMemo<AgentsPanelActions>(
     () => ({
       onOpen: (id) => {
@@ -965,6 +989,11 @@ export function App() {
   useEffect(() => {
     if (activeWsId) {
       try {
+        const url = new URL(location.href);
+        if (url.searchParams.has("ws") && url.searchParams.get("ws") !== activeWsId) {
+          url.searchParams.set("ws", activeWsId);
+          history.replaceState(history.state, "", url);
+        }
         localStorage.setItem("activeWsId", activeWsId);
       } catch {}
     }

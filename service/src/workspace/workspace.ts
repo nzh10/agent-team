@@ -327,6 +327,7 @@ export interface WorkspaceCallbacks {
     agentId: string,
     reply: Message,
     interrupted: boolean,
+    liveTurn: boolean,
   ) => void;
   onLeadStop?: (workspace: Workspace, agentId?: string) => void;
   onAgentBusy?: (wsId: string, agentId: string, streamAt: number) => void;
@@ -1332,7 +1333,13 @@ export class Workspace {
             entry.currentMsg.events,
             Object.keys(patch).length ? patch : undefined,
           );
-          this.cb?.onLeadTerminal?.(this, entry.info.id, entry.currentMsg, !!event.interrupted);
+          this.cb?.onLeadTerminal?.(
+            this,
+            entry.info.id,
+            entry.currentMsg,
+            !!event.interrupted,
+            true,
+          );
           // A turn the model answered while a retry waits (a wake-up, a
           // task's report): the limit is over. That turn saw the cut prompt,
           // so the retry carries on rather than sending it again, and now.
@@ -1398,7 +1405,7 @@ export class Workspace {
           msg.events,
           msg.context !== undefined ? { context: msg.context } : undefined,
         );
-        this.cb?.onLeadTerminal?.(this, entry.info.id, msg, false);
+        this.cb?.onLeadTerminal?.(this, entry.info.id, msg, false, !!activeTurn && !confirmed);
         this.finishReply(entry);
         if (failedWorkerTurn) this.cb?.onSaveNow?.();
       } else if (event.kind === "subagent_progress" || event.kind === "subagent_done") {

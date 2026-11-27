@@ -149,6 +149,33 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+it("routes a cold notification ahead of storage and switches a warm window without losing drafts", () => {
+  const prior = location.href;
+  const sw = new EventTarget();
+  Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: sw });
+  try {
+    history.replaceState(null, "", "?ws=w2");
+    localStorage.setItem("activeWsId", "w1");
+    boot([], { others: ["w2"] });
+    expect(localStorage.getItem("activeWsId")).toBe("w2");
+    fireEvent.change(composer(), { target: { value: "unfinished note" } });
+    const open = (wsId: string) =>
+      act(() => {
+        sw.dispatchEvent(
+          new MessageEvent("message", { data: { type: "yaat.open-workspace", wsId } }),
+        );
+      });
+    open("w1");
+    expect(localStorage.getItem("activeWsId")).toBe("w1");
+    expect(location.search).toBe("?ws=w1");
+    open("w2");
+    expect(composer().value).toBe("unfinished note");
+  } finally {
+    Reflect.deleteProperty(navigator, "serviceWorker");
+    history.replaceState(null, "", prior);
+  }
+});
+
 describe("render cost of a live transcript", { tags: ["app-detail"] }, () => {
   // MessageItem formats its timestamp once per render.
   const renders = () => {

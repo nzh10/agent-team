@@ -18,6 +18,7 @@ export interface LeadOutage {
   attempts: number;
   supersedes: string[];
   retainedReports: string[];
+  originInputId?: string;
   reason: string;
   phase: "waiting" | "sending" | "held";
   batch?: {
@@ -28,6 +29,7 @@ export interface LeadOutage {
     progress?: boolean;
     admitted?: boolean;
     completed?: boolean;
+    replyId?: string;
     terminalFailure?: "retryable" | "hold";
   };
 }
@@ -38,6 +40,14 @@ interface Host {
   availability(w: Workspace): "gone" | "unavailable" | "blocked" | "ready";
   slot(delay: number): number;
   drain(w: Workspace): void;
+  exhausted?(w: Workspace): void;
+  recovered?(
+    w: Workspace,
+    agentId: string,
+    reply: Message,
+    originId: string | undefined,
+    reports: string[],
+  ): void;
 }
 
 export class LeadRecovery {
@@ -66,6 +76,11 @@ export class LeadRecovery {
     this.hold(w, false);
   }
 
+  private exhausted(w: Workspace): void {
+    this.stop(w);
+    if (w.leadOutage?.phase === "held") this.host.exhausted?.(w);
+  }
+
   private hold(w: Workspace, restoring: boolean): void {
     const o = w.leadOutage!;
     this.cancel(w);
@@ -88,7 +103,7 @@ export class LeadRecovery {
     if (release) {
       if (o.batch) this.record(w, "outcome_unknown");
       this.release(w);
-    } else this.stop(w);
+    } else this.exhausted(w);
   }
 
   private release(w: Workspace): void {
@@ -109,6 +124,7 @@ export class LeadRecovery {
       if (o.phase === "sending" && o.batch && w.agents.get(agentId)?.input?.recovery) {
         const providerFailure = reply.events?.some((e) => e.kind === "error" && e.networkFailure);
         o.batch.completed = true;
+        o.batch.replyId = reply.id;
         if (reply.status === "error" || interrupted) {
           o.batch.terminalFailure =
             !interrupted &&
@@ -148,6 +164,7 @@ export class LeadRecovery {
       attempts: 0,
       supersedes: [],
       retainedReports: [],
+      originInputId: agent?.input?.id,
       reason: reason.slice(0, 500),
       phase: "waiting",
     };
@@ -158,7 +175,7 @@ export class LeadRecovery {
     if (this.host.availability(w) === "gone") return;
     const o = w.leadOutage!;
     const now = Date.now();
-    if (now >= o.deadline && !this.closed) return this.stop(w);
+    if (now >= o.deadline && !this.closed) return this.exhausted(w);
     const delay = restore
       ? Math.max(0, o.next - now)
       : DELAYS[Math.min(o.attempts, DELAYS.length - 1)];
@@ -182,7 +199,7 @@ export class LeadRecovery {
             const agent = w.recoveryAvailability(o.agentId);
             const now = Date.now();
             if (now >= o.deadline || host === "unavailable" || agent === "unavailable")
-              return this.stop(w);
+              return this.exhausted(w);
             if (host === "blocked" || agent === "blocked") {
               // Keep the saved wake and cutoff intact during a temporary dispatch hold.
               this.arm(w, o, Math.min(o.deadline, now + DISPATCH_RECHECK_MS), true);
@@ -194,7 +211,7 @@ export class LeadRecovery {
             w.startRecovery(o.agentId, batch.reportId, batch.text, batch.recovery);
           } catch (error) {
             console.error("[projects] lead recovery failed", error);
-            this.stop(w);
+            this.exhausted(w);
           }
         },
         Math.max(0, at - Date.now()),
@@ -221,7 +238,7 @@ export class LeadRecovery {
     if (!manual)
       this.timers.set(
         w.id,
-        setTimeout(() => this.stop(w), Math.max(0, o.deadline - Date.now())),
+        setTimeout(() => this.exhausted(w), Math.max(0, o.deadline - Date.now())),
       );
     return batch;
   }
@@ -352,6 +369,8 @@ export class LeadRecovery {
       this.record(w, "sent_to_pi");
       delete w.leadOutage;
       this.cancel(w);
+      const reply = !batch.manual && batch.replyId && w.findMessage(batch.replyId);
+      if (reply) this.host.recovered?.(w, o.agentId, reply, o.originInputId, batch.reports);
       this.host.drain(w);
     }
     this.save(w);

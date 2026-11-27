@@ -138,7 +138,8 @@ it("unfolds a right-aligned icon desktop strip without layout shift, focus theft
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
 
   const controls = [...strip.querySelectorAll<HTMLElement>("a, button")];
-  expect(controls).toHaveLength(3);
+  expect(controls).toHaveLength(4);
+  expect(controls).toContain(screen.getByRole("button", { name: "Send test push" }));
   for (const control of controls) {
     expect(rect(control).width).toBe(24);
     expect(rect(control).height).toBe(24);
@@ -161,6 +162,106 @@ it("unfolds a right-aligned icon desktop strip without layout shift, focus theft
   await userEvent.click(trigger);
   expect(style(get(container, ".sidebar-debug-strip")).animationName).toBe("none");
 });
+
+it.each(["dark", "light"])(
+  "keeps the %s bell and title visually separate at desktop and mobile widths",
+  async (theme) => {
+    document.documentElement.dataset.theme = theme;
+    window.yaatTheme = {
+      get: () => (theme === "dark" ? "dark" : "light"),
+      subscribe: () => () => {},
+      toggle: noop,
+    };
+    try {
+      healthyProbe();
+      const view = (connected: boolean) => (
+        <div className="sidebar sidebar-open" style={{ width: 260 }}>
+          <Sidebar {...props} connected={connected} />
+        </div>
+      );
+      const { container, rerender } = render(view(true));
+      const bell = screen.getByRole("button", { name: "Notifications" });
+      for (const width of [1280, 390]) {
+        await page.viewport(width, 800);
+        for (const connected of [true, false]) {
+          rerender(view(connected));
+          const range = document.createRange();
+          range.selectNodeContents(get(container, ".sidebar-title"));
+          expect(range.getBoundingClientRect().right).toBeLessThanOrEqual(rect(bell).left);
+        }
+        const next = screen.getByRole("button", { name: "Dark theme" });
+        expect(rect(bell).width).toBe(rect(next).width);
+        expect(style(bell).color).not.toBe("transparent");
+      }
+    } finally {
+      delete window.yaatTheme;
+      delete document.documentElement.dataset.theme;
+    }
+  },
+);
+
+it.each(["dark", "light"])(
+  "shows test-push results to an unsubscribed browser in the %s debug strip",
+  async (theme) => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      let failing = false;
+      const fetch = vi.fn((url: string) =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              url.endsWith("/test")
+                ? { accepted: 1, expired: 0, failed: failing ? 2 : 0 }
+                : { issues: [] },
+            ),
+        }),
+      );
+      vi.stubGlobal("fetch", fetch);
+      vi.stubGlobal("Notification", { permission: "denied" });
+      const { container } = render(
+        <div className="sidebar sidebar-open" style={{ width: 280 }}>
+          <Sidebar
+            {...props}
+            onDebugSnapshot={() =>
+              failing ? Promise.reject(new Error("Offline test")) : Promise.resolve()
+            }
+          />
+        </div>,
+      );
+      expect(
+        screen.getByRole("button", { name: "Notifications" }).getAttribute("aria-pressed"),
+      ).toBe("false");
+      fireEvent.click(screen.getByRole("button", { name: TRIGGER }));
+      const strip = get(container, ".sidebar-debug-strip");
+      const push = screen.getByRole("button", { name: "Send test push" });
+      for (const width of [1280, 390]) {
+        await page.viewport(width, 800);
+        for (const failure of [false, true]) {
+          failing = failure;
+          await userEvent.click(screen.getByRole("button", { name: SNAPSHOT }));
+          const snapshotText = failure ? "Snapshot failed" : "Snapshot saved";
+          const snapshotColor = style(await screen.findByText(snapshotText)).color;
+          expect(push.hasAttribute("disabled")).toBe(false);
+          await userEvent.click(push);
+          const result = await screen.findByText(failure ? "2 failed · 1 accepted" : "1 accepted");
+          expect(screen.queryByText(snapshotText)).toBeNull();
+          expect(style(result).color).toBe(snapshotColor);
+          // A narrow drawer may ellipsize the trailing count, but the primary result fits.
+          const marks = document.createRange();
+          marks.setStart(result.firstChild!, 0);
+          marks.setEnd(result.firstChild!, (failure ? "2 failed" : "1 accepted").length);
+          expect(marks.getBoundingClientRect().right).toBeLessThan(rect(result).right);
+          expect(rect(result).right).toBeLessThanOrEqual(rect(push).left);
+          expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+        }
+      }
+      expect(fetch.mock.calls.filter(([url]) => url.endsWith("/test"))).toHaveLength(4);
+    } finally {
+      delete document.documentElement.dataset.theme;
+    }
+  },
+);
 
 it("fits the offline 280px mobile drawer with touch targets, single moving dot, and drawer-close reset", async () => {
   await page.viewport(390, 844);
