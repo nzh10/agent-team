@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { page, userEvent } from "vitest/browser";
+import { cdp, page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { QUOTA_STALE_AFTER, type QuotaState } from "../../../shared/quota";
 import { Sidebar } from "../../src/sidebar/Sidebar";
@@ -98,12 +98,17 @@ function renderSidebar(quota: QuotaState, onRefreshQuota = vi.fn(), mobileOpen =
   );
 }
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await cdp().send("Emulation.setEmulatedMedia", { features: [] });
 });
 
 it("renders compact quota rows on desktop with threshold colors, error badges, and click/keyboard inline expansion", async () => {
   await page.viewport(1280, 800);
+  // Windows Server runners default to prefers-reduced-motion: reduce.
+  await cdp().send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "no-preference" }],
+  });
   const onRefresh = vi.fn();
   const view = renderSidebar(sampleQuota, onRefresh);
 
