@@ -76,6 +76,25 @@ it("rotates before exceeding the size cap and keeps exactly one backup", async (
   }
 });
 
+it("splits a queued batch cleanly across the rotation boundary", async () => {
+  const first = new ProxyMetrics(baseDir);
+  first.record(row);
+  await first.close();
+  const second = { ...row, reqId: "before-rotate" };
+  const third = { ...row, reqId: "after-rotate" };
+  const secondBytes = Buffer.byteLength(`${JSON.stringify(second)}\n`);
+  const limit = 8 * 1024 * 1024;
+  await truncate(logPath, limit - secondBytes);
+
+  const metrics = new ProxyMetrics(baseDir);
+  metrics.record(second);
+  metrics.record(third);
+  await metrics.close();
+
+  expect(await readFile(logPath, "utf8")).toBe(`${JSON.stringify(third)}\n`);
+  expect((await stat(`${logPath}.1`)).size).toBe(limit);
+});
+
 it("bounds the disk backlog separately from the rolling health window", async () => {
   const metrics = new ProxyMetrics(baseDir);
   metrics.record({ ...row, model: "aged-out", circuitBreakerTripped: true });
