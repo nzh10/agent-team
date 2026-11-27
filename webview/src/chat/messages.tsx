@@ -1583,6 +1583,7 @@ export const MessageItem = memo(function MessageItem({
   const quoteButton =
     !isUser && onQuote && segments.length > 0 ? (
       <button
+        type="button"
         className="btn-quote"
         aria-label="Quote this message"
         title="Quote this message"
@@ -1590,6 +1591,20 @@ export const MessageItem = memo(function MessageItem({
       >
         ↩
       </button>
+    ) : null;
+  const copyBody =
+    (msg.status === "done" || msg.status === "error" || msg.status === "outcome_unknown") &&
+    body.trim();
+  // Keep the timestamp and the delivery label in place until the copy action mounts.
+  const reserveCopy = (starting || sending) && body.trim();
+  const actions =
+    !streaming && (quoteButton || copyBody || reserveCopy) ? (
+      <div className="message-actions">
+        {quoteButton}
+        {copyBody && (
+          <CopyButton className="btn-copy-message" label="Copy message" text={() => body} />
+        )}
+      </div>
     ) : null;
 
   const forward = msg.forwardRef;
@@ -1683,7 +1698,7 @@ export const MessageItem = memo(function MessageItem({
                     streaming={streaming}
                   />
                 )}
-                {!streaming && quoteButton}
+                {actions}
               </div>
             )}
             {compact && (
@@ -1692,7 +1707,7 @@ export const MessageItem = memo(function MessageItem({
                   {time}
                 </span>
                 {streaming && <span className="streaming-dot" />}
-                {!streaming && quoteButton}
+                {actions}
               </div>
             )}
             {!isUser && <MessageStatus msg={msg} />}

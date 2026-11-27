@@ -350,10 +350,11 @@ it("keeps the quote control out of the text and truncates a long sender on one l
       />
     </div>,
   );
-  const quote = get(container, ".btn-quote");
   const header = get(container, ".message-header");
-  expect(rect(quote).bottom).toBeLessThanOrEqual(rect(get(container, ".message-content")).top);
-  expect(rect(quote).right).toBeCloseTo(rect(header).right, 0);
+  const actions = get(header, ".message-actions");
+  expect(rect(actions).bottom).toBeLessThanOrEqual(rect(get(container, ".message-content")).top);
+  expect(rect(actions).right).toBeCloseTo(rect(header).right, 0);
+  expect(get(actions, ".btn-quote").nextElementSibling).toBe(get(actions, ".btn-copy-message"));
   const phoneBodySize = getComputedStyle(document.documentElement)
     .getPropertyValue("--fs-text")
     .trim();
@@ -385,10 +386,10 @@ it("keeps a cross-year timestamp and quote button inside a narrow desktop header
   const header = get(container, ".message-header");
   const model = get(header, ".message-model");
   const time = get(header, ".message-time");
-  const quote = get(header, ".btn-quote");
+  const actions = get(header, ".message-actions");
   expect(lines(time)).toBe(1);
-  expect(rect(time).right).toBeLessThanOrEqual(rect(header).right + 0.5);
-  expect(rect(quote).right).toBeLessThanOrEqual(rect(header).right + 0.5);
+  expect(rect(time).right).toBeLessThanOrEqual(rect(actions).left);
+  expect(rect(actions).right).toBeLessThanOrEqual(rect(header).right + 0.5);
   expect(model.scrollWidth).toBeGreaterThan(model.clientWidth);
   expect(getComputedStyle(model).textOverflow).toBe("ellipsis");
   expect(model.title).toBe(model.textContent);

@@ -56,6 +56,9 @@ it("stops status loops and chrome motion without hiding status text in reduced m
       <div className="event-summary-line">
         <button className="copy-btn">Copy path</button>
       </div>
+      <div className="message-actions">
+        <button className="copy-btn btn-copy-message">Copy message</button>
+      </div>
       <button className="btn-primary">Create</button>
     </>,
   );
@@ -77,7 +80,12 @@ it("stops status loops and chrome motion without hiding status text in reduced m
   ];
   const fades = [".sidebar-debug-strip", ".quota-details", ".stop-actions"];
   const statusTexts = [".delivery-inline", ".banner-retry", ".history-loading", ".quota-details"];
-  const transitions = [".code-block .copy-btn", ".event-summary-line .copy-btn", ".btn-primary"];
+  const transitions = [
+    ".code-block .copy-btn",
+    ".event-summary-line .copy-btn",
+    ".btn-copy-message",
+    ".btn-primary",
+  ];
   function properties(selector: string) {
     const [animation, ...rest] = get(selector).getAnimations();
     expect(rest).toEqual([]);

@@ -52,7 +52,7 @@ export function codeText(code: Element): string {
 }
 
 // Drawn with user-select: none; Chrome still puts them in a selection's range.
-const UNSELECTABLE = ".copy-btn, .step-header, .subagent-header";
+const UNSELECTABLE = ".copy-btn, .message-actions, .step-header, .subagent-header";
 
 function codeAround(node: Node): Element | null {
   return (node instanceof Element ? node : node.parentElement)?.closest("pre, code") ?? null;

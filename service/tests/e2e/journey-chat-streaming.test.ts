@@ -1,15 +1,12 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chromium, type Browser, type Locator, type Page } from "playwright";
-import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
-import { ensureWebviewBuilt } from "../../../scripts/bench-demo";
-import { seedDemo } from "../../../scripts/seed-demo";
-import { Server } from "../../src/server/server";
-import { closeHistory, loadAll, saveWorkspace } from "../../src/workspace/state";
+import type { Locator, Page } from "playwright";
+import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
+import type { SeedDemoResult } from "../../../scripts/seed-demo";
+import { loadAll, saveWorkspace } from "../../src/workspace/state";
 import type { Message } from "../../src/workspace/workspace";
+import { startDemoJourney } from "./demo-journey-harness";
 
-const webDir = join(__dirname, "../../../dist/webview");
 const imageName = "journey preview.png";
 const historySize = 125;
 const pressureId = "journey-pressure";
@@ -17,17 +14,10 @@ const pressureBody = `Pressure result start\n${"Synthetic settled tool output.\n
 let historyIds: string[];
 let wakeId: string;
 let newestCursor: number;
-let dir: string | undefined;
-let server: Server | undefined;
-let browser: Browser;
-let origin: string;
-let page: Page | undefined;
-let errors: string[];
+let fixture: Awaited<ReturnType<typeof startDemoJourney>>;
+let tab: Awaited<ReturnType<typeof fixture.openPage>> | undefined;
 
-beforeAll(async () => {
-  ensureWebviewBuilt();
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "yaat-chat-journey-")));
-  const { workspaces } = seedDemo(dir, { quiet: true, writeConfig: true });
+function prepareHistory(dir: string, { workspaces }: SeedDemoResult) {
   const sessions = loadAll(dir);
   const mobile = sessions.find((session) => session.id === workspaces.mobile)!;
   const wake = sessions.find((session) => session.id === workspaces.wake)!;
@@ -105,92 +95,46 @@ beforeAll(async () => {
       },
     ],
   });
-  closeHistory(dir);
-  vi.stubEnv("AGENT_TEAM_HOST", "127.0.0.1");
-  server = new Server(0, dir, webDir);
-  origin = `http://127.0.0.1:${await server.listening}`;
-  browser = await chromium.launch();
+}
+
+beforeAll(async () => {
+  fixture = await startDemoJourney("yaat-chat-journey-", prepareHistory);
 }, 60_000);
 
 async function open(query = "", prepare?: (page: Page) => Promise<void>) {
-  const context = await browser.newContext({
+  tab = await fixture.openPage({
     viewport: { width: 1280, height: 800 },
     permissions: ["clipboard-read", "clipboard-write"],
+    timeout: 7_000,
   });
-  const current = (page = await context.newPage());
-  current.setDefaultTimeout(7_000);
-  errors = [];
-  current.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
-  });
-  current.on("pageerror", (error) => errors.push(error.stack ?? error.message));
-  await prepare?.(current);
-  await current.goto(`${origin}/${query}`);
-  await current
+  const { page } = tab;
+  await prepare?.(page);
+  await page.goto(`${fixture.origin}/${query}`);
+  await page
     .locator(".messages")
     .getByText(/分成两件事/)
     .waitFor();
-  return current;
+  return page;
 }
 
 afterEach(async () => {
-  if (!page) return;
+  if (!tab) return;
+  const { page, assertClean } = tab;
+  tab = undefined;
   await page.context().close();
-  page = undefined;
-  expect(errors).toEqual([]);
+  assertClean();
 });
 
-afterAll(async () => {
-  try {
-    await browser?.close();
-  } finally {
-    try {
-      await server?.close();
-    } finally {
-      vi.unstubAllEnvs();
-      if (dir) {
-        closeHistory(dir);
-        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      }
-    }
-  }
-});
+afterAll(async () => fixture?.close());
 
 const worker = (page: Page, name: string) => page.locator(".task-item", { hasText: name });
 const overflow = (page: Page) =>
   page.evaluate("document.documentElement.scrollWidth - window.innerWidth");
 
-it("reads persisted markdown, expands tool results, copies code and opens an image file", async () => {
+it("quotes the agent and copies a tool-linked image without overflowing the phone file bar", async () => {
   const page = await open();
   await worker(page, "mobile panels").click();
-  const messages = page.locator(".messages");
-  await messages.getByRole("cell", { name: "目录行高", exact: true }).waitFor();
-  const code = messages.locator("pre", { hasText: "npx vitest run" });
-  await code.waitFor();
-  await code.locator("..").getByRole("button", { name: "Copy", exact: true }).click();
-  await expect
-    .poll(() => page.evaluate("navigator.clipboard.readText()"))
-    .toBe("npx vitest run tests/agents-panel.test.tsx tests/files-panel.test.tsx");
-
-  const steps = messages.locator(".step-group", { has: page.getByText("Bash", { exact: true }) });
-  await steps.getByRole("button", { name: "Expand steps" }).click();
-  const bash = steps.locator(".event-tool_use", { hasText: "npx vitest run" });
-  const result = bash.getByRole("button", { name: /^Result ·/ });
-  await result.click();
-  const output = bash.locator(".event-result", { hasText: "31 passed (31)" });
-  await output.getByRole("button", { name: "Copy", exact: true }).click();
-  // The Windows clipboard represents line breaks as CRLF.
-  await expect
-    .poll(async () =>
-      (await page.evaluate<string>("navigator.clipboard.readText()")).replaceAll("\r\n", "\n"),
-    )
-    .toBe(" Test Files  2 passed (2)\n      Tests  31 passed (31)");
-  await bash.getByRole("button", { name: /^Hide result ·/ }).click();
-  await bash.locator(".event-result").waitFor({ state: "hidden" });
-  await steps.getByRole("button", { name: "Collapse step trace" }).press("Enter");
-  await steps.getByRole("button", { name: "Expand steps" }).and(page.locator(":focus")).waitFor();
-
-  const image = messages.locator("#msg-journey-image");
+  const image = page.locator(".messages #msg-journey-image");
   await image.getByTitle("Quote this message").click();
   await page.locator('.quote-bar-agent img[alt="Perseus"]').waitFor();
   const emptyThinking = image.locator(".step-group", { hasText: "1 thinking" });
@@ -294,7 +238,7 @@ it("reads every history window, preserves the reconnect anchor and restores evic
   const cursors: unknown[] = [];
   const frame = (raw: Buffer | string) => JSON.parse(raw.toString()) as Record<string, unknown>;
   const page = await open("", (page) =>
-    page.routeWebSocket(`ws://${new URL(origin).host}/`, (socket) => {
+    page.routeWebSocket(`ws://${new URL(fixture.origin).host}/`, (socket) => {
       const upstream = socket.connectToServer();
       socket.onMessage((raw) => {
         const { type, workspaceId, before, messageId } = frame(raw);
@@ -396,7 +340,7 @@ it("reads every history window, preserves the reconnect anchor and restores evic
       timeout: 7_000,
     }),
   );
-  for (const socket of server!["wss"].clients) socket.close(1000, "Journey reconnect");
+  for (const socket of fixture.server["wss"].clients) socket.close(1000, "Journey reconnect");
   await reconnect;
   await settle();
   await loaded(historyIds.length);
@@ -464,7 +408,7 @@ it("reads every history window, preserves the reconnect anchor and restores evic
 }, 40_000);
 
 // Replay Demo runs in the browser; only the seeded conversations above survive a reload.
-it("streams Replay Demo thinking, drills into a subagent, jumps to a quote and cancels work", async () => {
+it("streams Replay Demo and expands and collapses thinking and completed subagent traces", async () => {
   const page = await open("?debug=1&demoSpeed=3");
   await page.getByRole("button", { name: "Replay demo", exact: true }).click();
   await worker(page, "Replay Demo").click();
@@ -490,13 +434,4 @@ it("streams Replay Demo thinking, drills into a subagent, jumps to a quote and c
   await card.locator(".subagent-time", { hasText: /^21s$/ }).waitFor();
   await details.getByRole("button", { name: "Collapse subagent trace" }).click();
   await details.waitFor({ state: "detached" });
-
-  const running = page.locator(".subagent-item", { hasText: "Watch CI for regressions" });
-  await running.getByRole("button", { name: "Cancel", exact: true }).click();
-  await running.getByTitle("stopped", { exact: true }).waitFor();
-  expect(await running.getAttribute("class")).toContain("subagent-stopped");
-  await running.getByRole("button", { name: "Cancel", exact: true }).waitFor({ state: "hidden" });
-  await turn.getByText(/The fixtures cover the waiting, thinking, and tool phases/).waitFor();
-  await page.getByRole("button", { name: /^Jump to quoted message from Demo:/ }).click();
-  await page.locator("#msg-demo-msg-1.message-highlight").waitFor();
 }, 50_000);

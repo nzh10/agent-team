@@ -25,6 +25,7 @@ import {
   splitFileRef,
 } from "./fileRef";
 import { codeText, copyText } from "./clipboard";
+import { Icon } from "../panels/Icon";
 import {
   DiagramPreview,
   diagramLanguage,
@@ -35,20 +36,37 @@ import {
 
 const DiagramSlot = createContext("");
 
-export function CopyButton({ text }: { text: () => string }) {
+export function CopyButton({
+  text,
+  label = "Copy",
+  className,
+}: {
+  text: () => string;
+  label?: string;
+  className?: string;
+}) {
   const [copied, setCopied] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const name = copied ? "Copied" : label;
   return (
     <button
-      className="copy-btn"
+      ref={button}
+      type="button"
+      className={className ? `copy-btn ${className}` : "copy-btn"}
+      aria-label={name}
+      title={name}
       onClick={() => {
         void copyText(text()).then((ok) => {
-          if (!ok) return;
+          if (!ok || !button.current) return;
           setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
+          clearTimeout(timer.current);
+          timer.current = setTimeout(() => setCopied(false), 1500);
         });
       }}
     >
-      {copied ? "Copied" : "Copy"}
+      <Icon name={copied ? "check" : "copy"} />
     </button>
   );
 }
