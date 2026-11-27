@@ -118,39 +118,58 @@ export class ProxyMetrics {
 
   private async drain(): Promise<void> {
     while (this.pending.length) {
-      const row = this.pending.shift();
-      if (!row) break;
+      const batch = this.pending.splice(0);
       try {
-        await this.append(row.line, row.bytes);
+        await this.appendBatch(batch);
       } catch {
-        // Disk errors only drop the log row; the proxy and health summary stay available.
+        // Disk errors only drop the log batch; the proxy and health summary stay available.
       }
     }
     this.writer = undefined;
   }
 
-  private async append(line: string, bytes: number): Promise<void> {
+  private async appendBatch(batch: { line: string; bytes: number }[]): Promise<void> {
     await mkdir(this.logDir, { recursive: true, mode: 0o700 });
-    // Use a nonblocking open so an unexpected FIFO cannot hang shutdown.
-    const file = await open(this.logPath, appendFlags | constants.O_NONBLOCK, 0o600);
-    try {
-      const info = await file.stat();
-      if (!info.isFile()) return;
-      if ((info.mode & 0o777) !== 0o600) await file.chmod(0o600);
-      if (info.size + bytes <= maxLogBytes) {
-        await file.appendFile(line);
-        return;
+    let offset = 0;
+    while (offset < batch.length) {
+      // Use a nonblocking open so an unexpected FIFO cannot hang shutdown.
+      const file = await open(this.logPath, appendFlags | constants.O_NONBLOCK, 0o600);
+      let rotate = false;
+      try {
+        const info = await file.stat();
+        if (!info.isFile()) return;
+        // Windows uses directory ACLs, not POSIX mode bits.
+        if (process.platform !== "win32" && (info.mode & 0o777) !== 0o600) {
+          await file.chmod(0o600);
+        }
+        let size = info.size;
+        let chunk = "";
+        while (offset < batch.length && size + batch[offset].bytes <= maxLogBytes) {
+          chunk += batch[offset].line;
+          size += batch[offset].bytes;
+          offset++;
+        }
+        if (chunk) await file.appendFile(chunk);
+        if (offset < batch.length) rotate = true;
+      } finally {
+        await file.close();
       }
-    } finally {
-      await file.close();
-    }
-    await rename(this.logPath, `${this.logPath}.1`);
-    const next = await open(this.logPath, appendFlags | constants.O_EXCL, 0o600);
-    try {
-      await next.chmod(0o600);
-      await next.appendFile(line);
-    } finally {
-      await next.close();
+      if (!rotate) return;
+      await rename(this.logPath, `${this.logPath}.1`);
+      const next = await open(this.logPath, appendFlags | constants.O_EXCL, 0o600);
+      try {
+        if (process.platform !== "win32") await next.chmod(0o600);
+        let size = 0;
+        let chunk = "";
+        while (offset < batch.length && size + batch[offset].bytes <= maxLogBytes) {
+          chunk += batch[offset].line;
+          size += batch[offset].bytes;
+          offset++;
+        }
+        if (chunk) await next.appendFile(chunk);
+      } finally {
+        await next.close();
+      }
     }
   }
 }
