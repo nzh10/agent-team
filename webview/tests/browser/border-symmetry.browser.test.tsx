@@ -4,76 +4,64 @@ import { page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { BannerItem, EventItem, MessageStatus } from "../../src/chat/messages";
 import { MdBlock } from "../../src/chat/markdown";
-import { AgentsPanel, type AgentsPanelActions } from "../../src/panels/AgentsPanel";
+import { AgentsPanel } from "../../src/panels/AgentsPanel";
+import type { ComponentProps } from "react";
 import { SessionStats } from "../../src/panels/SessionStats";
 import { QuotaPanel } from "../../src/sidebar/QuotaPanel";
 import { SystemStatusPanel } from "../../src/sidebar/Sidebar";
-import type { AgentInfo, Project, Workspace } from "../../src/state/useServer";
+import { agentsActions } from "../helpers/agentsPanel";
+import {
+  agent as makeAgent,
+  objective,
+  project as makeProject,
+  workspace as makeWorkspace,
+} from "../helpers/fixtures";
 import "../../src/styles.css";
 
 const NOW = Date.UTC(2026, 10, 25, 12);
 const no = () => {};
-const agent: AgentInfo = {
-  id: "agent",
-  name: "Agent",
+const agent = makeAgent("agent", {
   model: "model",
-  avatar: "A",
   color: "#528bff",
-  isDefault: true,
   context: { tokens: 1200, window: 8192 },
-};
-const workspace: Workspace = {
-  id: "worker",
-  name: "worker",
+});
+const workspace = makeWorkspace("worker", {
   project: "Project",
-  hostId: "local",
   cwd: "/repo/worker",
   agents: [agent],
-  messages: [],
   createdAt: NOW - 1000,
   lastMessageAt: NOW,
   projectLink: { projectId: "project", role: "worker" },
   git: { branch: "feature/symmetry", dirty: 1, ahead: 0, behind: 0 },
-};
-const project: Project = {
-  id: "project",
-  name: "Project",
-  root: "/repo",
-  leadWorkspaceId: "lead",
+});
+const project = makeProject("project", {
   createdAt: NOW - 2000,
   objectives: [
-    {
-      id: "obj-1",
+    objective("obj-1", {
       area: "UI",
       title: "Balanced cards",
       goal: "Keep content evenly inset",
-      status: "active",
-      priority: "normal",
       context: "",
-      dependsOn: [],
       tasks: [{ id: "task-1", text: "Audit every border", state: "doing", session: "worker" }],
-      decisions: [],
       sessions: ["worker"],
       notes: "",
       updatedAt: NOW,
-    },
+    }),
   ],
-};
-const actions: AgentsPanelActions = {
-  onOpen: no,
-  onStop: no,
-  onArchive: no,
-  onRestore: no,
-  onSetReporting: no,
-  onAddAgent: no,
-  onClearContext: no,
-  onRemoveAgent: no,
-  onSetModel: no,
-  onSetEffort: no,
-  onStopAll: no,
-  onStopTask: no,
-  onCancelWake: no,
-};
+});
+const actions = agentsActions({}, () => no);
+const busySession = () => ({ ...workspace, agents: [{ ...agent, busy: true }] });
+const panel = (fields: Partial<ComponentProps<typeof AgentsPanel>> = {}) => (
+  <AgentsPanel
+    sessions={[workspace]}
+    project={project}
+    activeWsId={workspace.id}
+    connected
+    models={[]}
+    actions={actions}
+    {...fields}
+  />
+);
 
 // Atomic controls and selected flow sections contribute their border box; other
 // text contributes a layout Range. This guard is not an audit of painted spacing.
@@ -358,46 +346,16 @@ it.each([
         <QuotaPanel quota={{ refreshing: false, rows: [] }} now={NOW} refresh={no} connected />
       </div>
       <div id="audit-ap-collapsed" style={{ width: "min(380px, 100%)" }}>
-        <AgentsPanel
-          sessions={[workspace]}
-          project={project}
-          activeWsId="worker"
-          connected
-          models={[]}
-          actions={actions}
-          overview
-        />
+        {panel({ overview: true })}
       </div>
       <div id="audit-ap-collapsed-busy" style={{ width: "min(380px, 100%)" }}>
-        <AgentsPanel
-          sessions={[{ ...workspace, agents: [{ ...agent, busy: true }] }]}
-          project={project}
-          activeWsId="worker"
-          connected
-          models={[]}
-          actions={actions}
-          overview
-        />
+        {panel({ sessions: [busySession()], overview: true })}
       </div>
       <div id="audit-ap-expanded" style={{ width: "min(380px, 100%)" }}>
-        <AgentsPanel
-          sessions={[workspace]}
-          project={project}
-          activeWsId="worker"
-          connected
-          models={[]}
-          actions={actions}
-        />
+        {panel()}
       </div>
       <div id="audit-ap-expanded-readonly" style={{ width: "min(380px, 100%)" }}>
-        <AgentsPanel
-          sessions={[workspace]}
-          project={{ ...project, status: "sealed", sealedReason: "Audit complete" }}
-          activeWsId="worker"
-          connected
-          models={[]}
-          actions={actions}
-        />
+        {panel({ project: { ...project, status: "sealed", sealedReason: "Audit complete" } })}
       </div>
       <div id="audit-bp-card">
         <button className="bp-card">
@@ -582,15 +540,12 @@ it.each([390, 1280].flatMap((width) => ["light", "dark"].map((theme) => ({ width
     try {
       const view = (active: boolean, folded = false, sealed = false) => (
         <div style={{ width: 350 }}>
-          <AgentsPanel
-            sessions={[{ ...workspace, agents: [{ ...agent, busy: true }] }]}
-            project={sealed ? { ...project, status: "sealed" } : project}
-            activeWsId={active ? workspace.id : null}
-            connected
-            models={[]}
-            actions={actions}
-            overview={folded}
-          />
+          {panel({
+            sessions: [busySession()],
+            project: sealed ? { ...project, status: "sealed" } : project,
+            activeWsId: active ? workspace.id : null,
+            overview: folded,
+          })}
         </div>
       );
       const { container, rerender } = render(view(true));
@@ -647,16 +602,7 @@ it.each([390, 1280].flatMap((width) => ["light", "dark"].map((theme) => ({ width
 
 it("rejects section and contour regressions hidden by outer-box and resting-label checks", async () => {
   await page.viewport(1280, 900);
-  const { container } = render(
-    <AgentsPanel
-      sessions={[workspace]}
-      project={project}
-      activeWsId={workspace.id}
-      connected
-      models={[]}
-      actions={actions}
-    />,
-  );
+  const { container } = render(panel());
   const card = container.querySelector<HTMLElement>(".ap-session")!;
   const foot = card.querySelector<HTMLElement>("footer")!;
   const add = foot.querySelector<HTMLElement>(".ap-add")!;
@@ -680,15 +626,7 @@ it("keeps the mobile collapsed Stop target inside its card and clickable", async
   render(
     <div style={{ width: 350, height: 200, overflowY: "auto" }}>
       <div style={{ height: 400 }} />
-      <AgentsPanel
-        sessions={[{ ...workspace, agents: [{ ...agent, busy: true }] }]}
-        project={project}
-        activeWsId="worker"
-        connected
-        models={[]}
-        actions={{ ...actions, onStop: stop }}
-        overview
-      />
+      {panel({ sessions: [busySession()], actions: { ...actions, onStop: stop }, overview: true })}
     </div>,
   );
   const button = document.querySelector<HTMLElement>(".ap-brief .panel-btn")!;

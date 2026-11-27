@@ -1,34 +1,19 @@
 // Side panels in the app: how wide, docked or floating, maximised, and the
 // chat header beside them.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, act } from "@testing-library/react";
-import { App } from "../src/App";
-import type { Project, Workspace } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { fireEvent, act } from "@testing-library/react";
+import type { Workspace } from "../src/state/useServer";
+import { agent } from "./helpers/fixtures";
+import { bootProjectApp, cliceProject, repoSession, stubAppSocket } from "./helpers/projectApp";
 
 const NOW = Date.now();
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "clice",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  git: null,
-  pr: null,
-  agents: [{ id: `${id}-a`, name: "A", model: "m", avatar: "A", color: "#fff", isDefault: true }],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW - 5000,
-  ...over,
-});
-const project: Project = {
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: 0,
-  objectives: [],
-};
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  repoSession(id, NOW, {
+    project: "clice",
+    agents: [agent(`${id}-a`, { name: "A", model: "m", color: "#fff" })],
+    ...over,
+  });
+const project = cliceProject(NOW, { createdAt: 0 });
 const lead = ws("lead", {
   name: "clice · lead",
   cwd: "/repo/clice",
@@ -37,13 +22,7 @@ const lead = ws("lead", {
 const worker = ws("w1", { name: "modules", projectLink: { projectId: "p1", role: "worker" } });
 
 beforeEach(() => {
-  const store = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => store.get(k) ?? null,
-    setItem: (k: string, v: string) => void store.set(k, String(v)),
-    removeItem: (k: string) => void store.delete(k),
-    clear: () => store.clear(),
-  });
+  stubAppSocket();
   vi.stubGlobal(
     "fetch",
     vi.fn(() =>
@@ -55,28 +34,11 @@ beforeEach(() => {
       }),
     ),
   );
-  FakeSocket.instances = [];
-  vi.stubGlobal("WebSocket", FakeSocket);
-  Element.prototype.scrollIntoView = vi.fn();
 });
 afterEach(() => vi.unstubAllGlobals());
 
-function boot(active: string, workspaces = [lead, worker]) {
-  localStorage.setItem("activeWsId", active);
-  const utils = render(<App />);
-  const sock = FakeSocket.instances.at(-1)!;
-  act(() => sock.open());
-  act(() =>
-    sock.receive({
-      type: "init",
-      workspaces,
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-      projects: [project],
-    }),
-  );
-  return utils;
-}
+const boot = (active: string, workspaces = [lead, worker]) =>
+  bootProjectApp(workspaces, [project], active);
 const rail = (label: string) =>
   fireEvent.click(document.querySelector(`.side-rail [aria-label="${label}"]`)!);
 const panel = () => document.querySelector(".side-panel") as HTMLElement;

@@ -3,23 +3,19 @@ import { afterEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { QUOTA_STALE_AFTER, type QuotaState } from "../../../shared/quota";
-import { Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
+import { Sidebar } from "../../src/sidebar/Sidebar";
 import { QuotaPanel } from "../../src/sidebar/QuotaPanel";
-import type { Workspace } from "../../src/state/useServer";
+import { workspace } from "../helpers/fixtures";
+import { sidebarProps } from "../helpers/sidebar";
 import "../../src/styles.css";
 
 const NOW = 1_800_000_000_000;
 
-const sampleWorkspace: Workspace = {
-  id: "w1",
+const sampleWorkspace = workspace("w1", {
   name: "main-workspace",
   project: "yaat",
-  cwd: "/repo",
-  hostId: "local",
-  agents: [],
-  messages: [],
   createdAt: NOW - 60_000,
-};
+});
 
 const sampleQuota: QuotaState = {
   refreshing: false,
@@ -72,14 +68,9 @@ const sampleQuota: QuotaState = {
 };
 
 function renderSidebar(quota: QuotaState, onRefreshQuota = vi.fn(), mobileOpen = false) {
-  const noop = () => {};
-  const props: SidebarProps = {
+  const props = sidebarProps({
     workspaces: [sampleWorkspace],
     activeWsId: "w1",
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
     systemStatus: {
       osName: "Darwin",
       osArch: "arm64",
@@ -94,17 +85,7 @@ function renderSidebar(quota: QuotaState, onRefreshQuota = vi.fn(), mobileOpen =
     quota,
     onRefreshQuota,
     now: NOW,
-    onSelect: noop,
-    onDelete: noop,
-    onToggleGroup: noop,
-    onSearchChange: noop,
-    onJump: noop,
-    onCreate: noop,
-    onCreateIn: noop,
-    onReplayDemo: noop,
-    onDebugSnapshot: noop,
-    onPurgeArchived: noop,
-  };
+  });
   return render(
     <div className="app" style={{ height: "100dvh", display: "flex" }}>
       <aside

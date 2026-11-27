@@ -9,30 +9,17 @@ import {
   type Message,
   type Workspace,
 } from "../src/state/useServer";
-import { FakeSocket } from "./fakeSocket";
+import { FakeSocket, initFrame, messagePage } from "./fakeSocket";
+import { message, workspace } from "./helpers/fixtures";
 
-const init = {
-  type: "init",
-  workspaces: [],
-  config: { presets: [], models: [], commands: [], hosts: {} },
-  hosts: [],
-};
+const init = initFrame([]);
 
 function setVisibility(state: "visible" | "hidden") {
   Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
-const W: Workspace = {
-  id: "w",
-  name: "w",
-  project: "p",
-  hostId: "h",
-  cwd: "/",
-  agents: [],
-  messages: [],
-  createdAt: 0,
-};
+const W = workspace("w", { project: "p", hostId: "h", cwd: "/", createdAt: 0 });
 
 function openSnapshot(ws: FakeSocket, workspaces = [W]) {
   ws.open();
@@ -42,7 +29,7 @@ function openSnapshot(ws: FakeSocket, workspaces = [W]) {
 // A hook connected to a fake server that has sent `init` with workspace "w".
 function connected(
   wrapper?: ({ children }: { children: ReactNode }) => ReactNode,
-  workspaces = [W],
+  workspaces: Workspace[] = [W],
 ) {
   const hook = renderHook(() => useServer(), wrapper ? { wrapper } : undefined);
   const ws = FakeSocket.instances.at(-1)!;
@@ -50,13 +37,8 @@ function connected(
   return { result: hook.result, unmount: hook.unmount, ws };
 }
 
-const workspacePage = (messages: Message[], before: number | null = null, hasMore = false) => ({
-  type: "workspace_messages",
-  workspaceId: "w",
-  messages,
-  before,
-  hasMore,
-});
+const workspacePage = (messages: Message[], before: number | null = null, hasMore = false) =>
+  messagePage("w", messages, { before, hasMore });
 
 const streamEvent = (event: Record<string, unknown>, messageId = "m1") => ({
   type: "stream_event",
@@ -65,16 +47,9 @@ const streamEvent = (event: Record<string, unknown>, messageId = "m1") => ({
   event,
 });
 
-const liveMessage = (over: Record<string, unknown> = {}) => ({
-  id: "m1",
-  kind: "agent",
-  agentId: "a",
-  content: "Hello",
-  timestamp: 1,
-  status: "streaming",
-  events: [],
-  ...over,
-});
+const liveMessage = (over: Partial<Message> = {}) =>
+  message("m1", { content: "Hello", status: "streaming", events: [], ...over });
+const initialReply = () => message("m1", { status: "streaming" });
 
 const frame = () =>
   act(() => {
@@ -172,13 +147,7 @@ describe("connection liveness", () => {
 
   it("uses the reconnected snapshot's timers even if no new thinking text arrives", () => {
     const { result, ws } = connected();
-    const page = (over: Record<string, unknown>) => ({
-      type: "workspace_messages",
-      workspaceId: "w",
-      hasMore: false,
-      before: null,
-      messages: [liveMessage(over)],
-    });
+    const page = (over: Partial<Message>) => workspacePage([liveMessage(over)]);
     act(() => ws.receive(page({ waitingSince: 1_000 })));
     expect(result.current.workspaces[0].messages[0].waitingSince).toBe(1_000);
 
@@ -204,31 +173,13 @@ describe("connection liveness", () => {
 
 describe("resync detail refetch", () => {
   it("re-fetches bodies for a message the user was watching live", () => {
-    const { result } = renderHook(() => useServer());
+    const { result } = renderHook(useServer);
     const ws = FakeSocket.instances[0];
-    const w = { id: "w", name: "w", project: "p", hostId: "h", cwd: "/", agents: [], messages: [] };
-    const page = (messages: unknown[]) => ({
-      type: "workspace_messages",
-      workspaceId: "w",
-      hasMore: false,
-      before: null,
-      messages,
-    });
     act(() => {
-      ws.open();
-      ws.receive({ ...init, workspaces: [{ ...w, createdAt: 0 }] });
-      ws.receive(
-        page([
-          { id: "m1", kind: "agent", agentId: "a", content: "", timestamp: 1, status: "streaming" },
-        ]),
-      );
+      openSnapshot(ws);
+      ws.receive(workspacePage([initialReply()]));
       // Streamed live: full thinking body on the client.
-      ws.receive({
-        type: "stream_event",
-        workspaceId: "w",
-        messageId: "m1",
-        event: { kind: "thinking", content: "long reasoning" },
-      });
+      ws.receive(streamEvent({ kind: "thinking", content: "long reasoning" }));
     });
     act(() => {
       vi.runOnlyPendingTimers();
@@ -238,14 +189,9 @@ describe("resync detail refetch", () => {
     // Reconnect resync: the server sends the same message as a summary.
     act(() => {
       ws.receive(
-        page([
+        workspacePage([
           {
-            id: "m1",
-            kind: "agent",
-            agentId: "a",
-            content: "",
-            timestamp: 1,
-            status: "streaming",
+            ...initialReply(),
             events: [{ kind: "thinking", content: "", contentLength: 14 }],
             detail: "summary",
           },
@@ -274,24 +220,11 @@ describe("resync detail refetch", () => {
 
 describe("message_done status patch", () => {
   it("applies the effort and context reported at the end of the turn", () => {
-    const { result } = renderHook(() => useServer());
+    const { result } = renderHook(useServer);
     const ws = FakeSocket.instances[0];
-    const w = { id: "w", name: "w", project: "p", hostId: "h", cwd: "/", agents: [], messages: [] };
     act(() => {
-      ws.open();
-      ws.receive({ ...init, workspaces: [{ ...w, createdAt: 0 }] });
-      ws.receive({
-        type: "new_message",
-        workspaceId: "w",
-        message: {
-          id: "m1",
-          kind: "agent",
-          agentId: "a",
-          content: "",
-          timestamp: 1,
-          status: "streaming",
-        },
-      });
+      openSnapshot(ws);
+      ws.receive({ type: "new_message", workspaceId: "w", message: initialReply() });
       ws.receive({
         type: "message_done",
         workspaceId: "w",
@@ -331,24 +264,11 @@ describe("message_done status patch", () => {
 
 describe("message_done ordering", () => {
   it("applies events still waiting for a frame before finishing the message", () => {
-    const { result } = renderHook(() => useServer());
+    const { result } = renderHook(useServer);
     const ws = FakeSocket.instances[0];
-    const w = { id: "w", name: "w", project: "p", hostId: "h", cwd: "/", agents: [], messages: [] };
     act(() => {
-      ws.open();
-      ws.receive({ ...init, workspaces: [{ ...w, createdAt: 0 }] });
-      ws.receive({
-        type: "new_message",
-        workspaceId: "w",
-        message: {
-          id: "m1",
-          kind: "agent",
-          agentId: "a",
-          content: "",
-          timestamp: 1,
-          status: "streaming",
-        },
-      });
+      openSnapshot(ws);
+      ws.receive({ type: "new_message", workspaceId: "w", message: initialReply() });
       ws.receive({
         type: "stream_event",
         workspaceId: "w",
@@ -708,15 +628,8 @@ describe("connection attempts", () => {
 });
 
 describe("history pages", () => {
-  const settled = (timestamp: number, patch: Partial<Message> = {}): Message => ({
-    id: `m${timestamp}`,
-    kind: "agent",
-    agentId: "a",
-    content: "",
-    timestamp,
-    status: "done",
-    ...patch,
-  });
+  const settled = (timestamp: number, patch: Partial<Message> = {}) =>
+    message(`m${timestamp}`, { timestamp, ...patch });
   const page = (a: number, b: number, extra: Record<string, unknown> = {}) => ({
     ...workspacePage(
       Array.from({ length: b - a + 1 }, (_, k) => settled(a + k)),

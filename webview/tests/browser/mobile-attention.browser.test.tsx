@@ -1,24 +1,15 @@
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page } from "vitest/browser";
-import { App } from "../../src/App";
-import type { Project, Workspace } from "../../src/state/useServer";
-import { FakeSocket } from "../fakeSocket";
+import type { Workspace } from "../../src/state/useServer";
+import { FakeSocket, initFrame } from "../fakeSocket";
+import { mountFixedApp } from "../helpers/browser";
+import { project as makeProject, workspace } from "../helpers/fixtures";
 import "../../src/styles.css";
 
 const NOW = Date.now();
-const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/repo/${id}`,
-  agents: [],
-  messages: [],
-  createdAt: NOW - 5000,
-  lastMessageAt: NOW,
-  ...over,
-});
+const ws = (id: string, over: Partial<Workspace> = {}) =>
+  workspace(id, { cwd: `/repo/${id}`, createdAt: NOW - 5000, lastMessageAt: NOW, ...over });
 const active = ws("A");
 const lead = ws("lead", {
   cwd: "/repo/project",
@@ -32,14 +23,7 @@ const unread = ws("C", {
   projectLink: { projectId: "p1", role: "worker" },
   unread: 8,
 });
-const project: Project = {
-  id: "p1",
-  name: "Project",
-  root: "/repo/project",
-  leadWorkspaceId: "lead",
-  createdAt: NOW - 10_000,
-  objectives: [],
-};
+const project = makeProject("p1", { root: "/repo/project", createdAt: NOW - 10_000 });
 
 let session: ReturnType<typeof cdp> | null = null;
 let stopErrorCapture: (() => void) | null = null;
@@ -85,21 +69,11 @@ it("keeps the mobile attention count through reading, peeking and resolving at 3
   FakeSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeSocket);
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  render(<App />, { container: root });
+  mountFixedApp();
   const sock = FakeSocket.instances.at(-1)!;
   act(() => {
     sock.open();
-    sock.receive({
-      type: "init",
-      workspaces: [active, lead, waiting, unread],
-      projects: [project],
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-    });
+    sock.receive(initFrame([active, lead, waiting, unread], { projects: [project] }));
   });
   const receive = (frame: unknown) => act(() => sock.receive(frame));
   const get = <T extends HTMLElement = HTMLElement>(selector: string) =>

@@ -2,48 +2,19 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { App } from "../../src/App";
 import { loadMath, MdBlock } from "../../src/chat/markdown";
 import { MessageItem } from "../../src/chat/messages";
-import type { AgentInfo, Message } from "../../src/state/useServer";
-import { FakeSocket } from "../fakeSocket";
+import type { Message } from "../../src/state/useServer";
+import { FakeSocket, initFrame, messagePage } from "../fakeSocket";
+import { mountFixedApp, nextPaint as painted } from "../helpers/browser";
+import { agent as makeAgent, workspace } from "../helpers/fixtures";
+import { paintedContrast } from "../helpers/contrast";
 import "../../src/styles.css";
 
-const agent: AgentInfo = {
-  id: "a1",
-  name: "Alice",
-  model: "claude-opus-5-5",
-  avatar: "A",
-  color: "#528bff",
-  isDefault: true,
-};
+const agent = makeAgent("a1", { name: "Alice", color: "#528bff" });
 
-function luminance(channels: Uint8ClampedArray): number {
-  const [r, g, b] = Array.from(channels.slice(0, 3), (byte) => {
-    const c = byte / 255;
-    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-  });
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
-function contrastOf(foreground: string, backgrounds: string[]): number {
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = 1;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-  const paint = (layers: string[]) => {
-    ctx.clearRect(0, 0, 1, 1);
-    for (const color of layers) {
-      ctx.fillStyle = color;
-      ctx.fillRect(0, 0, 1, 1);
-    }
-    const pixel = ctx.getImageData(0, 0, 1, 1).data;
-    expect(pixel[3], layers.join(" + ")).toBe(255);
-    return luminance(pixel);
-  };
-  const bg = paint(backgrounds);
-  const fg = paint([...backgrounds, foreground]);
-  return (Math.max(bg, fg) + 0.05) / (Math.min(bg, fg) + 0.05);
-}
+const contrastOf = (foreground: string, backgrounds: string[]) =>
+  paintedContrast(foreground, backgrounds, { opaque: true });
 
 function resolveColor(value: string): string {
   const probe = document.createElement("span");
@@ -62,11 +33,6 @@ function resolveShadow(value: string): string {
   probe.remove();
   return resolved;
 }
-
-const painted = () =>
-  new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
 
 afterEach(() => {
   cleanup();
@@ -306,11 +272,8 @@ it.each(["light", "dark"])(
     await page.viewport(1280, 620);
     vi.stubGlobal("WebSocket", FakeSocket);
     localStorage.setItem("activeWsId", "w");
-    const root = document.createElement("div");
-    root.id = "root";
-    root.style.cssText = "position:fixed; inset:0; height:100dvh";
-    document.body.append(root);
-    const view = render(<App />, { container: root });
+    const view = mountFixedApp();
+    const root = view.container;
     const sock = FakeSocket.instances.at(-1)!;
     const history: Message[] = Array.from({ length: 24 }, (_, i) => ({
       id: `m-${i}`,
@@ -322,30 +285,8 @@ it.each(["light", "dark"])(
     }));
     act(() => {
       sock.open();
-      sock.receive({
-        type: "init",
-        workspaces: [
-          {
-            id: "w",
-            name: "Chat",
-            project: "repo",
-            cwd: "/repo",
-            hostId: "local",
-            agents: [agent],
-            messages: [],
-            createdAt: 1,
-          },
-        ],
-        config: { presets: [], models: [], commands: [], hosts: {} },
-        hosts: [],
-      });
-      sock.receive({
-        type: "workspace_messages",
-        workspaceId: "w",
-        before: null,
-        hasMore: false,
-        messages: history,
-      });
+      sock.receive(initFrame([workspace("w", { name: "Chat", agents: [agent] })]));
+      sock.receive(messagePage("w", history, { before: null, hasMore: false }));
     });
     await painted();
 

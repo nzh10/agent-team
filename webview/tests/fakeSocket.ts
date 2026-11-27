@@ -1,3 +1,19 @@
+import type { Message, Workspace } from "../src/state/useServer";
+
+export const initFrame = (workspaces: Workspace[], fields: Record<string, unknown> = {}) => ({
+  type: "init",
+  workspaces,
+  config: { presets: [], models: [], commands: [], hosts: {} },
+  hosts: [],
+  ...fields,
+});
+
+export const messagePage = (
+  workspaceId: string,
+  messages: Message[],
+  paging: { before?: number | null; hasMore?: boolean } = {},
+) => ({ type: "workspace_messages", workspaceId, messages, ...paging });
+
 // Minimal WebSocket stand-in: the test opens it, feeds frames, and watches
 // what the hook sends. Never closes on its own, like a socket whose peer
 // vanished without a FIN.

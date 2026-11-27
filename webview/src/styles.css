@@ -406,7 +406,6 @@ button {
   opacity: 1;
 }
 .sidebar-header .sidebar-push[aria-pressed="true"],
-.sidebar-header .sidebar-debug[aria-pressed="true"],
 .sidebar-header .sidebar-debug[aria-expanded="true"] {
   opacity: 1;
   color: var(--text-primary);
@@ -835,7 +834,6 @@ button {
   background: var(--bg-hover);
 }
 .ws-idle-toggle .events-toggle {
-  flex-shrink: 0;
   color: var(--text-muted);
   opacity: 0;
   transition:
@@ -1125,10 +1123,6 @@ button {
   visibility: hidden;
 }
 @media (hover: none) {
-  .task-archive,
-  .task-delete {
-    width: 20px;
-  }
   .task-item.active .task-hover {
     opacity: 1;
     pointer-events: auto;
@@ -2429,11 +2423,6 @@ span.katex-display {
 .chip-tool_result {
   color: var(--success);
   background: var(--success-soft);
-  border-color: transparent;
-}
-.chip-error {
-  color: var(--error);
-  background: var(--error-soft);
   border-color: transparent;
 }
 .chip-text {
@@ -4425,7 +4414,6 @@ button.quote-bar-content:focus-visible {
   outline-offset: -1px;
 }
 .quota-caret {
-  flex-shrink: 0;
   width: 10px;
   font-size: 10px;
   color: var(--text-muted);
@@ -4713,10 +4701,6 @@ button.quote-bar-content:focus-visible {
     width: 36px;
     height: 36px;
   }
-  .sidebar-debug-action .icon {
-    width: 14px;
-    height: 14px;
-  }
   .sidebar-header .sidebar-debug .sidebar-debug-dot,
   .sidebar-debug-action .sidebar-debug-dot {
     top: 6px;
@@ -4731,7 +4715,6 @@ button.quote-bar-content:focus-visible {
   .task-archive,
   .task-delete {
     width: 22px;
-    height: 18px;
   }
   /* The add action can enter flow on hover or when a touch group becomes
      current. Let its hit target use the header's vertical padding. */
@@ -4862,15 +4845,11 @@ button.quote-bar-content:focus-visible {
      dead band under the composer. body is already fixed + overflow:hidden, so
      relative positioning here is enough to contain .main-panel. */
   .app {
-    position: relative;
-    height: 100%;
     overflow: hidden;
   }
   .main-panel {
     position: absolute;
     inset: 0;
-    display: flex;
-    flex-direction: column;
     overflow: hidden;
   }
   .panel-header,
@@ -4878,9 +4857,7 @@ button.quote-bar-content:focus-visible {
     flex-shrink: 0;
   }
   .messages {
-    flex: 1;
     min-height: 0;
-    overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     padding: 8px 0 12px;
   }
@@ -4903,9 +4880,6 @@ button.quote-bar-content:focus-visible {
   .message-gutter .agent-avatar img {
     width: 28px !important;
     height: 28px !important;
-  }
-  .message-content {
-    font-size: 13px;
   }
   .step-group {
     padding-left: 6px;
@@ -4956,18 +4930,15 @@ button.quote-bar-content:focus-visible {
     border-top: none;
   }
   .input-row {
-    align-items: flex-end;
     border-radius: 22px;
-    padding: 4px 4px 4px 4px;
+    padding: 4px;
     gap: 4px;
-    background: var(--bg-tertiary);
     border-color: var(--border-strong);
   }
   .input-row .chat-input {
     font-size: 16px;
     padding: 10px 6px;
     min-height: 40px;
-    line-height: 20px;
   }
   .input-row .chat-input::placeholder {
     font-size: 14px;
@@ -4997,11 +4968,6 @@ button.quote-bar-content:focus-visible {
   .btn-attach {
     background: transparent !important;
     color: var(--text-secondary) !important;
-  }
-  .input-row .btn-abort {
-    width: 40px;
-    min-width: 40px;
-    height: 40px;
   }
   .stop-label {
     display: none;
@@ -6259,7 +6225,6 @@ button.from-author {
   }
   .bp-body {
     flex-direction: column;
-    position: relative;
   }
   .bp-nav {
     width: auto;
@@ -6856,7 +6821,6 @@ button.from-author {
   left: 0;
   display: flex;
   flex-shrink: 0;
-  background: var(--bg-tertiary);
   color: var(--text-muted);
   user-select: none;
 }
@@ -7462,7 +7426,6 @@ button.from-author {
   .side-panel.floating {
     position: fixed;
     top: var(--app-offset, 0px);
-    left: 0;
     right: 0;
     height: var(--app-height, 100%);
     z-index: 95;
@@ -7591,9 +7554,6 @@ button.from-author {
   }
   .dir-entry {
     padding: 11px 16px;
-  }
-  .changes .dir-entry {
-    padding-left: calc(16px + var(--depth, 0) * 14px);
   }
   .ap-model {
     min-height: 32px;

@@ -2,22 +2,9 @@ import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent, within } from "@testing-library/react";
 import { BoardPage, type SessionInfo } from "../src/project/BoardPage";
 import { layout, reach, relations, stage, matches } from "../src/project/board";
-import type { Objective, Project } from "../src/state/useServer";
-
-const o = (id: string, over: Partial<Objective> = {}): Objective => ({
-  id,
-  area: id.split("/")[0],
-  title: id,
-  goal: `goal of ${id}`,
-  status: "active",
-  priority: "normal",
-  dependsOn: [],
-  tasks: [],
-  decisions: [],
-  sessions: [],
-  updatedAt: 1_800_000_000_000,
-  ...over,
-});
+import type { Objective } from "../src/state/useServer";
+import { boardProject, boardProps, renderBoard } from "./helpers/board";
+import { objective as o } from "./helpers/fixtures";
 
 // A slice of a real board: prerequisites across areas, work in progress,
 // things put off and dropped, open and settled decisions.
@@ -53,28 +40,14 @@ const objectives: Objective[] = [
   o("foundation/paths", { title: "Canonical paths", status: "done" }),
 ];
 
-const project: Project = {
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: 0,
-  objectives: [...objectives, { id: "infra/broken", error: "Unexpected character at row 2" }],
-};
+const project = boardProject([
+  ...objectives,
+  { id: "infra/broken", error: "Unexpected character at row 2" },
+]);
 
 const sessions = new Map<string, SessionInfo>([["w1", { name: "identity", state: "working" }]]);
 
-function page(p: Project = project) {
-  const props = {
-    onClose: vi.fn(),
-    onOpenSession: vi.fn(),
-    onAskLead: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-  };
-  const utils = render(<BoardPage project={p} sessions={sessions} {...props} />);
-  return { ...utils, ...props };
-}
+const page = (p = project) => renderBoard(p, { sessions });
 
 describe("board relations", () => {
   it("know what blocks what, where each stands and how deep it sits", () => {
@@ -270,15 +243,7 @@ describe("archiving the project from its board", () => {
       createdAt: 0,
       objectives: [],
     };
-    const props = {
-      sessions: new Map(),
-      onClose: vi.fn(),
-      onOpenSession: vi.fn(),
-      onAskLead: null,
-      onRename: vi.fn(),
-      onArchive,
-      onDelete: vi.fn(),
-    };
+    const props = boardProps({ onAskLead: null, onArchive });
     const { getByText, rerender } = render(<BoardPage project={p} {...props} />);
     fireEvent.click(getByText("Archive project"));
     expect(onArchive).toHaveBeenCalledWith(true);

@@ -65,12 +65,7 @@ Horizontal rule above. 中文渲染测试：多智能体编排面板。`;
 function textDeltas(messageId: string, text: string, chunk = 24): Frame[] {
   const frames: Frame[] = [];
   for (let i = 0; i < text.length; i += chunk) {
-    frames.push({
-      type: "stream_event",
-      workspaceId: DEMO_WS_ID,
-      messageId,
-      event: { kind: "text_delta", content: text.slice(i, i + chunk) },
-    });
+    frames.push(ev(messageId, { kind: "text_delta", content: text.slice(i, i + chunk) }));
   }
   return frames;
 }

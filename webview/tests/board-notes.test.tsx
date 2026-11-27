@@ -4,51 +4,30 @@
 // resolve against it.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, fireEvent, screen, within, waitFor, act } from "@testing-library/react";
-import { BoardPage } from "../src/project/BoardPage";
 import { InlineMd, MdBlock, ProsePathContext, prosePaths } from "../src/chat/markdown";
 import { FileOpenContext } from "../src/chat/fileRef";
 import { reachable, refFrom } from "../src/project/NotesView";
 import { inVSCode } from "../src/vscode";
-import type { IssueModules, Objective, Project } from "../src/state/useServer";
+import type { IssueModules } from "../src/state/useServer";
+import { boardProject, renderBoard } from "./helpers/board";
+import { objective as o } from "./helpers/fixtures";
 
-const o = (id: string, over: Partial<Objective> = {}): Objective => ({
-  id,
-  area: id.split("/")[0],
-  title: id,
-  goal: `goal of ${id}`,
-  status: "active",
-  priority: "normal",
-  dependsOn: [],
-  tasks: [],
-  decisions: [],
-  sessions: [],
-  updatedAt: 1_800_000_000_000,
-  ...over,
-});
-
-const project: Project = {
-  id: "p1",
-  name: "clice",
-  root: "/repo/clice",
-  leadWorkspaceId: "lead",
-  createdAt: 0,
-  objectives: [
-    o("release/docs", {
-      title: "Docs truth",
-      context: "清单在 notes/release/docs-truth.md。代码见 src/server/a.cpp:12。",
-      tasks: [
-        { id: "t1", text: "规则进 notes/rules/cli.md", state: "todo" },
-        {
-          id: "t2",
-          text: "改 `src/server/a.cpp:2`，再看 sched/batch.cpp 和 notes/release/",
-          state: "todo",
-        },
-      ],
-      dependsOn: ["release/other"],
-    }),
-    o("release/other", { title: "Other, see notes/ideas.md" }),
-  ],
-};
+const project = boardProject([
+  o("release/docs", {
+    title: "Docs truth",
+    context: "清单在 notes/release/docs-truth.md。代码见 src/server/a.cpp:12。",
+    tasks: [
+      { id: "t1", text: "规则进 notes/rules/cli.md", state: "todo" },
+      {
+        id: "t2",
+        text: "改 `src/server/a.cpp:2`，再看 sched/batch.cpp 和 notes/release/",
+        state: "todo",
+      },
+    ],
+    dependsOn: ["release/other"],
+  }),
+  o("release/other", { title: "Other, see notes/ideas.md" }),
+]);
 
 // The server's files, as api/file answers for project p1.
 const FILES: Record<string, unknown> = {
@@ -180,14 +159,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 function board(ua?: string, issues?: IssueModules) {
   if (ua) vi.stubGlobal("navigator", { ...navigator, userAgent: ua });
-  const props = {
-    onClose: vi.fn(),
-    onOpenSession: vi.fn(),
-    onAskLead: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-  };
-  return render(<BoardPage project={project} issues={issues} sessions={new Map()} {...props} />);
+  return renderBoard(project, { issues });
 }
 const objective = (container: HTMLElement) => {
   fireEvent.click(container.querySelector('[data-objective="release/docs"]')!);
@@ -292,8 +264,7 @@ describe("paths in prose", () => {
 describe("the notes view", () => {
   it("opens a path an objective names on the board, a line of code marked", async () => {
     const { container } = board();
-    fireEvent.click(container.querySelector('[data-objective="release/docs"]')!);
-    const detail = screen.getByRole("complementary", { name: "Docs truth" });
+    const detail = objective(container);
     const refs = [...detail.querySelectorAll(".file-ref")].map((e) => e.textContent);
     expect(refs).toEqual([
       "notes/release/docs-truth.md",
@@ -319,8 +290,7 @@ describe("the notes view", () => {
     expect(inVSCode(VSCODE_UA.replace("Code/", "Code - Insiders/"))).toBe(true);
     expect(inVSCode("Mozilla/5.0 (Windows NT 10.0) Chrome/138.0 Safari/537.36")).toBe(false);
     const { container } = board(VSCODE_UA);
-    fireEvent.click(container.querySelector('[data-objective="release/docs"]')!);
-    const detail = screen.getByRole("complementary", { name: "Docs truth" });
+    const detail = objective(container);
     fireEvent.click(within(detail).getByText("src/server/a.cpp:12"));
     await waitFor(() =>
       expect(opens).toEqual([{ project: "p1", path: "src/server/a.cpp", line: 12 }]),

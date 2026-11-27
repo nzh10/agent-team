@@ -1,33 +1,27 @@
-import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
-import { App } from "../../src/App";
 import { recordTelemetry } from "../../src/telemetry";
-import { FakeSocket } from "../fakeSocket";
+import { FakeSocket, initFrame } from "../fakeSocket";
+import { mountFixedApp } from "../helpers/browser";
+import { agent, workspace } from "../helpers/fixtures";
 import "../../src/styles.css";
 
 vi.mock("../../src/telemetry", { spy: true });
 
-const WORKSPACE = {
-  id: "w",
+const WORKSPACE = workspace("w", {
   name: "Composer test",
-  project: "repo",
-  cwd: "/repo",
-  hostId: "local",
-  agents: ["Alpha", "Beta"].map((name, i) => ({
-    id: name,
-    name,
-    // A limit-paused agent has the same Stop affordance as a running turn.
-    state: i === 1 ? "idle" : "working",
-    retryPending: i === 1,
-    model: "claude-opus-5-5",
-    avatar: name[0],
-    color: "#888",
-    isDefault: i === 0,
-  })),
-  messages: [],
-  createdAt: 1,
-};
+  agents: ["Alpha", "Beta"].map((name, i) =>
+    agent(name, {
+      name,
+      // A limit-paused agent has the same Stop affordance as a running turn.
+      state: i === 1 ? "idle" : "working",
+      retryPending: i === 1,
+      avatar: name[0],
+      isDefault: i === 0,
+    }),
+  ),
+});
 
 let touch = false;
 afterEach(async () => {
@@ -43,20 +37,11 @@ function boot() {
   localStorage.clear();
   FakeSocket.instances = [];
   vi.stubGlobal("WebSocket", FakeSocket);
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  render(<App />, { container: root });
+  const { container: root } = mountFixedApp();
   const sock = FakeSocket.instances.at(-1)!;
   act(() => {
     sock.open();
-    sock.receive({
-      type: "init",
-      workspaces: [WORKSPACE],
-      config: { presets: [], models: [], commands: [], hosts: {} },
-      hosts: [],
-    });
+    sock.receive(initFrame([WORKSPACE]));
   });
   const row = root.querySelector<HTMLElement>(".input-row")!;
   const composer = within(row);

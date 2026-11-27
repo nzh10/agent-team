@@ -3,9 +3,11 @@ import { render, fireEvent, act } from "@testing-library/react";
 import { EventItem, BannerItem, StepGroup, MessageItem } from "../src/chat/messages";
 import { Sidebar, SidebarProps, SystemStatusPanel } from "../src/sidebar/Sidebar";
 import { ConfirmDialog } from "../src/workspace/dialogs";
-import { StreamEvent, Message, AgentInfo, Workspace, SystemStatus } from "../src/state/useServer";
+import { StreamEvent, Message, Workspace, SystemStatus } from "../src/state/useServer";
 import { formatPiToolUse } from "../../service/src/session/pi-tool-format";
 import { applyEventsToMessage } from "../src/state/stream";
+import { agent as makeAgent, message, workspace } from "./helpers/fixtures";
+import { sidebarProps } from "./helpers/sidebar";
 
 const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
   kind,
@@ -13,14 +15,11 @@ const ev = (kind: string, over: Partial<StreamEvent> = {}): StreamEvent => ({
   ...over,
 });
 
-const agent: AgentInfo = {
-  id: "a1",
-  name: "Alice",
-  model: "claude-fable-5-1",
-  avatar: "🤖",
-  color: "#888",
-  isDefault: true,
-};
+const agent = makeAgent("a1", { name: "Alice", model: "claude-fable-5-1", avatar: "🤖" });
+const turn = (id: string, fields: Partial<Message> = {}) =>
+  message(id, { agentId: "a1", timestamp: 0, ...fields });
+const streaming = (id: string, fields: Partial<Message> = {}) =>
+  turn(id, { status: "streaming", events: [], ...fields });
 
 describe("EventItem", () => {
   it("renders a tool chip with a one-line summary for single-line tools", () => {
@@ -227,18 +226,20 @@ describe("BannerItem folding", () => {
   const long =
     "Wake up in 25m (01:23 AM) — codex migration run takes tens of minutes\n\n> Check on the background codex migration run: tail the log, check the report, and git log for new commits.";
 
-  it("folds wake-up, schedule and skill prompts to their first line until opened", () => {
+  it("shows a scheduled wake-up's label and folds its prompt until opened", () => {
     const { container, getByText } = render(
       <BannerItem ev={ev("notice", { level: "schedule", content: long })} />,
     );
+    const banner = container.querySelector(".banner")!;
+    expect(banner.className).toContain("banner-schedule");
     expect(container.querySelector(".banner-label")!.textContent).toBe("Scheduled");
     expect(container.querySelector(".banner-first-line")!.textContent).toBe(
       "Wake up in 25m (01:23 AM) — codex migration run takes tens of minutes",
     );
     expect(container.textContent).not.toContain("tail the log");
+    expect(banner.querySelector("blockquote")).toBeNull();
     fireEvent.click(getByText("more"));
-    expect(container.textContent).toContain("tail the log");
-    expect(container.querySelector("blockquote")).not.toBeNull();
+    expect(banner.querySelector("blockquote")?.textContent).toContain("tail the log");
     fireEvent.click(getByText("less"));
     expect(container.textContent).not.toContain("tail the log");
   });
@@ -286,18 +287,12 @@ describe("MessageItem retry recovery", () => {
   it.each([false, true])(
     "updates and clears the streaming retry banner (compact=%s)",
     (compact) => {
-      const streaming: Message = {
-        id: "m1",
-        kind: "agent",
-        agentId: agent.id,
-        content: "",
-        timestamp: 0,
-        status: "streaming",
+      const initial = streaming("m1", {
         events: [ev("retry", { content: "Retrying (1/3 in 2s): 529 overloaded" })],
-      };
+      });
       const view = (msg: Message) => <MessageItem msg={msg} agents={[agent]} compact={compact} />;
-      const { container, rerender } = render(view(streaming));
-      const updated = applyEventsToMessage(streaming, [
+      const { container, rerender } = render(view(initial));
+      const updated = applyEventsToMessage(initial, [
         ev("retry", { content: "Retrying (2/3 in 4s): 529 overloaded" }),
       ]);
       rerender(view(updated));
@@ -313,7 +308,7 @@ describe("MessageItem retry recovery", () => {
       expect(container.querySelector('[data-kind="retry"]')).toBeNull();
       expect(container.textContent).toContain("Recovered reply.");
 
-      rerender(view(applyEventsToMessage(streaming, [ev("error", { content: "final failure" })])));
+      rerender(view(applyEventsToMessage(initial, [ev("error", { content: "final failure" })])));
       expect(container.querySelector('[data-kind="retry"]')).toBeNull();
       expect(container.querySelectorAll('[data-kind="error"]')).toHaveLength(1);
     },
@@ -345,16 +340,7 @@ describe("StepGroup", () => {
 describe("streaming turn footer", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
-  const msg = (over: Partial<Message> = {}): Message => ({
-    id: "m1",
-    kind: "agent",
-    agentId: "a1",
-    content: "",
-    timestamp: 0,
-    status: "streaming",
-    events: [],
-    ...over,
-  });
+  const msg = (over?: Partial<Message>) => streaming("m1", over);
   const read = ev("tool_use", { toolName: "Read", content: "**Read** `a`", contentOffset: 0 });
   const footer = (c: HTMLElement) => c.querySelector(".turn-footer");
   const tick = (ms: number) =>
@@ -487,44 +473,28 @@ describe("streaming turn footer", () => {
 
 describe("Sidebar archived section", () => {
   const NOW = 1_800_000_000_000;
-  const ws = (id: string, over: Partial<Workspace> = {}): Workspace => ({
-    id,
-    name: id,
-    project: "proj",
-    hostId: "local",
-    cwd: "/repo",
-    git: null,
-    pr: null,
-    agents: [],
-    messages: [],
-    createdAt: NOW - 1000,
-    lastMessageAt: NOW - 1000,
-    ...over,
-  });
-  const base = (over: Partial<SidebarProps> = {}): SidebarProps => ({
-    workspaces: [
-      ws("live"),
-      ws("dusty", { archivedAt: NOW - 86_400_000, lastMessageAt: NOW - 20 * 86_400_000 }),
-    ],
-    activeWsId: "live",
-    connected: true,
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    now: NOW,
-    onSelect: vi.fn(),
-    onDelete: vi.fn(),
-    onToggleGroup: vi.fn(),
-    onSearchChange: vi.fn(),
-    onJump: vi.fn(),
-    onCreate: vi.fn(),
-    onCreateIn: vi.fn(),
-    onReplayDemo: vi.fn(),
-    onDebugSnapshot: vi.fn(),
-    onPurgeArchived: vi.fn(),
-    ...over,
-  });
+  const ws = (id: string, over: Partial<Workspace> = {}) =>
+    workspace(id, {
+      project: "proj",
+      git: null,
+      pr: null,
+      createdAt: NOW - 1000,
+      lastMessageAt: NOW - 1000,
+      ...over,
+    });
+  const base = (over: Partial<SidebarProps> = {}) =>
+    sidebarProps(
+      {
+        workspaces: [
+          ws("live"),
+          ws("dusty", { archivedAt: NOW - 86_400_000, lastMessageAt: NOW - 20 * 86_400_000 }),
+        ],
+        activeWsId: "live",
+        now: NOW,
+        ...over,
+      },
+      () => vi.fn(),
+    );
 
   it("folds archived workspaces into a collapsed section, its count and Clear inside", () => {
     const props = base();
@@ -666,40 +636,22 @@ describe("StepGroup summary", () => {
 describe("Sidebar group quick-create", () => {
   it("offers a + on each folder group that creates in that folder without toggling it", () => {
     const NOW = 1_800_000_000_000;
-    const props: SidebarProps = {
-      workspaces: [
-        {
-          id: "w",
-          name: "w",
-          project: "repo",
-          hostId: "local",
-          cwd: "/home/me/repo",
-          git: null,
-          pr: null,
-          agents: [],
-          messages: [],
-          createdAt: NOW - 1000,
-          lastMessageAt: NOW - 1000,
-        },
-      ],
-      activeWsId: "w",
-      connected: true,
-      groupOverrides: {},
-      searchQuery: "",
-      searchHits: null,
-      systemStatus: null,
-      now: NOW,
-      onSelect: vi.fn(),
-      onDelete: vi.fn(),
-      onToggleGroup: vi.fn(),
-      onSearchChange: vi.fn(),
-      onJump: vi.fn(),
-      onCreate: vi.fn(),
-      onCreateIn: vi.fn(),
-      onReplayDemo: vi.fn(),
-      onDebugSnapshot: vi.fn(),
-      onPurgeArchived: vi.fn(),
-    };
+    const props = sidebarProps(
+      {
+        workspaces: [
+          workspace("w", {
+            cwd: "/home/me/repo",
+            git: null,
+            pr: null,
+            createdAt: NOW - 1000,
+            lastMessageAt: NOW - 1000,
+          }),
+        ],
+        activeWsId: "w",
+        now: NOW,
+      },
+      () => vi.fn(),
+    );
     const { getByTitle } = render(<Sidebar {...props} />);
     fireEvent.click(getByTitle("New workspace in /home/me/repo"));
     expect(props.onCreateIn).toHaveBeenCalledWith("/home/me/repo");
@@ -730,15 +682,7 @@ describe("CreateWorkspaceDialog initial path", () => {
 });
 
 describe("message status row and timestamps", () => {
-  const base: Message = {
-    id: "m",
-    kind: "agent",
-    agentId: "a1",
-    content: "done",
-    timestamp: Date.UTC(2026, 0, 1, 10, 30),
-    status: "done",
-    events: [],
-  };
+  const base = turn("m", { content: "done", timestamp: Date.UTC(2026, 0, 1, 10, 30), events: [] });
 
   it("shows effort and context occupancy under the header, colored by pressure", () => {
     const { container, rerender } = render(
@@ -840,27 +784,6 @@ describe("scheduled wake-ups", () => {
   });
 });
 
-describe("scheduled banner", () => {
-  it("renders the schedule with its label and the planned prompt", () => {
-    const { container } = render(
-      <BannerItem
-        ev={ev("notice", {
-          level: "schedule",
-          content: "Wake up in 8m (02:10) — watching CI\n\n> check CI",
-        })}
-      />,
-    );
-    const el = container.querySelector(".banner")!;
-    expect(el.className).toContain("banner-schedule");
-    expect(el.querySelector(".banner-label")!.textContent).toBe("Scheduled");
-    expect(el.textContent).toContain("Wake up in 8m");
-    // The planned prompt is behind the fold.
-    expect(el.querySelector("blockquote")).toBeNull();
-    fireEvent.click(el.querySelector(".banner-toggle")!);
-    expect(el.querySelector("blockquote")!.textContent).toContain("check CI");
-  });
-});
-
 describe("GitBar", () => {
   it("shows branch with dirty/ahead/behind badges and a PR card with state and checks", async () => {
     const { GitBar } = await import("../src/workspace/GitBar");
@@ -935,16 +858,10 @@ describe("summary pages and lazy details", () => {
 
   it("requests details when a step group of a summarised message is opened", () => {
     const onLoadDetails = vi.fn();
-    const msg: Message = {
-      id: "m1",
-      kind: "agent",
-      agentId: "a1",
-      content: "",
-      timestamp: 0,
-      status: "done",
+    const msg = turn("m1", {
       detail: "summary",
       events: [ev("thinking", { content: "", contentLength: 10 })],
-    };
+    });
     const { container } = render(
       <MessageItem msg={msg} agents={[agent]} onLoadDetails={onLoadDetails} />,
     );
@@ -954,15 +871,7 @@ describe("summary pages and lazy details", () => {
 
   it("does not request details once the message is full", () => {
     const onLoadDetails = vi.fn();
-    const msg: Message = {
-      id: "m1",
-      kind: "agent",
-      agentId: "a1",
-      content: "",
-      timestamp: 0,
-      status: "done",
-      events: [ev("thinking", { content: "body" })],
-    };
+    const msg = turn("m1", { events: [ev("thinking", { content: "body" })] });
     const { container } = render(
       <MessageItem msg={msg} agents={[agent]} onLoadDetails={onLoadDetails} />,
     );
@@ -990,16 +899,7 @@ describe("HistoryHint", () => {
 describe("live thinking", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
-  const live = (over: Partial<Message> = {}): Message => ({
-    id: "m",
-    kind: "agent",
-    agentId: "a1",
-    content: "",
-    timestamp: 0,
-    status: "streaming",
-    events: [],
-    ...over,
-  });
+  const live = (over?: Partial<Message>) => streaming("m", over);
 
   it.each(["", "\n  "])(
     "does not offer controls or an empty body for %j live thinking",

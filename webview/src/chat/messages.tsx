@@ -1547,20 +1547,18 @@ export const MessageItem = memo(function MessageItem({
     const offsetOf = (e: StreamEvent): number => resolved.get(e) ?? 0;
     const uniqueOffsets = [...new Set(detailEvents.map(offsetOf))].sort((a, b) => a - b);
 
-    if (uniqueOffsets.length > 0) {
-      let prevOff = 0;
-      for (const off of uniqueOffsets) {
-        const text = body.substring(prevOff, off).trim();
-        const evtsAtOff = detailEvents.filter((e) => offsetOf(e) === off);
-        segments.push({ text, events: evtsAtOff });
-        prevOff = off;
-      }
-      const trailing = body.substring(prevOff).trim();
-      if (trailing || streaming) {
-        segments.push({ text: trailing, events: [] });
-      }
-      joinsLastEvents = body.length === prevOff;
+    let prevOff = 0;
+    for (const off of uniqueOffsets) {
+      const text = body.substring(prevOff, off).trim();
+      const evtsAtOff = detailEvents.filter((e) => offsetOf(e) === off);
+      segments.push({ text, events: evtsAtOff });
+      prevOff = off;
     }
+    const trailing = body.substring(prevOff).trim();
+    if (trailing || streaming) {
+      segments.push({ text: trailing, events: [] });
+    }
+    joinsLastEvents = body.length === prevOff;
   }
 
   let tailAt = -1;

@@ -2,54 +2,18 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { ICONS } from "../src/panels/Icon";
 import { Sidebar, type SidebarProps } from "../src/sidebar/Sidebar";
+import { deferred } from "./helpers/deferred";
+import { workspace } from "./helpers/fixtures";
+import { healthResponse, sidebarProps, stubHealth } from "./helpers/sidebar";
 
 const TRIGGER = "Debug tools";
 const SNAPSHOT = "Capture debug snapshot";
 const DEMO = "Replay demo";
 const TEST_PUSH = "Send test push";
 
-function healthResponse(issues: object[] = []) {
-  return { ok: true, json: () => Promise.resolve({ issues }) };
-}
-
-function stubHealth(issues: object[] = []) {
-  const fetch = vi.fn(() => Promise.resolve(healthResponse(issues)));
-  vi.stubGlobal("fetch", fetch);
-  return fetch;
-}
-
-function deferred() {
-  let resolve!: () => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<void>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 function sidebar(connected = true, over: Partial<SidebarProps> = {}) {
   const noop = vi.fn();
-  const props: SidebarProps = {
-    connected,
-    activeWsId: null,
-    workspaces: [],
-    groupOverrides: {},
-    searchQuery: "",
-    searchHits: null,
-    systemStatus: null,
-    onSelect: noop,
-    onDelete: noop,
-    onToggleGroup: noop,
-    onSearchChange: noop,
-    onJump: noop,
-    onCreate: noop,
-    onCreateIn: noop,
-    onReplayDemo: noop,
-    onDebugSnapshot: noop,
-    onPurgeArchived: noop,
-    ...over,
-  };
+  const props = sidebarProps({ connected, ...over }, () => noop);
   const view = render(<Sidebar {...props} />);
   return { ...view, props };
 }
@@ -411,20 +375,7 @@ it("keeps the strip open on outside clicks, workspace actions, and desktop Demo 
     onDebugSnapshot,
     onReplayDemo,
     onCreateIn,
-    workspaces: [
-      {
-        id: "w",
-        name: "w",
-        hostId: "local",
-        project: "repo",
-        cwd: "/repo",
-        agents: [],
-        messages: [],
-        createdAt: 1,
-        git: null,
-        pr: null,
-      },
-    ],
+    workspaces: [workspace("w", { git: null, pr: null })],
   });
   await act(async () => {});
 

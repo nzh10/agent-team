@@ -140,6 +140,25 @@ describe("installMacCtrlClipboard", () => {
     return e;
   };
 
+  const textarea = (value = "") => {
+    const field = document.body.appendChild(document.createElement("textarea"));
+    field.value = value;
+    return field;
+  };
+  const focusedSelection = (value: string, start: number, end: number) => {
+    const field = textarea(value);
+    field.focus();
+    field.setSelectionRange(start, end);
+    return field;
+  };
+  const installMac = (target: HTMLTextAreaElement | null, ua?: string) =>
+    installMacCtrlClipboard(
+      () => target,
+      () => {},
+      "MacIntel",
+      ua,
+    )!;
+
   it("is a no-op off macOS", () => {
     expect(
       installMacCtrlClipboard(
@@ -153,17 +172,8 @@ describe("installMacCtrlClipboard", () => {
   it("copies via execCommand on Ctrl+C with a textarea selection", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    ta.value = "hello";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.setSelectionRange(0, 5);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-    )!;
+    const ta = focusedSelection("hello", 0, 5);
+    const cleanup = installMac(ta);
     const e = press("c", { ctrlKey: true });
     expect(exec).toHaveBeenCalledWith("copy");
     expect(e.defaultPrevented).toBe(true);
@@ -173,19 +183,9 @@ describe("installMacCtrlClipboard", () => {
   it("copies via execCommand on Cmd+C before a child can stop propagation", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    ta.value = "hello";
+    const ta = focusedSelection("hello", 0, 5);
     ta.addEventListener("keydown", (e) => e.stopPropagation());
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.setSelectionRange(0, 5);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(ta, VSCODE_UA);
     const e = press("c", { metaKey: true }, ta);
     expect(exec).toHaveBeenCalledWith("copy");
     expect(e.defaultPrevented).toBe(true);
@@ -193,17 +193,8 @@ describe("installMacCtrlClipboard", () => {
   });
 
   it("selects all textarea text on Ctrl+A", () => {
-    const ta = document.createElement("textarea");
-    ta.value = "select all of this";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.setSelectionRange(4, 8);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-    )!;
+    const ta = focusedSelection("select all of this", 4, 8);
+    const cleanup = installMac(ta);
     const e = press("a", { ctrlKey: true });
     expect(ta.selectionStart).toBe(0);
     expect(ta.selectionEnd).toBe(ta.value.length);
@@ -215,12 +206,7 @@ describe("installMacCtrlClipboard", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
 
-    const cleanup = installMacCtrlClipboard(
-      () => null,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(null, VSCODE_UA);
     const e = press("a", { metaKey: true });
     expect(exec).toHaveBeenCalledWith("selectAll");
     expect(e.defaultPrevented).toBe(true);
@@ -230,16 +216,9 @@ describe("installMacCtrlClipboard", () => {
   it("undoes and redoes in a focused textarea on Cmd+Z and Cmd+Shift+Z, Ctrl too", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    document.body.appendChild(ta);
+    const ta = textarea();
     ta.focus();
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(ta, VSCODE_UA);
     expect(press("z", { metaKey: true }).defaultPrevented).toBe(true);
     expect(press("Z", { metaKey: true, shiftKey: true }).defaultPrevented).toBe(true);
     expect(press("Z", { ctrlKey: true, shiftKey: true }).defaultPrevented).toBe(true);
@@ -252,12 +231,7 @@ describe("installMacCtrlClipboard", () => {
   it("leaves undo to the page outside a text field", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const cleanup = installMacCtrlClipboard(
-      () => null,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(null, VSCODE_UA);
     expect(press("z", { metaKey: true }).defaultPrevented).toBe(false);
     expect(exec).not.toHaveBeenCalled();
     cleanup();
@@ -266,11 +240,7 @@ describe("installMacCtrlClipboard", () => {
   it("leaves clipboard shortcuts alone without a selection or with mixed modifiers", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const cleanup = installMacCtrlClipboard(
-      () => null,
-      () => {},
-      "MacIntel",
-    )!;
+    const cleanup = installMac(null);
 
     expect(press("c", { ctrlKey: true }).defaultPrevented).toBe(false);
     expect(press("c", { ctrlKey: true, metaKey: true }).defaultPrevented).toBe(false);
@@ -281,15 +251,8 @@ describe("installMacCtrlClipboard", () => {
   it("pastes synchronously on Cmd+V when the webview host supports execCommand", () => {
     const exec = vi.fn((command: string) => command === "paste");
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    document.body.appendChild(ta);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const ta = textarea();
+    const cleanup = installMac(ta, VSCODE_UA);
     const e = press("v", { metaKey: true });
     expect(ta).toBe(document.activeElement);
     expect(exec).toHaveBeenCalledWith("paste");
@@ -304,16 +267,9 @@ describe("installMacCtrlClipboard", () => {
       clipboard: { readText: () => Promise.resolve("pasted") },
     });
     document.execCommand = vi.fn(() => false);
-    const ta = document.createElement("textarea");
-    document.body.appendChild(ta);
+    const ta = textarea();
     ta.focus();
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(ta, VSCODE_UA);
     expect(press("v", { metaKey: true }).defaultPrevented).toBe(true);
     await vi.waitFor(() => expect(ta.value).toBe("pasted"));
     cleanup();
@@ -324,17 +280,8 @@ describe("installMacCtrlClipboard", () => {
     vi.stubGlobal("navigator", { ...navigator, platform: "MacIntel", clipboard: { readText } });
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    ta.value = "hello";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.setSelectionRange(0, 5);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-    )!;
+    const ta = focusedSelection("hello", 0, 5);
+    const cleanup = installMac(ta);
     for (const key of ["c", "x", "v", "a", "z"]) {
       expect(press(key, { metaKey: true }).defaultPrevented).toBe(false);
     }
@@ -348,16 +295,9 @@ describe("installMacCtrlClipboard", () => {
   it("leaves the keys alone while an input method composes", () => {
     const exec = vi.fn(() => true);
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    document.body.appendChild(ta);
+    const ta = textarea();
     ta.focus();
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-      VSCODE_UA,
-    )!;
+    const cleanup = installMac(ta, VSCODE_UA);
     expect(press("z", { metaKey: true, isComposing: true }).defaultPrevented).toBe(false);
     expect(press("a", { metaKey: true, isComposing: true }).defaultPrevented).toBe(false);
     expect(exec).not.toHaveBeenCalled();
@@ -372,14 +312,8 @@ describe("installMacCtrlClipboard", () => {
     });
     const exec = vi.fn(() => false); // force the setRangeText fallback
     document.execCommand = exec;
-    const ta = document.createElement("textarea");
-    document.body.appendChild(ta);
-
-    const cleanup = installMacCtrlClipboard(
-      () => ta,
-      () => {},
-      "MacIntel",
-    )!;
+    const ta = textarea();
+    const cleanup = installMac(ta);
     const e = press("v", { ctrlKey: true });
     expect(exec).toHaveBeenCalledWith("paste");
     expect(e.defaultPrevented).toBe(true);
@@ -389,11 +323,7 @@ describe("installMacCtrlClipboard", () => {
 
   it("does not hijack Ctrl+V when the async clipboard API is unavailable", () => {
     vi.stubGlobal("navigator", { ...navigator, clipboard: undefined });
-    const cleanup = installMacCtrlClipboard(
-      () => null,
-      () => {},
-      "MacIntel",
-    )!;
+    const cleanup = installMac(null);
     expect(press("v", { ctrlKey: true }).defaultPrevented).toBe(false);
     cleanup();
   });

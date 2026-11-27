@@ -1,82 +1,51 @@
-import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { page, cdp, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { App } from "../../src/App";
 import { FOLDED_IDLE_STORAGE_KEY } from "../../src/sidebar/Sidebar";
 import { collectSnapshot, SNAPSHOT_SELECTORS } from "../../src/dev/debugSnapshot";
-import type { AgentInfo, Message, Project, Workspace } from "../../src/state/useServer";
-import { FakeSocket } from "../fakeSocket";
+import type { Message, Project, Workspace } from "../../src/state/useServer";
+import { FakeSocket, messagePage } from "../fakeSocket";
+import {
+  mountFixedApp,
+  nextPaint as painted,
+  rowOffset,
+  scrollGap,
+  scrollTo,
+  themedViewport,
+} from "../helpers/browser";
+import {
+  agent as makeAgent,
+  message,
+  project as makeProject,
+  workspace as makeWorkspace,
+} from "../helpers/fixtures";
+import { paintedContrast as contrastOf } from "../helpers/contrast";
 import "../../src/styles.css";
 
 const NOW = 1_800_000_000_000;
-const agent: AgentInfo = {
-  id: "agent",
-  name: "Agent",
-  model: "model",
-  avatar: "A",
-  color: "#888",
-  isDefault: true,
-};
-const project: Project = {
-  id: "proj",
-  name: "Project",
-  root: "/repo",
-  createdAt: NOW,
-  leadWorkspaceId: "lead",
-  objectives: [],
-};
-function workspace(id: string, order: number, fields: Partial<Workspace> = {}): Workspace {
-  return {
-    id,
-    name: id,
-    project: "repo",
-    hostId: "local",
-    cwd: "/repo",
+const agent = makeAgent("agent", { model: "model" });
+const project = makeProject("proj", { createdAt: NOW });
+const workspace = (id: string, order: number, fields: Partial<Workspace> = {}) =>
+  makeWorkspace(id, {
     agents: [agent],
-    messages: [],
     createdAt: NOW + order,
     projectLink: { projectId: project.id, role: id === "lead" ? "lead" : "worker" },
     ...fields,
-  };
-}
+  });
 const lead = workspace("lead", 0);
 const a = workspace("A", 1);
 const b = workspace("B", 2);
 const config = { presets: [], models: [], commands: [], hosts: {} };
-const frame = (n: number, over: Partial<Message> = {}): Message => ({
-  id: `m${n}`,
-  kind: "agent",
-  agentId: agent.id,
-  status: "done",
-  timestamp: NOW + n,
-  content: `Reply ${n}\n\n${"The transcript is long enough to read in the middle. ".repeat(10)}`,
-  ...over,
-});
+const frame = (n: number, over: Partial<Message> = {}) =>
+  message(`m${n}`, {
+    agentId: agent.id,
+    timestamp: NOW + n,
+    content: `Reply ${n}\n\n${"The transcript is long enough to read in the middle. ".repeat(10)}`,
+    ...over,
+  });
 const get = <T extends HTMLElement = HTMLElement>(selector: string) =>
   document.querySelector<T>(selector)!;
-const contrastOf = (foreground: string, backgrounds: string[]) => {
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = 1;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-  const luminance = () => {
-    const [r, g, b] = Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3), (byte) => {
-      const c = byte / 255;
-      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-    });
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  };
-  ctx.clearRect(0, 0, 1, 1);
-  for (const background of backgrounds) {
-    ctx.fillStyle = background;
-    ctx.fillRect(0, 0, 1, 1);
-  }
-  const a = luminance();
-  ctx.fillStyle = foreground;
-  ctx.fillRect(0, 0, 1, 1);
-  const b = luminance();
-  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
-};
 const row = (name: string) =>
   document.querySelector<HTMLElement>(`.task-item:has(.clip[title="${name}"])`);
 const order = () =>
@@ -85,7 +54,7 @@ const order = () =>
   );
 const cue = (name: string) => row(name)?.querySelector(".session-attention")?.textContent;
 const sendPage = (sock: FakeSocket, workspaceId: string, messages: Message[]) =>
-  act(() => sock.receive({ type: "workspace_messages", workspaceId, messages, hasMore: false }));
+  act(() => sock.receive(messagePage(workspaceId, messages, { hasMore: false })));
 function connect(workspaces: Workspace[], extra = {}) {
   const sock = FakeSocket.instances.at(-1)!;
   const receive = (value: object) => act(() => sock.receive(value));
@@ -96,11 +65,7 @@ function connect(workspaces: Workspace[], extra = {}) {
 function mount(active = "lead") {
   localStorage.setItem("activeWsId", active);
   vi.stubGlobal("WebSocket", FakeSocket);
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  return render(<App />, { container: root });
+  return mountFixedApp();
 }
 
 let touch = false;
@@ -123,8 +88,7 @@ it.each([
 ] as const)(
   "keeps attention, quiet waits and stable worker positions at %ipx (%s)",
   async (width, theme) => {
-    await page.viewport(width, 800);
-    document.documentElement.dataset.theme = theme;
+    await themedViewport(width, 800, theme);
     let clock = NOW;
     vi.spyOn(Date, "now").mockImplementation(() => clock);
     const asking = workspace("Asking", 1, { awaitsUser: true, unread: 1 });
@@ -334,11 +298,6 @@ it("prunes a saved fold after an authoritative empty init, not before it", async
   expect(localStorage.getItem(FOLDED_IDLE_STORAGE_KEY)).toBeNull();
 });
 
-const painted = () =>
-  new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
-
 it.each([1280, 390])(
   "keeps the transcript width fixed when an inline trace adds overflow at %ipx",
   async (width) => {
@@ -448,12 +407,10 @@ it("restores A's exact reading anchor after sending in B, without following new 
   const history = Array.from({ length: 30 }, (_, index) => frame(index));
   sendPage(sock, a.id, history);
   const scroller = () => get(".messages");
-  const offset = () =>
-    get("#msg-m10").getBoundingClientRect().top - scroller().getBoundingClientRect().top;
-  const gap = () => scroller().scrollHeight - scroller().clientHeight - scroller().scrollTop;
+  const offset = () => rowOffset(scroller(), get("#msg-m10"));
+  const gap = () => scrollGap(scroller());
   expect(gap()).toBeLessThanOrEqual(1);
-  scroller().scrollTop += offset() + 17;
-  fireEvent.scroll(scroller());
+  scrollTo(scroller(), scroller().scrollTop + offset() + 17);
   const original = offset();
   expect(original).toBeCloseTo(-17, 0);
   fireEvent.click(row("B")!);
@@ -550,7 +507,7 @@ it("hides Jump to latest while reading a tall latest message without yanking on 
   sendPage(sock, a.id, [...Array.from({ length: 8 }, (_, i) => frame(i)), tall]);
   const scroller = () => get(".messages");
   const jump = () => view.queryByRole("button", { name: /Jump to latest/ });
-  const gap = () => scroller().scrollHeight - scroller().clientHeight - scroller().scrollTop;
+  const gap = () => scrollGap(scroller());
 
   await painted();
   expect(gap()).toBeLessThanOrEqual(1);
@@ -558,9 +515,7 @@ it("hides Jump to latest while reading a tall latest message without yanking on 
   // Scroll up > 150px inside the tall latest message so auto-follow disengages,
   // while keeping the top/middle of the latest message inside the viewport.
   const tallEl = get("#msg-m10");
-  scroller().scrollTop +=
-    tallEl.getBoundingClientRect().top - scroller().getBoundingClientRect().top + 120;
-  fireEvent.scroll(scroller());
+  scrollTo(scroller(), scroller().scrollTop + rowOffset(scroller(), tallEl) + 120);
   await painted();
 
   expect(gap()).toBeGreaterThan(150);
@@ -602,13 +557,11 @@ it("shows Jump to latest immediately when a new message arrives below a tall mes
   sendPage(sock, a.id, [frame(0), tall]);
   const scroller = () => get(".messages");
   const jump = () => view.queryByRole("button", { name: /Jump to latest/ });
-  const gap = () => scroller().scrollHeight - scroller().clientHeight - scroller().scrollTop;
+  const gap = () => scrollGap(scroller());
 
   await painted();
   const tallEl = get("#msg-m10");
-  scroller().scrollTop +=
-    tallEl.getBoundingClientRect().top - scroller().getBoundingClientRect().top + 80;
-  fireEvent.scroll(scroller());
+  scrollTo(scroller(), scroller().scrollTop + rowOffset(scroller(), tallEl) + 80);
   await painted();
 
   expect(gap()).toBeGreaterThan(150);
@@ -644,12 +597,11 @@ it("toggles Jump to latest when scrolling above a tall latest message and back i
   sendPage(sock, a.id, [...history, tall]);
   const scroller = () => get(".messages");
   const jump = () => view.queryByRole("button", { name: /Jump to latest/ });
-  const gap = () => scroller().scrollHeight - scroller().clientHeight - scroller().scrollTop;
+  const gap = () => scrollGap(scroller());
 
   await painted();
   // Scroll up into older history so the latest message is completely below the viewport.
-  scroller().scrollTop = 0;
-  fireEvent.scroll(scroller());
+  scrollTo(scroller(), 0);
   await expect.poll(jump).not.toBeNull();
   expect(get("#msg-m12").getBoundingClientRect().top).toBeGreaterThanOrEqual(
     scroller().getBoundingClientRect().bottom,
@@ -984,30 +936,16 @@ it.each(["light", "dark"] as const)(
       expect(getComputedStyle(dot).opacity).toBe("1");
     };
 
-    const workingProj: Project = {
-      id: "proj-work",
-      name: "WorkingProj",
-      root: "/repo/work",
-      createdAt: NOW + 5,
-      leadWorkspaceId: "work-lead",
-      objectives: [],
-    };
-    const waitingProj: Project = {
-      id: "proj-wait",
-      name: "WaitingProj",
-      root: "/repo/wait",
-      createdAt: NOW + 10,
-      leadWorkspaceId: "wait-lead",
-      objectives: [],
-    };
-    const sleepingProj: Project = {
-      id: "proj-sleep",
-      name: "SleepingProj",
-      root: "/repo/sleep",
-      createdAt: NOW + 20,
-      leadWorkspaceId: "sleep-lead",
-      objectives: [],
-    };
+    const stateProject = (state: string, title: string, offset: number) =>
+      makeProject(`proj-${state}`, {
+        name: `${title}Proj`,
+        root: `/repo/${state}`,
+        createdAt: NOW + offset,
+        leadWorkspaceId: `${state}-lead`,
+      });
+    const workingProj = stateProject("work", "Working", 5);
+    const waitingProj = stateProject("wait", "Waiting", 10);
+    const sleepingProj = stateProject("sleep", "Sleeping", 20);
 
     const busyWithCue = workspace("BusyCue", 1, {
       awaitsUser: true,

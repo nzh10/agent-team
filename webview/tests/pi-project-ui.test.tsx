@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, renderHook } from "@testing-library/react";
 import { App } from "../src/App";
 import { MessageItem, StepGroup } from "../src/chat/messages";
-import { BoardPage } from "../src/project/BoardPage";
 import { reachable } from "../src/project/NotesView";
 import {
   useServer,
@@ -10,7 +9,6 @@ import {
   type CommandInfo,
   type Message,
   type ModelOption,
-  type Project,
   type UiDialogMethod,
   type UiDialogRequest,
   type Workspace,
@@ -19,28 +17,25 @@ import { CreateProjectDialog } from "../src/workspace/dialogs";
 import { UiDialogModal } from "../src/workspace/UiDialogModal";
 import { QuotaPanel } from "../src/sidebar/QuotaPanel";
 import { QUOTA_STALE_AFTER } from "../../shared/quota";
-import { FakeSocket } from "./fakeSocket";
+import { FakeSocket, initFrame as makeInit, messagePage } from "./fakeSocket";
+import { renderBoard } from "./helpers/board";
+import {
+  agent as makeAgent,
+  message,
+  project as makeProject,
+  workspace as makeWorkspace,
+} from "./helpers/fixtures";
+import { stubAppSocket } from "./helpers/projectApp";
 
 const NOW = 1_800_000_000_000;
-const agent: AgentInfo = {
-  id: "a1",
+const agent = makeAgent("a1", {
   name: "Alice",
   model: "pi/model-one",
-  avatar: "A",
   color: "#fff",
-  isDefault: true,
   effortLevels: ["low", "high"],
-};
-const workspace = (id: string, agents: AgentInfo[] = [agent]): Workspace => ({
-  id,
-  name: id,
-  project: "repo",
-  hostId: "local",
-  cwd: `/${id}`,
-  agents,
-  messages: [],
-  createdAt: NOW,
 });
+const workspace = (id: string, agents: AgentInfo[] = [agent]) =>
+  makeWorkspace(id, { cwd: `/${id}`, agents, createdAt: NOW });
 const command = (name: string, source: CommandInfo["source"] = "pi"): CommandInfo => ({
   name,
   description: `${name} description`,
@@ -65,18 +60,8 @@ function receive(sock: FakeSocket, frame: unknown) {
   act(() => sock.receive(frame));
 }
 
-function initFrame(
-  workspaces: Workspace[] = [workspace("w1")],
-  over: Record<string, unknown> = {},
-) {
-  return {
-    type: "init",
-    workspaces,
-    config: { presets: [], models: [], commands: [], hosts: {} },
-    hosts: [],
-    ...over,
-  };
-}
+const initFrame = (workspaces: Workspace[] = [workspace("w1")], fields?: Record<string, unknown>) =>
+  makeInit(workspaces, fields);
 
 it("hydrates sidebar quota on init and reconnect, refreshes without a turn and expands inline details", () => {
   const app = render(<App />);
@@ -347,19 +332,7 @@ it("deduplicates short names, prioritizes top-2 windows, and shows threshold ton
   const names = [...view.container.querySelectorAll(".quota-name")].map((el) => el.textContent);
   expect(names).toEqual(["Codex · Pi", "Codex · native"]);
 });
-let localStore: Map<string, string>;
-beforeEach(() => {
-  FakeSocket.instances = [];
-  vi.stubGlobal("WebSocket", FakeSocket);
-  localStore = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (key: string) => localStore.get(key) ?? null,
-    setItem: (key: string, value: string) => void localStore.set(key, String(value)),
-    removeItem: (key: string) => void localStore.delete(key),
-    clear: () => localStore.clear(),
-  });
-  Element.prototype.scrollIntoView = vi.fn();
-});
+beforeEach(stubAppSocket);
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -745,8 +718,7 @@ describe("Project v2", () => {
   });
 
   it("renders root:null sealed projects read-only without assuming a repository", () => {
-    const project: Project = {
-      id: "p1",
+    const project = makeProject("p1", {
       name: "Research",
       root: null,
       leadWorkspaceId: "w1",
@@ -756,21 +728,8 @@ describe("Project v2", () => {
       status: "sealed",
       sealedAt: NOW,
       sealedReason: "complete",
-      objectives: [],
-    };
-    const view = render(
-      <BoardPage
-        project={project}
-        sessions={new Map()}
-        onClose={() => {}}
-        onOpenSession={() => {}}
-        onAskLead={() => {}}
-        onRename={() => {}}
-        onArchive={() => {}}
-        onSeal={() => {}}
-        onDelete={() => {}}
-      />,
-    );
+    });
+    const view = renderBoard(project, { onArchive: vi.fn(), onSeal: vi.fn() });
     expect(view.getByText("Sealed · read-only")).toBeTruthy();
     expect(view.queryByRole("button", { name: "Delete project" })).toBeNull();
     expect(view.queryByRole("button", { name: "Seal project" })).toBeNull();
@@ -781,15 +740,13 @@ describe("Project v2", () => {
   });
 
   it("keeps a sealed project's chat history visible while disabling its composer", () => {
-    const project: Project = {
-      id: "p1",
+    const project = makeProject("p1", {
       name: "Research",
       root: null,
       leadWorkspaceId: "w1",
       createdAt: NOW,
       status: "sealed",
-      objectives: [],
-    };
+    });
     const lead = {
       ...workspace("w1"),
       projectLink: { projectId: "p1", role: "lead" as const },
@@ -825,21 +782,18 @@ describe("stream and message rendering", () => {
       content: "start Alice",
       queuedFor: agent.id,
     };
-    const reply: Message = {
-      id: "reply",
-      kind: "agent",
+    const reply = message("reply", {
       agentId: target.id,
-      content: "",
       timestamp: NOW + 1,
       status: "streaming",
       replyTo: first.id,
-    };
+    });
     const mount = (messages: Message[], agents = ws.agents) => {
       const view = render(<App />);
       const sock = FakeSocket.instances.at(-1)!;
       act(() => sock.open());
       receive(sock, initFrame([{ ...ws, agents }]));
-      receive(sock, { type: "workspace_messages", workspaceId: ws.id, messages, hasMore: false });
+      receive(sock, messagePage(ws.id, messages, { hasMore: false }));
       const rows = () => [...view.container.querySelectorAll(".message-starting")];
       return { view, sock, rows };
     };

@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
 import { Sidebar, type SidebarProps } from "../../src/sidebar/Sidebar";
+import { sidebarProps, stubHealth as healthyProbe } from "../helpers/sidebar";
 import "../../src/styles.css";
 
 const TRIGGER = "Debug tools";
@@ -20,33 +21,10 @@ const get = <T extends Element = HTMLElement>(root: ParentNode, selector: string
   return element!;
 };
 
-const props: SidebarProps = {
-  workspaces: [],
-  activeWsId: null,
-  connected: true,
-  groupOverrides: {},
-  searchQuery: "",
-  searchHits: null,
-  systemStatus: null,
-  onSelect: noop,
-  onDelete: noop,
-  onToggleGroup: noop,
-  onSearchChange: noop,
-  onJump: noop,
-  onCreate: noop,
-  onCreateProject: noop,
-  onCreateIn: noop,
-  onReplayDemo: noop,
-  onDebugSnapshot: () => Promise.resolve(),
-  onPurgeArchived: noop,
-};
-
-function healthyProbe() {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ issues: [] }) })),
-  );
-}
+const props = sidebarProps(
+  { onCreateProject: noop, onDebugSnapshot: () => Promise.resolve() },
+  () => noop,
+);
 
 function MobileDrawer({
   onDebugSnapshot,

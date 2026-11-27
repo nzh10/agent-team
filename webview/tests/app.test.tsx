@@ -548,24 +548,22 @@ describe("composer", () => {
   });
 });
 
-describe("search jumps", () => {
-  function searchAndOpen(
-    sock: FakeSocket,
-    hit: { messageId: string; timestamp: number },
-    workspaceId = "w1",
-  ) {
-    fireEvent.change(document.querySelector(".search-bar input")!, {
-      target: { value: "needle" },
-    });
-    sock.receive({
-      type: "search_results",
-      query: "needle",
-      hits: [{ workspaceId, workspaceName: "w", snippet: "needle", ...hit }],
-    });
-    fireEvent.click(document.querySelector(".search-result-item")!);
-    frame();
-  }
+function searchAndOpen(
+  sock: FakeSocket,
+  hit: { messageId: string; timestamp: number },
+  workspaceId = "w1",
+) {
+  fireEvent.change(document.querySelector(".search-bar input")!, { target: { value: "needle" } });
+  sock.receive({
+    type: "search_results",
+    query: "needle",
+    hits: [{ workspaceId, workspaceName: "w", snippet: "needle", ...hit }],
+  });
+  fireEvent.click(document.querySelector(".search-result-item")!);
+  frame();
+}
 
+describe("search jumps", () => {
   const page = (ids: number[]): Message[] =>
     ids.map((i) => ({ ...settled(i), id: `m${i}`, timestamp: i }));
 
@@ -681,27 +679,6 @@ describe("search jumps against the server's paging", () => {
     }
   }
 
-  function searchAndOpen(sock: FakeSocket, hit: Message) {
-    fireEvent.change(document.querySelector(".search-bar input")!, {
-      target: { value: "needle" },
-    });
-    sock.receive({
-      type: "search_results",
-      query: "needle",
-      hits: [
-        {
-          workspaceId: "w1",
-          workspaceName: "w",
-          snippet: "needle",
-          messageId: hit.id,
-          timestamp: hit.timestamp,
-        },
-      ],
-    });
-    fireEvent.click(document.querySelector(".search-result-item")!);
-    frame();
-  }
-
   function expectHistory(all: Message[], hit: Message) {
     expect(document.querySelector(`#msg-${hit.id}.message-highlight`)).not.toBeNull();
     expect(document.querySelectorAll("[data-transcript-row]").length).toBeLessThanOrEqual(45);
@@ -718,7 +695,7 @@ describe("search jumps against the server's paging", () => {
       const sock = FakeSocket.instances.at(-1)!;
       openSocket(sock, [AGENT]);
       answerAll(sock, () => all);
-      searchAndOpen(sock, all[5]);
+      searchAndOpen(sock, { messageId: all[5].id, timestamp: all[5].timestamp });
       answerAll(sock, () => all);
       expectHistory(all, all[5]);
       expect(FakeSocket.instances).toEqual([sock]);
@@ -733,7 +710,7 @@ describe("search jumps against the server's paging", () => {
     const first = FakeSocket.instances.at(-1)!;
     openSocket(first, [AGENT]);
     answerAll(first, () => all);
-    searchAndOpen(first, all[10]);
+    searchAndOpen(first, { messageId: all[10].id, timestamp: all[10].timestamp });
     expect(first.frames()).toContainEqual(
       expect.objectContaining({ type: "load_messages", before: 1100 }),
     );
@@ -781,7 +758,7 @@ describe("search jumps against the server's paging", () => {
   });
 });
 
-it("reloads the newest page on sidebar return after a late detail evicts inactive history", () => {
+it("reopens a session evicted by its late detail reply", () => {
   const large = "界".repeat(Math.ceil(1_048_576 / 3));
   const message: Message = {
     ...settled(0),

@@ -8,6 +8,7 @@ import { readTracePage } from "../../shared/subagent-trace";
 import { MessageBoundary } from "../src/chat/messages";
 import { SubagentTraceContext } from "../src/chat/subagentTrace";
 import { TranscriptChoiceScope } from "../src/chat/transcriptChoices";
+import { agent, message } from "./helpers/fixtures";
 
 const sa = (over: Partial<NonNullable<StreamEvent["subagent"]>> = {}): StreamEvent => ({
   kind: "subagent_start",
@@ -72,6 +73,7 @@ describe("SubAgentItem", () => {
     click("more");
     expect(view.getByText("Latest result")).toBeTruthy();
     click("Earlier");
+    expect(view.queryByText("Latest result")).toBeNull();
     expect(view.queryByText("Earlier result")).toBeNull();
     expect(view.getByRole("button", { name: "more" })).toBeTruthy();
   });
@@ -142,25 +144,8 @@ describe("StepGroup", () => {
 });
 
 describe("MessageItem", () => {
-  const agents: AgentInfo[] = [
-    {
-      id: "a1",
-      name: "Alice",
-      model: "claude-fable-5",
-      avatar: "🤖",
-      color: "#888",
-      isDefault: true,
-    },
-  ];
-  const msg = (over: Partial<Message>): Message => ({
-    id: "m1",
-    kind: "agent",
-    agentId: "a1",
-    content: "",
-    timestamp: 0,
-    status: "done",
-    ...over,
-  });
+  const agents = [agent("a1", { name: "Alice", model: "claude-fable-5", avatar: "🤖" })];
+  const msg = (over: Partial<Message>) => message("m1", { agentId: "a1", timestamp: 0, ...over });
 
   it("renders the user's name and image or text avatar", () => {
     const message = msg({ kind: "user", content: "Hello" });
@@ -203,51 +188,45 @@ describe("MessageItem", () => {
     expect(container.querySelector(".step-group")).toBeTruthy();
   });
 
-  it("segments delayed thinking before text using the preserved offset", () => {
-    const streamed = applyEventsToMessage(msg({ status: "streaming" }), [
-      { kind: "text_delta", content: "Answer" },
-      { kind: "thinking", content: "plan", contentOffset: 0, durationMs: 1_000 },
-    ]);
-    expect(streamed.events?.map((event) => [event.kind, event.contentOffset])).toEqual([
-      ["thinking", 0],
-    ]);
-    const { container } = render(
-      <MessageItem msg={{ ...streamed, status: "done" }} agents={agents} />,
-    );
-    const segments = container.querySelectorAll(".message-content > div");
-    expect(segments).toHaveLength(2);
-    expect(segments[0].querySelector(".step-summary")?.textContent).toBe("1 thinking");
-    expect(segments[1].textContent).toBe("Answer");
-  });
-
-  it("renders delayed thinking before text and an interleaved tool in client aggregation", () => {
-    const streamed = applyEventsToMessage(msg({ status: "streaming" }), [
-      { kind: "text_delta", content: "Answer" },
-      {
+  it.each([false, true])(
+    "renders delayed thinking before the answer (interleaved tool: %s)",
+    (tool) => {
+      const read = {
         kind: "tool_use",
         content: "**Read** `a.ts`",
         toolName: "Read",
         toolUseId: "call-1",
         contentOffset: 6,
-      },
-      { kind: "thinking", content: "plan", contentOffset: 0, durationMs: 1_000 },
-    ]);
-    expect(streamed.events?.map((event) => [event.kind, event.contentOffset])).toEqual([
-      ["tool_use", 6],
-      ["thinking", 0],
-    ]);
-    const { container } = render(
-      <MessageItem msg={{ ...streamed, status: "done" }} agents={agents} />,
-    );
-    const segments = container.querySelectorAll(".message-content > div");
-    expect(segments).toHaveLength(2);
-    expect(segments[0].querySelector(".step-summary")?.textContent).toBe("1 thinking");
-    expect(segments[1].textContent).toContain("Answer");
-    expect(segments[1].querySelector(".step-summary")?.textContent).toBe("1 tool call");
-    expect(segments[1].textContent.indexOf("Answer")).toBeLessThan(
-      segments[1].textContent.indexOf("1 tool call"),
-    );
-  });
+      };
+      const streamed = applyEventsToMessage(msg({ status: "streaming" }), [
+        { kind: "text_delta", content: "Answer" },
+        ...(tool ? [read] : []),
+        { kind: "thinking", content: "plan", contentOffset: 0, durationMs: 1_000 },
+      ]);
+      expect(streamed.events?.map((event) => [event.kind, event.contentOffset])).toEqual(
+        tool
+          ? [
+              ["tool_use", 6],
+              ["thinking", 0],
+            ]
+          : [["thinking", 0]],
+      );
+      const { container } = render(
+        <MessageItem msg={{ ...streamed, status: "done" }} agents={agents} />,
+      );
+      const segments = container.querySelectorAll(".message-content > div");
+      expect(segments).toHaveLength(2);
+      expect(segments[0].querySelector(".step-summary")?.textContent).toBe("1 thinking");
+      if (!tool) {
+        expect(segments[1].textContent).toBe("Answer");
+      } else {
+        const text = segments[1].textContent;
+        expect(text).toContain("Answer");
+        expect(segments[1].querySelector(".step-summary")?.textContent).toBe("1 tool call");
+        expect(text.indexOf("Answer")).toBeLessThan(text.indexOf("1 tool call"));
+      }
+    },
+  );
 
   it("keeps an opened step box open when the first text of the reply arrives", () => {
     const events: StreamEvent[] = [
@@ -346,17 +325,19 @@ describe("CreateWorkspaceDialog", () => {
   function setup(dirSuggestions = { prefix: "", dirs: [] as string[] }) {
     const onCreate = vi.fn();
     const onListDirs = vi.fn();
-    const utils = render(
+    const dialog = (suggestions: typeof dirSuggestions) => (
       <CreateWorkspaceDialog
         hosts={hosts}
         onClose={() => {}}
         onCreate={onCreate}
         onListDirs={onListDirs}
-        dirSuggestions={dirSuggestions}
-      />,
+        dirSuggestions={suggestions}
+      />
     );
+    const utils = render(dialog(dirSuggestions));
     const pathInput = utils.getByPlaceholderText("~/workspace/...") as HTMLInputElement;
-    return { ...utils, onCreate, onListDirs, pathInput };
+    const suggest = (prefix: string, ...dirs: string[]) => utils.rerender(dialog({ prefix, dirs }));
+    return { ...utils, onCreate, onListDirs, pathInput, suggest };
   }
 
   it("requests directory completion while typing (debounced)", () => {
@@ -376,33 +357,17 @@ describe("CreateWorkspaceDialog", () => {
   });
 
   it("shows suggestions matching the current input and completes on click", () => {
-    const { pathInput, getByText, rerender, onCreate, onListDirs } = setup();
+    const { pathInput, getByText, suggest } = setup();
     fireEvent.change(pathInput, { target: { value: "/home/ex" } });
-    rerender(
-      <CreateWorkspaceDialog
-        hosts={hosts}
-        onClose={() => {}}
-        onCreate={onCreate}
-        onListDirs={onListDirs}
-        dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
-      />,
-    );
+    suggest("/home/ex", "/home/example/");
     fireEvent.mouseDown(getByText("/home/example/"));
     expect(pathInput.value).toBe("/home/example/");
   });
 
   it("ignores stale suggestions for older input", () => {
-    const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
+    const { pathInput, baseElement, suggest } = setup();
     fireEvent.change(pathInput, { target: { value: "/tmp/x" } });
-    rerender(
-      <CreateWorkspaceDialog
-        hosts={hosts}
-        onClose={() => {}}
-        onCreate={onCreate}
-        onListDirs={onListDirs}
-        dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
-      />,
-    );
+    suggest("/home/ex", "/home/example/");
     expect(baseElement.querySelector(".dir-suggest")).toBeNull();
   });
 
@@ -440,17 +405,9 @@ describe("CreateWorkspaceDialog", () => {
   it("closes the suggestion list when the path input loses focus (mobile has no Esc)", () => {
     vi.useFakeTimers();
     try {
-      const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
+      const { pathInput, baseElement, suggest } = setup();
       fireEvent.change(pathInput, { target: { value: "/home/ex" } });
-      rerender(
-        <CreateWorkspaceDialog
-          hosts={hosts}
-          onClose={() => {}}
-          onCreate={onCreate}
-          onListDirs={onListDirs}
-          dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
-        />,
-      );
+      suggest("/home/ex", "/home/example/");
       expect(baseElement.querySelector(".dir-suggest")).not.toBeNull();
 
       fireEvent.blur(pathInput);
@@ -470,17 +427,9 @@ describe("CreateWorkspaceDialog", () => {
   it("keeps the list open across a quick blur/focus (tapping a suggestion)", () => {
     vi.useFakeTimers();
     try {
-      const { pathInput, baseElement, onCreate, onListDirs, rerender } = setup();
+      const { pathInput, baseElement, suggest } = setup();
       fireEvent.change(pathInput, { target: { value: "/home/ex" } });
-      rerender(
-        <CreateWorkspaceDialog
-          hosts={hosts}
-          onClose={() => {}}
-          onCreate={onCreate}
-          onListDirs={onListDirs}
-          dirSuggestions={{ prefix: "/home/ex", dirs: ["/home/example/"] }}
-        />,
-      );
+      suggest("/home/ex", "/home/example/");
       fireEvent.blur(pathInput);
       fireEvent.focus(pathInput); // cancels the pending close
       act(() => {

@@ -2,9 +2,11 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import type {} from "@vitest/browser-playwright";
-import { App } from "../../src/App";
 import { UsageDashboard } from "../../src/usage/UsageDashboard";
 import { FakeSocket } from "../fakeSocket";
+import { mountFixedApp } from "../helpers/browser";
+import { paintedContrast } from "../helpers/contrast";
+import { deferred } from "../helpers/deferred";
 import {
   compaction,
   journeyResponse,
@@ -37,30 +39,8 @@ function expectTextContained(element: Element, label: string) {
   );
 }
 
-// Composite computed translucent surfaces as painted before measuring WCAG contrast.
-function contrastRatio(foreground: string, ...background: string[]) {
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = 1;
-  const context = canvas.getContext("2d", { willReadFrequently: true })!;
-  const painted = (colors: string[]) => {
-    context.clearRect(0, 0, 1, 1);
-    for (const color of colors) {
-      expect(CSS.supports("color", color), color).toBe(true);
-      context.fillStyle = color;
-      context.fillRect(0, 0, 1, 1);
-    }
-    const pixel = context.getImageData(0, 0, 1, 1).data;
-    expect(pixel[3], colors.join(" + ")).toBe(255);
-    const [r, g, b] = Array.from(pixel.slice(0, 3), (byte) => {
-      const channel = byte / 255;
-      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
-    });
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  };
-  const a = painted(background);
-  const b = painted([...background, foreground]);
-  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
-}
+const contrastRatio = (foreground: string, ...backgrounds: string[]) =>
+  paintedContrast(foreground, backgrounds, { opaque: true, validateColors: true });
 
 function expectNoHorizontalOverflow(dialog: HTMLElement, label: string) {
   const box = dialog.getBoundingClientRect();
@@ -100,11 +80,7 @@ it("opens the mobile overview without shifting chat and renders a bounded token 
   }));
   const request = vi.fn<typeof fetch>().mockResolvedValueOnce(overviewResponse({ ranking }));
   vi.stubGlobal("fetch", request);
-  const root = document.createElement("div");
-  root.id = "root";
-  root.style.cssText = "position:fixed; inset:0; height:100dvh";
-  document.body.append(root);
-  const { container } = render(<App />, { container: root });
+  const { container } = mountFixedApp();
   const main = container.querySelector(".main-panel")!;
   const initialMain = bounds(main);
   await page.getByRole("button", { name: /^Open workspace menu/ }).click();
@@ -293,15 +269,15 @@ it.each(["light", "dark"])(
   async (theme) => {
     document.documentElement.dataset.theme = theme;
     await page.viewport(1000, 620);
-    let finishRefresh!: (response: Response) => void;
-    let finishFailure!: (response: Response) => void;
-    let finishSuccess!: (response: Response) => void;
+    const refreshReply = deferred<Response>();
+    const failedReply = deferred<Response>();
+    const retryReply = deferred<Response>();
     const request = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(overviewResponse())
-      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishRefresh = resolve)))
-      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishFailure = resolve)))
-      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishSuccess = resolve)));
+      .mockReturnValueOnce(refreshReply.promise)
+      .mockReturnValueOnce(failedReply.promise)
+      .mockReturnValueOnce(retryReply.promise);
     vi.stubGlobal("fetch", request);
     render(<UsageDashboard onClose={vi.fn()} />);
     await screen.findByText("Inference records");
@@ -336,7 +312,7 @@ it.each(["light", "dark"])(
     expect(document.activeElement).toBe(refresh);
     expect(screen.getByText("Inference records")).toBeTruthy();
     expect(request).toHaveBeenCalledTimes(2);
-    finishRefresh(overviewResponse());
+    refreshReply.resolve(overviewResponse());
     await expect.element(page.getByText("Updating usage…")).not.toBeInTheDocument();
 
     const unit = screen.getByRole<HTMLSelectElement>("combobox", { name: "Reporting unit" });
@@ -351,7 +327,7 @@ it.each(["light", "dark"])(
     expect(screen.getByText("Inference records")).toBeTruthy();
     expect(screen.queryByText("Turn records")).toBeNull();
     expect(request).toHaveBeenCalledTimes(3);
-    finishFailure(new Response(null, { status: 503 }));
+    failedReply.resolve(new Response(null, { status: 503 }));
     await screen.findByText("Update failed · previous results");
     expectTextContained(loadState, `${theme} 1000px error`);
     expect(snapshot()).toEqual(beforeFailure);
@@ -368,7 +344,7 @@ it.each(["light", "dark"])(
     expect(body.scrollTop).toBe(scrollTop);
     expect(document.activeElement).toBe(refresh);
     expect(request).toHaveBeenCalledTimes(4);
-    finishSuccess(overviewResponse());
+    retryReply.resolve(overviewResponse());
     await screen.findByText("Turn records");
     expect(screen.queryByText("Inference records")).toBeNull();
     expect(screen.queryByText("Update failed · previous results")).toBeNull();
@@ -378,12 +354,12 @@ it.each(["light", "dark"])(
 
 it("gates retained Records pagination while a new query is pending or failed", async () => {
   await page.viewport(1000, 700);
-  let finishFilter!: (response: Response) => void;
+  const filterReply = deferred<Response>();
   const request = vi
     .fn<typeof fetch>()
     .mockResolvedValueOnce(overviewResponse())
     .mockResolvedValueOnce(journeyResponse([observation], { total: 91 }))
-    .mockReturnValueOnce(new Promise<Response>((resolve) => (finishFilter = resolve)));
+    .mockReturnValueOnce(filterReply.promise);
   vi.stubGlobal("fetch", request);
   render(<UsageDashboard onClose={vi.fn()} />);
   fireEvent.click(screen.getByRole("button", { name: "Records" }));
@@ -402,7 +378,7 @@ it("gates retained Records pagination while a new query is pending or failed", a
   expect(request).toHaveBeenCalledTimes(3);
 
   await act(async () => {
-    finishFilter(new Response(null, { status: 503 }));
+    filterReply.resolve(new Response(null, { status: 503 }));
     await Promise.resolve();
   });
   await screen.findByText("Update failed · previous results");
@@ -418,13 +394,13 @@ it.each(["light", "dark"].flatMap((theme) => [280, 390].map((width) => ({ theme,
     await page.viewport(width, 700);
     const longModel = "enterprise-model-with-a-long-name-and-a-quantized-variant";
     const ranking = [{ model: longModel, tokens: 104 }];
-    let finishFailure!: (response: Response) => void;
+    const failedReply = deferred<Response>();
     const request = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(overviewResponse({ ranking }))
       .mockResolvedValueOnce(overviewResponse({ ranking, count: 3, promptBearing: 3 }))
       .mockResolvedValueOnce(overviewResponse({ ranking, count: 4, promptBearing: 4 }))
-      .mockReturnValueOnce(new Promise<Response>((resolve) => (finishFailure = resolve)));
+      .mockReturnValueOnce(failedReply.promise);
     vi.stubGlobal("fetch", request);
     render(<UsageDashboard onClose={vi.fn()} />);
     const rank = await screen.findByRole("button", { name: `${longModel}, 104 tokens` });
@@ -471,7 +447,7 @@ it.each(["light", "dark"].flatMap((theme) => [280, 390].map((width) => ({ theme,
     };
     expectBoundedHeading();
     await act(async () => {
-      finishFailure(new Response(null, { status: 503 }));
+      failedReply.resolve(new Response(null, { status: 503 }));
       await Promise.resolve();
     });
     await screen.findByText("Update failed · previous results");
@@ -479,6 +455,20 @@ it.each(["light", "dark"].flatMap((theme) => [280, 390].map((width) => ({ theme,
     expectBoundedHeading();
   },
 );
+
+function mountUsagePages() {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>((url) =>
+      Promise.resolve(
+        usageUrl(url).pathname.endsWith("/overview")
+          ? overviewResponse()
+          : journeyResponse([observation], { total: 91 }),
+      ),
+    ),
+  );
+  render(<UsageDashboard onClose={vi.fn()} />);
+}
 
 const surfaceCases = ["light", "dark"].flatMap((theme) => [
   { theme, width: 1000, height: 800 },
@@ -490,19 +480,7 @@ it.each(surfaceCases)(
   async ({ theme, width, height }) => {
     document.documentElement.dataset.theme = theme;
     await page.viewport(width, height);
-    vi.stubGlobal(
-      "fetch",
-      vi
-        .fn<typeof fetch>()
-        .mockImplementation((url) =>
-          Promise.resolve(
-            usageUrl(url).pathname.endsWith("/overview")
-              ? overviewResponse()
-              : journeyResponse([observation], { total: 91 }),
-          ),
-        ),
-    );
-    render(<UsageDashboard onClose={vi.fn()} />);
+    mountUsagePages();
     await screen.findByText("92.31%");
     await document.fonts.ready;
     const dialog = screen.getByRole("dialog");
@@ -607,19 +585,7 @@ it.each(responsiveCases)(
   async ({ theme, width, height, stepped }) => {
     document.documentElement.dataset.theme = theme;
     await page.viewport(width, height);
-    vi.stubGlobal(
-      "fetch",
-      vi
-        .fn<typeof fetch>()
-        .mockImplementation((url) =>
-          Promise.resolve(
-            usageUrl(url).pathname.endsWith("/overview")
-              ? overviewResponse()
-              : journeyResponse([observation], { total: 91 }),
-          ),
-        ),
-    );
-    render(<UsageDashboard onClose={vi.fn()} />);
+    mountUsagePages();
     await screen.findByText("92.31%");
     await document.fonts.ready;
     const dialog = screen.getByRole("dialog");

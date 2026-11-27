@@ -5,7 +5,9 @@ import { loadMath } from "../../src/chat/markdown";
 import { MessageItem } from "../../src/chat/messages";
 import { buildFrames, DEMO_WS_ID, frameDelay, LAYOUT_TURN_ID } from "../../src/dev/replayFixture";
 import { applyEventsToMessage, withoutLiveTiming } from "../../src/state/stream";
-import type { AgentInfo, Message, StreamEvent, Workspace } from "../../src/state/useServer";
+import type { Message, StreamEvent, Workspace } from "../../src/state/useServer";
+import { nextPaint, themedViewport } from "../helpers/browser";
+import { agent as makeAgent, message } from "../helpers/fixtures";
 import "../../src/fonts/sarasa-mono-sc/regular/result.css";
 import "../../src/fonts/sarasa-mono-sc/bold/result.css";
 import "../../src/styles.css";
@@ -16,6 +18,14 @@ afterEach(() => {
 });
 
 const rect = (el: Element) => el.getBoundingClientRect();
+const agent = makeAgent("a1", { name: "Alice", color: "#528bff", model: "test" });
+const streaming = (id: string, timestamp: number, fields: Partial<Message> = {}) =>
+  message(id, { agentId: agent.id, timestamp, status: "streaming", ...fields });
+const inTranscript = (msg: Message) => (
+  <div className="messages">
+    <MessageItem msg={msg} agents={[agent]} />
+  </div>
+);
 
 it.each([390, 520, 600, 960])("keeps the folded streaming turn stable at %ipx", async (width) => {
   await page.viewport(width, 800);
@@ -165,9 +175,7 @@ it.each([390, 520, 600, 960])("keeps the folded streaming turn stable at %ipx", 
   checkPhase({ footerLabel: "Checking layout · 3s" });
 
   // Let the strip's ResizeObserver publish its measurements before checking the fades.
-  await new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-  );
+  await nextPaint();
   if (width <= 600) {
     expect(strip.scrollWidth).toBeGreaterThan(strip.clientWidth);
     expect(strip.hasAttribute("data-fade-end")).toBe(true);
@@ -190,22 +198,7 @@ it.each([390, 520, 600, 960])("keeps standalone thinking stable at %ipx", async 
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
   const now = 1_800_000_000_000;
   vi.setSystemTime(now);
-  const agent: AgentInfo = {
-    id: "a1",
-    name: "Alice",
-    color: "#528bff",
-    model: "test",
-    avatar: "A",
-    isDefault: true,
-  };
-  let msg: Message = {
-    id: "first",
-    kind: "agent",
-    agentId: agent.id,
-    content: "",
-    timestamp: now,
-    status: "streaming",
-  };
+  let msg = streaming("first", now);
   const view = () => <MessageItem msg={msg} agents={[agent]} />;
   const { container, rerender } = render(view());
   await document.fonts.ready;
@@ -290,14 +283,7 @@ it.each([
     document.documentElement.dataset.theme = theme;
     try {
       const now = Date.now();
-      const initial: Message = {
-        id: "sample",
-        kind: "agent",
-        agentId: "a1",
-        content: "",
-        timestamp: now,
-        status: "streaming",
-      };
+      const initial = streaming("sample", now);
       const command = String.raw`find . \( -name '*.ts' \)`;
       const argument = "/tmp/_test_/*.ts";
       const tail = String.raw` and ${argument}, $O(n \log n)$, then *read this*.`;
@@ -342,19 +328,10 @@ it.each([
 ] as const)(
   "keeps live thinking unified in .step-header across placements in %s mode at %ipx",
   async (theme, width) => {
-    await page.viewport(width, 800);
-    document.documentElement.dataset.theme = theme;
+    await themedViewport(width, 800, theme);
     vi.useFakeTimers({ toFake: ["Date"] });
     const now = 1_800_000_000_000;
     vi.setSystemTime(now);
-    const agent: AgentInfo = {
-      id: "a1",
-      name: "Alice",
-      color: "#528bff",
-      model: "test",
-      avatar: "A",
-      isDefault: true,
-    };
     const cases: Array<{ name: string; events: StreamEvent[]; expectSummary?: string }> = [
       { name: "standalone", events: [] },
       {
@@ -398,22 +375,12 @@ it.each([
 
     try {
       for (const scenario of cases) {
-        const msg: Message = {
-          id: `m-${scenario.name.replace(/\s+/g, "-")}`,
-          kind: "agent",
-          agentId: agent.id,
-          content: "",
-          timestamp: now - 10_000,
-          status: "streaming",
+        const msg = streaming(`m-${scenario.name.replace(/\s+/g, "-")}`, now - 10_000, {
           events: scenario.events,
           liveThinking: "Evaluating next step.",
           liveThinkingSince: now - 4_000,
-        };
-        const { container, unmount } = render(
-          <div className="messages">
-            <MessageItem msg={msg} agents={[agent]} />
-          </div>,
-        );
+        });
+        const { container, unmount } = render(inTranscript(msg));
         await document.fonts.ready;
 
         const header = container.querySelector<HTMLElement>(".step-header")!;
@@ -451,14 +418,6 @@ it("keeps a long step summary and live timer inside the header at 320px", async 
   vi.useFakeTimers({ toFake: ["Date"] });
   const now = 1_800_000_000_000;
   vi.setSystemTime(now);
-  const agent: AgentInfo = {
-    id: "a1",
-    name: "Alice",
-    color: "#528bff",
-    model: "test",
-    avatar: "A",
-    isDefault: true,
-  };
   const events: StreamEvent[] = [
     ...Array.from({ length: 100 }, (): StreamEvent => ({
       kind: "thinking",
@@ -479,22 +438,12 @@ it("keeps a long step summary and live timer inside the header at 320px", async 
       contentOffset: 0,
     })),
   ];
-  const msg: Message = {
-    id: "narrow-long",
-    kind: "agent",
-    agentId: agent.id,
-    content: "",
-    timestamp: now - 15_000,
-    status: "streaming",
+  const msg = streaming("narrow-long", now - 15_000, {
     events,
     liveThinking: "Still checking.",
     liveThinkingSince: now - 12_000,
-  };
-  const { container } = render(
-    <div className="messages">
-      <MessageItem msg={msg} agents={[agent]} />
-    </div>,
-  );
+  });
+  const { container } = render(inTranscript(msg));
   await document.fonts.ready;
 
   const header = container.querySelector<HTMLElement>(".step-header")!;
@@ -517,28 +466,8 @@ it.each([390, 960])(
     vi.useFakeTimers({ toFake: ["Date"] });
     const now = 1_800_000_000_000;
     vi.setSystemTime(now);
-    const agent: AgentInfo = {
-      id: "a1",
-      name: "Alice",
-      color: "#528bff",
-      model: "test",
-      avatar: "A",
-      isDefault: true,
-    };
-    const base: Message = {
-      id: "equiv",
-      kind: "agent",
-      agentId: agent.id,
-      content: "",
-      timestamp: now - 10_000,
-      status: "streaming",
-      events: [],
-    };
-    const renderView = (msg: Message) => (
-      <div className="messages">
-        <MessageItem msg={msg} agents={[agent]} />
-      </div>
-    );
+    const base = streaming("equiv", now - 10_000, { events: [] });
+    const renderView = inTranscript;
     const measure = (root: HTMLElement) => {
       const header = root.querySelector<HTMLElement>(".step-header")!;
       const chip = header.querySelector<HTMLElement>(".chip-live")!;
